@@ -1007,6 +1007,14 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
 
+    // Find two keys that hash to the same shard. MasterService::
+    // getShardIndex is private but the formula is deterministic
+    // (cvm::KeySlot(default_tenant, key) % kNumShards), so we can mirror
+    // it here. kNumShards=1024.
+    constexpr size_t kNumShardsLocal = 1024;
+    auto shard_of = [](const std::string& k) {
+        return cvm::KeySlot(TenantId::Default(), k) % kNumShardsLocal;
+    };
     const std::string k1 = "qlim_first";
     const std::string k2 = "qlim_second";
 
@@ -1212,6 +1220,69 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
                                                   TenantId::Default());
     ASSERT_FALSE(notify.has_value());
     EXPECT_EQ(notify.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    service->RemoveAll();
+}
+
+// The cap gate must be cluster-wide, not per-shard. Promotion targets
+// skewed hot keys, which by definition cluster into a small number of
+// shards; a `shard->size() * kNumShards >= limit` heuristic fires
+// roughly kNumShards-times too eagerly on that workload. With a global
+// atomic counter, a task in shard A counts toward the cap that gates a
+// task in shard B.
+TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;  // 1 in-flight task globally
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+
+    // Find two keys hashing to *different* shards. With the old per-shard
+    // heuristic this would let both through (each shard's count is 0
+    // independently). With the global counter, only the first goes in.
+    constexpr size_t kNumShardsLocal = 1024;
+    auto shard_of = [](const std::string& k) {
+        return cvm::KeySlot(TenantId::Default(), k) % kNumShardsLocal;
+    };
+    const std::string k1 = "xshard_first";
+    std::string k2;
+    for (int i = 0; i < 100000 && k2.empty(); ++i) {
+        std::string candidate = "xshard_other_" + std::to_string(i);
+        if (shard_of(candidate) != shard_of(k1)) {
+            k2 = candidate;
+        }
+    }
+    ASSERT_FALSE(k2.empty()) << "couldn't find a different-shard key";
+    ASSERT_NE(shard_of(k1), shard_of(k2));
+
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k1, 1024,
+                                       seg.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k2, 1024,
+                                       seg.segment_name));
+
+    auto r1 = service->GetReplicaList(k1, TenantId::Default());
+    ASSERT_TRUE(r1.has_value());
+
+    // k2 lives in a different shard, but the global cap is already met
+    // by k1's task — k2 must be rejected.
+    auto r2 = service->GetReplicaList(k2, TenantId::Default());
+    ASSERT_TRUE(r2.has_value()) << "read itself still succeeds";
+
+    auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(heartbeat.has_value());
+    EXPECT_EQ(heartbeat->size(), 1u)
+        << "with global cap=1 and one task already in shard " << shard_of(k1)
+        << ", a key hashing to shard " << shard_of(k2)
+        << " must be rejected by the global gate. A per-shard heuristic "
+        << "would admit it here since the destination shard's local "
+        << "count is 0.";
+    EXPECT_EQ(CountPromotionTask(*heartbeat, k1), 1u);
+    EXPECT_EQ(CountPromotionTask(*heartbeat, k2), 0u);
 
     service->RemoveAll();
 }

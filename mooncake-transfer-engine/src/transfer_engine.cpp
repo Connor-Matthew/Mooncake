@@ -313,6 +313,11 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
     return impl_->getBatchTransferStatus(batch_id, status);
 }
 
+Status TransferEngine::getSliceTimings(BatchID batch_id, size_t task_id,
+                                       std::vector<Transport::SliceTiming>& timings) {
+    return impl_->getSliceTimings(batch_id, task_id, timings);
+}
+
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     stats.clear();
     return Status::OK();
@@ -1104,6 +1109,16 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
             return Status::OK();
     } else
         return impl_->getBatchTransferStatus(batch_id, status);
+}
+
+Status TransferEngine::getSliceTimings(
+    BatchID batch_id, size_t task_id,
+    std::vector<Transport::SliceTiming>& timings) {
+    if (use_tent_) {
+        return Status::InvalidArgument(
+            "getSliceTimings is not supported for TENT transports");
+    }
+    return impl_->getSliceTimings(batch_id, task_id, timings);
 }
 
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {

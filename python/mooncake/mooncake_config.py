@@ -168,6 +168,32 @@ def _parse_bool(value) -> bool:
     raise ValueError(f"Invalid boolean value: {value!r}")
 
 
+def _parse_numa_nodes(value) -> str:
+    """Normalise a NUMA node list to the C++ comma-separated format."""
+    if value is None or value == "":
+        return ""
+    raw_nodes = value.split(",") if isinstance(value, str) else value
+    if not isinstance(raw_nodes, (list, tuple)) or not raw_nodes:
+        raise ValueError(
+            "ub_numa_nodes must be a comma-separated string or a list of integers"
+        )
+
+    nodes = []
+    seen = set()
+    for raw_node in raw_nodes:
+        if isinstance(raw_node, bool):
+            raise ValueError(f"Invalid NUMA node: {raw_node!r}")
+        text = str(raw_node).strip()
+        if not text or not text.isdecimal():
+            raise ValueError(f"Invalid NUMA node: {raw_node!r}")
+        node = int(text)
+        if node in seen:
+            raise ValueError(f"Duplicate NUMA node: {node}")
+        seen.add(node)
+        nodes.append(node)
+    return ",".join(str(node) for node in nodes)
+
+
 @dataclass
 class MooncakeConfig:
     """The configuration class for Mooncake.
@@ -196,6 +222,9 @@ class MooncakeConfig:
             endpoints. Default is False.
         client_http_port (int): Port for the client HTTP endpoints.
             Defaults to 9300.
+        ub_numa_nodes (str): Comma-separated NUMA nodes for UB global segments.
+            Empty keeps automatic selection of all NUMA nodes on multi-NUMA
+            hosts.
 
     Example of configuration file:
         {
@@ -242,6 +271,7 @@ class MooncakeConfig:
     tenant_id: str = "default"
     enable_client_http_server: bool = False
     client_http_port: int = 9300
+    ub_numa_nodes: str = ""
 
     def __post_init__(self):
         """Validate and normalise configuration invariants.
@@ -266,6 +296,7 @@ class MooncakeConfig:
         # silently accepted here but rejected deep in the engine; normalising
         # turns that hidden misconfiguration into a working configuration.
         self.protocol = self.protocol.strip().lower()
+        self.ub_numa_nodes = _parse_numa_nodes(self.ub_numa_nodes)
         # Warn (do not reject) on values we do not recognise: MooncakeConfig
         # drives both Transfer Engine and Store paths, and a given build may
         # support protocols beyond this list. The C++ layer is authoritative and
@@ -329,6 +360,7 @@ class MooncakeConfig:
                 config.get("enable_client_http_server", False)
             ),
             client_http_port=int(config.get("client_http_port", 9300)),
+            ub_numa_nodes=_parse_numa_nodes(config.get("ub_numa_nodes", "")),
         )
 
     @staticmethod
@@ -370,5 +402,8 @@ class MooncakeConfig:
                     os.getenv("MOONCAKE_ENABLE_CLIENT_HTTP_SERVER", "false")
                 ),
                 client_http_port=int(os.getenv("MOONCAKE_CLIENT_HTTP_PORT", 9300)),
+                ub_numa_nodes=_parse_numa_nodes(
+                    os.getenv("MOONCAKE_UB_NUMA_NODES", "")
+                ),
             )
         return MooncakeConfig.from_file(config_file_path)

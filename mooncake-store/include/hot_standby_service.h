@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "ha/ha_types.h"
@@ -22,6 +23,7 @@
 #include "ha/standby_metadata_store.h"
 #include "standby_state_machine.h"
 #include "types.h"
+#include "vsegment/vsegment_manager.h"
 
 namespace mooncake {
 
@@ -38,6 +40,10 @@ struct OpLogBatchStandbyPollResult;
 struct HotStandbyConfig {
     std::string standby_id;
     std::string primary_address;
+    // Replay sources. A single source with an empty master_id is the
+    // single-leader (unpartitioned) layout; anything else is the SP930
+    // multi-submaster layout with one partitioned stream per master.
+    std::vector<ha::MasterSource> sources{};
     uint32_t replication_port{0};
     uint32_t verification_interval_sec{30};
     uint32_t max_replication_lag_entries{1000};
@@ -85,6 +91,8 @@ struct StandbySyncStatus {
 class HotStandbyService {
    public:
     using SyncStatusCallback = std::function<void(const StandbySyncStatus&)>;
+    using VSegmentStateMap =
+        std::unordered_map<std::string, vsegment::PartitionVSegmentSnapshot>;
 
     explicit HotStandbyService(const HotStandbyConfig& config);
     ~HotStandbyService();
@@ -101,6 +109,29 @@ class HotStandbyService {
     ErrorCode Start(const std::string& primary_address,
                     const std::string& oplog_endpoints,
                     const std::string& cluster_id);
+
+    /**
+     * @brief Start following explicit replay sources (SP930 multi-submaster).
+     *
+     * One source with an empty master_id behaves exactly like
+     * Start(primary_address, ...). Several sources (or a named one) follow
+     * one partitioned OpLog stream per master; batch snapshots and
+     * compaction are not used in that mode.
+     */
+    ErrorCode Start(const std::vector<ha::MasterSource>& sources,
+                    const std::string& oplog_endpoints,
+                    const std::string& cluster_id);
+
+    /**
+     * @brief Re-bind replay sources while keeping the accumulated metadata.
+     *
+     * Equivalent to Start() when not running; a no-op when the set of source
+     * master_ids is unchanged; otherwise stops and restarts replication with
+     * the new set. metadata_store_ is preserved across the restart.
+     */
+    ErrorCode UpdateSources(const std::vector<ha::MasterSource>& sources,
+                            const std::string& oplog_endpoints,
+                            const std::string& cluster_id);
 
     /**
      * @brief Stop replication and disconnect from Primary
@@ -253,6 +284,21 @@ class HotStandbyService {
                                              PromotionCatchUpPolicy policy);
     ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend,
                                              PromotionCatchUpPolicy policy);
+    // Main's catch-up policy loop for one stream (source_id "" = the
+    // unpartitioned single-leader stream).
+    ErrorCode CatchUpSourceLocked(HaKvBackend& backend, OpLogApplier& applier,
+                                  OpLogBatchStandbyReader* source_reader,
+                                  const std::string& source_id,
+                                  PromotionCatchUpPolicy policy);
+    // VSegment partition state (both modes).
+    void InstallVSegmentHandler(OpLogApplier& applier);
+    bool ApplyVSegmentState(const OpLogEntry& entry);
+    void ResetVSegmentPartitions(
+        std::vector<vsegment::PartitionVSegmentSnapshot> partitions);
+    void CollectVSegmentPartitions(
+        std::vector<vsegment::PartitionVSegmentSnapshot>& out) const;
+    // Segment registry of the single applier, or merged across sources.
+    std::vector<StandbySegmentInfo> CollectSegmentsLocked() const;
     void StopReplicationLoop();
     void HandleSnapshotCaptureRequest(
         const OpLogBatchStandbyPollResult& result);
@@ -282,7 +328,21 @@ class HotStandbyService {
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::shared_ptr<BatchOpLogSnapshotProvider> batch_oplog_snapshot_provider_;
 
-    // OpLog replication components
+    // VSegment partition state replayed from the OpLog (VSEGMENT_STATE).
+    mutable std::mutex vsegment_mutex_;
+    VSegmentStateMap vsegment_partitions_;
+
+    // Multi-source (partitioned) replication components, keyed by source
+    // master_id. All appliers share metadata_store_ (sources own disjoint
+    // slots). Empty in single-leader mode.
+    struct SourceReplica {
+        std::unique_ptr<OpLogApplier> applier;
+        std::unique_ptr<OpLogBatchStandbyReader> reader;
+    };
+    std::unordered_map<std::string, SourceReplica> sources_;
+    bool multi_source_{false};
+
+    // OpLog replication components (single-leader mode)
     std::unique_ptr<OpLogApplier> oplog_applier_;
     std::shared_ptr<HaKvBackend> batch_standby_kv_backend_;
     std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;

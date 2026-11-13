@@ -24,6 +24,10 @@
 #include "tent/transfer_engine.h"
 #endif
 #include "nof/nvmeof_initiator.h"
+#ifdef USE_NOF_URMA
+#include "nof_gpu_direct_report.h"
+#endif
+#include "vsegment/vsegment_transfer.h"
 
 namespace mooncake {
 
@@ -45,6 +49,72 @@ static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     }
 
     return static_cast<int>(parsed);
+}
+
+static bool ParseBoolEnv(const char* name, bool default_value) {
+    const char* raw_value = std::getenv(name);
+    if (!raw_value || raw_value[0] == '\0') {
+        return default_value;
+    }
+    std::string normalized(raw_value);
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (normalized == "1" || normalized == "true" || normalized == "yes" ||
+        normalized == "on") {
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" ||
+        normalized == "off") {
+        return false;
+    }
+    LOG(WARNING) << "Invalid value for " << name << ": " << raw_value
+                 << ", using default " << default_value;
+    return default_value;
+}
+
+// Used by the polling loop, which also serves TENT batches in
+// USE_EVENT_DRIVEN_COMPLETION builds, so not compiled out there.
+// UB has dedicated posting/polling workers. Long Store-side busy waits can
+// compete with those workers; keep a short spin for fast completions, then
+// optionally back off. Range [0, 1s].
+static int ReadUbPollDelayUs(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    if (!value) return default_value;
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno || end == value || *end || parsed < 0 || parsed > 1000000) {
+        LOG(WARNING) << "Invalid " << name << "; using " << default_value;
+        return default_value;
+    }
+    return static_cast<int>(parsed);
+}
+
+static int UbPollSpinUs() {
+    static const int value = ReadUbPollDelayUs("MC_STORE_UB_POLL_SPIN_US", 50);
+    return value;
+}
+
+static int UbPollSleepUs() {
+    // Latency-sensitive reads busy poll by default; deployments preferring
+    // lower CPU usage opt into backoff.
+    static const int value = ReadUbPollDelayUs("MC_STORE_UB_POLL_SLEEP_US", 0);
+    return value;
+}
+
+// A lane with I/O in flight and no completion for this long is isolated.
+// 0 disables the check.
+static std::chrono::milliseconds GetNofIoTimeout() {
+    static const auto value = [] {
+        const char* raw_value = std::getenv("MC_NOF_IO_TIMEOUT_MS");
+        if (raw_value && std::string(raw_value) == "0") {
+            return std::chrono::milliseconds(0);
+        }
+        return std::chrono::milliseconds(
+            GetPositiveEnvOrDefault("MC_NOF_IO_TIMEOUT_MS", 60000));
+    }();
+    return value;
 }
 
 static bool IsNofDebugEnabled() {
@@ -77,15 +147,26 @@ static int CountNofQueuedTasks(const mooncake::NofTask* head) {
     return count;
 }
 
+// Completes the task once all bytes were submitted and all sub-I/O returned.
+// Idempotent: a failing sub-I/O can complete a task that is still queued at
+// the QoS head (on_chain); popping the head later calls this again. The task
+// is deleted only when it is off the chain.
 static inline void NofTaskCompletion(mooncake::NofTask* task) {
-    if (task->remaining_bytes == 0 && task->outstanding_sub_io == 0) {
+    if (task->remaining_bytes != 0 || task->outstanding_sub_io != 0) {
+        return;
+    }
+    if (!task->completed) {
+        task->completed = true;
+        if (task->nof_qos) {
+            task->nof_qos->live.erase(task);
+        }
         task->state->set_completed(task->failed
                                        ? mooncake::ErrorCode::TRANSFER_FAIL
                                        : mooncake::ErrorCode::OK,
                                    std::move(task->error_detail));
-        if (!task->on_chain) {
-            delete task;
-        }
+    }
+    if (!task->on_chain) {
+        delete task;
     }
 }
 
@@ -115,6 +196,12 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
     if (nof_qos->inflight_blocks[op] < 0) {
         LOG(ERROR) << "qos inflight blocks < 0";
     }
+    nof_qos->last_progress = std::chrono::steady_clock::now();
+#ifdef USE_NOF_URMA
+    mooncake::RecordNofIoCompleted(task->buffer_info, c.success,
+                                   task->op == mooncake::NofIOOp::kWrite,
+                                   sub_task->submit_bytes);
+#endif
 
     if (!c.success) {
 #ifdef USE_NOF
@@ -222,12 +309,14 @@ std::optional<TransferStatusEnum> ToClassicTransferStatus(
 
 }  // namespace
 
-NofQos::NofQos(uint32_t bs)
+NofQos::NofQos(uint32_t bs, uint32_t lane_count)
     : block_size(bs == 0 || bs == kInvalidBlockSize ? 1 : bs),
       blocks_per_chunk(
           std::max(1, GetNofSubmitChunkBytes() / static_cast<int>(block_size))),
+      // Split per lane so a multi-lane segment keeps the single-lane total.
       inflight_blocks_limit(std::max(
-          1, GetNofInflightBytesLimit() / static_cast<int>(block_size))) {
+          1, GetNofInflightBytesLimit() / static_cast<int>(block_size) /
+                 static_cast<int>(std::max<uint32_t>(lane_count, 1)))) {
     for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
         inflight_blocks[i] = 0;
         head[i] = nullptr;
@@ -396,7 +485,20 @@ void NofWorkerPool::submitTask(NofTask task) {
     int worker_idx = -1;
     {
         std::lock_guard<std::mutex> lock(seg_mutex_);
-        NofSegmentHandle* seg = task.seg_handle;
+        // Each task runs on one lane of its segment; the lane handle then
+        // keys worker affinity and QoS exactly like a single-lane segment.
+        uint32_t lane_count = 1;
+        NofSegmentHandle* lane = PickLaneLocked(task.seg_handle, &lane_count);
+        if (lane == nullptr) {
+            LOG(ERROR) << "No healthy NoF lane for segment "
+                       << task.seg_handle;
+            task.state->set_completed(ErrorCode::TRANSFER_FAIL,
+                                      "no healthy NoF lane");
+            return;
+        }
+        task.seg_handle = lane;
+        task.lane_count = lane_count;
+        NofSegmentHandle* seg = lane;
         bool new_binding = false;
         if (seg_to_worker_.find(seg) != seg_to_worker_.end()) {
             worker_idx = seg_to_worker_[seg];
@@ -421,6 +523,23 @@ void NofWorkerPool::submitTask(NofTask task) {
         task_queue_[worker_idx].push(std::move(task));
     }
     queue_cv_[worker_idx].notify_one();
+}
+
+NofSegmentHandle* NofWorkerPool::PickLaneLocked(NofSegmentHandle* segment,
+                                                uint32_t* lane_count) {
+    const size_t count = initiator_->GetLaneCount(segment);
+    *lane_count = static_cast<uint32_t>(std::max<size_t>(count, 1));
+    if (count == 0) {
+        return nullptr;
+    }
+    uint64_t& next = seg_next_lane_[segment];
+    for (size_t attempt = 0; attempt < count; ++attempt) {
+        NofSegmentHandle* lane = initiator_->GetLane(segment, next++ % count);
+        if (lane != nullptr && initiator_->IsLaneHealthy(lane)) {
+            return lane;
+        }
+    }
+    return nullptr;
 }
 
 static bool HasBufferedTask(
@@ -455,6 +574,52 @@ static inline bool CheckSubTaskPool(std::stack<NofSubTask*>& sub_task_pool,
     }
 
     return true;
+}
+
+// Isolates a lane after a fatal submit/poll error or an I/O timeout. Runs on
+// the lane's worker (its only polling thread), as ReleaseFailedLane requires.
+// Outstanding I/O is aborted: callbacks either run inside ReleaseFailedLane
+// (failing their tasks normally) or never run, in which case the stranded
+// tasks are failed here. Queued tasks fail without being submitted.
+static void IsolateNofLane(NVMeoFInitiator& initiator, NofSegmentHandle* lane,
+                           NofQos* qos,
+                           std::atomic<int64_t>& total_outstanding_io,
+                           int work_idx, const char* reason) {
+    LOG(ERROR) << "Isolating NoF lane " << lane << " on worker " << work_idx
+               << ": " << reason << " (in-flight tasks=" << qos->live.size()
+               << ")";
+    qos->dead = true;
+    initiator.MarkLaneFailed(lane);
+    initiator.ReleaseFailedLane(lane);
+
+    // Collect every affected task once: a partially submitted task can be
+    // both queued at the head and in flight.
+    std::unordered_set<NofTask*> affected(qos->live.begin(), qos->live.end());
+    for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
+        while (NofTask* task = qos->head[i]) {
+            qos->PopTask(static_cast<NofIOOp>(i));
+            task->on_chain = false;
+            affected.insert(task);
+        }
+        qos->inflight_blocks[i] = 0;
+    }
+    for (NofTask* task : affected) {
+        const int lost = task->outstanding_sub_io;
+        if (lost > 0) {
+            total_outstanding_io.fetch_sub(lost, std::memory_order_acq_rel);
+#ifdef USE_NOF_URMA
+            RecordNofIoAborted(task->buffer_info, task->op == NofIOOp::kWrite,
+                               static_cast<uint64_t>(lost));
+#endif
+        }
+        task->outstanding_sub_io = 0;
+        task->remaining_bytes = 0;
+        task->failed = true;
+        if (task->error_detail.empty()) {
+            task->error_detail = reason;
+        }
+        NofTaskCompletion(task);  // completes once; deletes (off chain)
+    }
 }
 
 void NofWorkerPool::workerThread(int work_idx) {
@@ -513,7 +678,8 @@ void NofWorkerPool::workerThread(int work_idx) {
                 auto it = seg_to_qos.find(task->seg_handle);
                 if (it == seg_to_qos.end()) {
                     auto qos = std::make_unique<NofQos>(
-                        initiator_->GetBlockSize(task->seg_handle));
+                        initiator_->GetBlockSize(task->seg_handle),
+                        task->lane_count);
                     if (qos == nullptr) {
                         LOG(ERROR)
                             << "alloc NofQos failed, worker " << work_idx;
@@ -542,6 +708,33 @@ void NofWorkerPool::workerThread(int work_idx) {
                 } else {
                     nof_qos = it->second.get();
                 }
+                // The lane may have been isolated after this task was routed
+                // to it.
+                const char* reject_reason = nullptr;
+                if (nof_qos->dead ||
+                    !initiator_->IsLaneHealthy(task->seg_handle)) {
+                    reject_reason = "NoF lane failed";
+                }
+#ifdef USE_NOF_URMA
+                if (reject_reason == nullptr) {
+                    // GPU Direct: classify once per task. Device memory that
+                    // cannot be served must fail, never silently stage.
+                    task->buffer_info =
+                        initiator_->ResolveBuffer(task->ptr, task->byte_length);
+                    if (task->buffer_info.type == NofMemoryType::kError ||
+                        task->buffer_info.type ==
+                            NofMemoryType::kNotSupported) {
+                        reject_reason = "NoF buffer classification failed";
+                    }
+                }
+#endif
+                if (reject_reason != nullptr) {
+                    task->state->set_completed(ErrorCode::TRANSFER_FAIL,
+                                               reject_reason);
+                    delete task;
+                    task_queue.pop();
+                    continue;
+                }
                 task->io_count = total_outstanding_io;
                 task->nof_qos = nof_qos;
                 task->on_chain = true;
@@ -551,12 +744,18 @@ void NofWorkerPool::workerThread(int work_idx) {
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+            if (nof_qos->dead) {
+                continue;
+            }
             // block_size comes from the QoS cache; the hot loop no longer
             // queries the initiator.
             const uint32_t block_size = nof_qos->block_size;
             const uint64_t chunk_bytes =
                 static_cast<uint64_t>(nof_qos->blocks_per_chunk) * block_size;
-            for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
+            const char* isolate_reason = nullptr;
+            for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum) &&
+                               isolate_reason == nullptr;
+                 ++i) {
                 int avail_blocks = nof_qos->inflight_blocks_limit -
                                    nof_qos->inflight_blocks[i];
                 while (nof_qos->head[i] && avail_blocks > 0) {
@@ -588,10 +787,28 @@ void NofWorkerPool::workerThread(int work_idx) {
                         sub_task->submit_bytes = submit_bytes;
                         sub_task->adaptor = {&nof_io_complete, sub_task};
 
-                        int ret = initiator_->SubmitIO(
+                        // Host buffers take the classic path inside the
+                        // initiator; device buffers use GPU Direct.
+                        int ret = initiator_->SubmitIOWithBuffer(
                             task->seg_handle, submit_ptr, submit_off,
-                            submit_bytes, task->op, &sub_task->adaptor);
+                            submit_bytes, task->op, &sub_task->adaptor,
+                            task->buffer_info);
                         if (ret != 0) {
+                            // Return the pool slot: a sub-task taken out and
+                            // then failing to submit must be returned, or
+                            // repeated failures would exhaust the 4096 slots
+                            // and allocate new chunks unboundedly.
+                            sub_task->sub_task_pool->push(sub_task);
+                            const bool has_inflight =
+                                nof_qos->inflight_blocks[0] > 0 ||
+                                nof_qos->inflight_blocks[1] > 0;
+                            if ((ret == -EAGAIN || ret == -ENOMEM) &&
+                                has_inflight) {
+                                // Queue pressure: keep the task at the head,
+                                // poll to return credits, retry next round.
+                                avail_blocks = 0;
+                                break;
+                            }
 #ifdef USE_NOF
                             if (task->metric) {
                                 if (task->op == NofIOOp::kWrite) {
@@ -601,18 +818,26 @@ void NofWorkerPool::workerThread(int work_idx) {
                                 }
                             }
 #endif
-                            LOG(ERROR) << "work " << work_idx << ", seg "
-                                       << task->seg_handle << " submit io fail";
-                            // Return the pool slot: a sub-task taken out
-                            // and then failing to submit must be returned,
-                            // or repeated failures would exhaust the 4096
-                            // slots and allocate new chunks unboundedly.
-                            sub_task->sub_task_pool->push(sub_task);
+                            LOG(ERROR) << "work " << work_idx << ", lane "
+                                       << task->seg_handle
+                                       << " submit io fail: ret " << ret;
+                            if (ret == -ENXIO || ret == -ENODEV) {
+                                // The lane is gone; fail everything on it.
+                                isolate_reason = "NoF lane submit failed";
+                                avail_blocks = 0;
+                                break;
+                            }
                             task->failed = true;
                             task->remaining_bytes = 0;
                         } else {
                             const int submit_blocks =
                                 static_cast<int>(submit_bytes / block_size);
+                            if (nof_qos->live.empty()) {
+                                // Idle -> busy: start the timeout clock.
+                                nof_qos->last_progress =
+                                    std::chrono::steady_clock::now();
+                            }
+                            nof_qos->live.insert(task);
                             task->idx++;
                             task->remaining_bytes -= submit_bytes;
                             nof_qos->inflight_blocks[i] += submit_blocks;
@@ -620,7 +845,15 @@ void NofWorkerPool::workerThread(int work_idx) {
                             task->outstanding_sub_io++;
                             total_outstanding_io->fetch_add(
                                 1, std::memory_order_acq_rel);
+#ifdef USE_NOF_URMA
+                            RecordNofIoSubmitted(task->buffer_info,
+                                                 task->op == NofIOOp::kWrite,
+                                                 submit_bytes);
+#endif
                         }
+                    }
+                    if (isolate_reason != nullptr) {
+                        break;
                     }
                     if (task->remaining_bytes == 0) {
                         nof_qos->PopTask(static_cast<NofIOOp>(i));
@@ -629,13 +862,32 @@ void NofWorkerPool::workerThread(int work_idx) {
                     }
                 }
             }
+            if (isolate_reason != nullptr) {
+                IsolateNofLane(*initiator_, seg_handle, nof_qos.get(),
+                               *total_outstanding_io, work_idx,
+                               isolate_reason);
+            }
         }
 
         if (total_outstanding_io->load(std::memory_order_acquire) > 0) {
-            for (auto& it : seg_to_qos) {
-                int64_t ret = initiator_->PollCompletion(it.first, 0);
-                if (ret < 0) {
+            const auto io_timeout = GetNofIoTimeout();
+            const auto now = std::chrono::steady_clock::now();
+            for (auto& [lane, nof_qos] : seg_to_qos) {
+                if (nof_qos->dead) {
+                    continue;
+                }
+                const int64_t ret = initiator_->PollCompletion(lane, 0);
+                if (ret == -ENXIO || ret == -ENODEV) {
+                    IsolateNofLane(*initiator_, lane, nof_qos.get(),
+                                   *total_outstanding_io, work_idx,
+                                   "NoF lane poll failed");
+                } else if (ret < 0) {
                     LOG(ERROR) << "poll completion error: ret " << ret;
+                } else if (io_timeout.count() > 0 && !nof_qos->live.empty() &&
+                           now - nof_qos->last_progress > io_timeout) {
+                    IsolateNofLane(*initiator_, lane, nof_qos.get(),
+                                   *total_outstanding_io, work_idx,
+                                   "NoF lane I/O timeout");
                 }
             }
         }
@@ -678,16 +930,49 @@ void NofWorkerPool::workerThread(int work_idx) {
 // ============================================================================
 // MemcpyWorkerPool Implementation
 // ============================================================================
-// Since memcpy is bound by memory bandwidth, we only need one worker thread.
-constexpr int kDefaultMemcpyWorkers = 1;
+// A single worker serializes otherwise independent local-memory puts. Four
+// workers expose several cores of memcpy bandwidth without creating an
+// unbounded number of threads. Tune with MC_STORE_MEMCPY_WORKERS (1..64).
+constexpr int kDefaultMemcpyWorkers = 4;
+constexpr int kMaxMemcpyWorkers = 64;
+
+static int GetMemcpyWorkerCount() {
+    static const int worker_count = [] {
+        const unsigned int hardware_threads =
+            std::thread::hardware_concurrency();
+        const int automatic_default =
+            hardware_threads == 0
+                ? kDefaultMemcpyWorkers
+                : std::max(1, std::min(kDefaultMemcpyWorkers,
+                                       static_cast<int>(hardware_threads)));
+        const int parsed = GetPositiveEnvOrDefault("MC_STORE_MEMCPY_WORKERS",
+                                                   automatic_default);
+        if (parsed > kMaxMemcpyWorkers) {
+            LOG(WARNING) << "MC_STORE_MEMCPY_WORKERS=" << parsed
+                         << " exceeds " << kMaxMemcpyWorkers << ", using "
+                         << automatic_default;
+            return automatic_default;
+        }
+        return parsed;
+    }();
+    return worker_count;
+}
+
+// Host-to-host copies run inline on the submitting thread by default
+// (MC_STORE_MEMCPY_INLINE=0 queues them on the pool instead).
+static bool IsInlineHostMemcpyEnabled() {
+    static const bool enabled = ParseBoolEnv("MC_STORE_MEMCPY_INLINE", true);
+    return enabled;
+}
 
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
-    VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
-            << " workers";
+    const int worker_count = GetMemcpyWorkerCount();
+    VLOG(1) << "Creating MemcpyWorkerPool with " << worker_count
+            << " workers; tune with MC_STORE_MEMCPY_WORKERS";
 
     // Start worker threads
-    workers_.reserve(kDefaultMemcpyWorkers);
-    for (int i = 0; i < kDefaultMemcpyWorkers; ++i) {
+    workers_.reserve(worker_count);
+    for (int i = 0; i < worker_count; ++i) {
         workers_.emplace_back(&MemcpyWorkerPool::workerThread, this);
     }
 }
@@ -1016,26 +1301,47 @@ void TransferEngineOperationState::wait_for_completion() {
 #endif
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
-    while (true) {
-        if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
-        }
+    const bool ub_transport = engine_.getTransport("ub") != nullptr;
+    const auto sleep_time =
+        std::chrono::microseconds(ub_transport ? UbPollSleepUs() : 0);
+    const auto spin_time =
+        std::chrono::microseconds(ub_transport ? UbPollSpinUs() : 0);
+    auto spin_until = std::chrono::steady_clock::now() + spin_time;
+    if (ub_transport) {
+        LOG_FIRST_N(INFO, 1) << "UB completion polling: spin_us="
+                             << spin_time.count()
+                             << " sleep_us=" << sleep_time.count()
+                             << " (MC_STORE_UB_POLL_SLEEP_US=0 restores "
+                                "busy polling)";
+    }
 
-        std::unique_lock<std::mutex> lock(mutex_);
-        check_task_status();
-        if (result_.has_value()) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(result_.value());
-            break;
+    while (true) {
+        {
+            // Timeout and status are checked under the lock so a concurrent
+            // observer never sees two results.
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (result_.has_value()) return;
+            if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
+                LOG(ERROR) << "Failed to complete transfers after "
+                           << timeout_milliseconds << " milliseconds for batch "
+                           << batch_id_;
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            check_task_status();
+            if (result_.has_value()) {
+                VLOG(1) << "Transfer engine operation completed for batch "
+                        << batch_id_ << " with result: "
+                        << static_cast<int>(result_.value());
+                break;
+            }
         }
-        // Continue polling
-        VLOG(1) << "Transfer engine operation still pending for batch "
-                << batch_id_;
+        // Lock released before sleeping so other observers see progress.
+        if (sleep_time.count() > 0 &&
+            std::chrono::steady_clock::now() >= spin_until) {
+            std::this_thread::sleep_for(sleep_time);
+            spin_until = std::chrono::steady_clock::now() + spin_time;
+        }
     }
 }
 
@@ -1149,6 +1455,11 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         }
 
         future = submitNofOperation(handle, ptr, size, op_code);
+    } else if (replica.is_vsegment_replica()) {
+        // Without this branch a vsegment replica would fall through to the
+        // file-read path.
+        LOG(ERROR) << "VSegment transfer requires an expanded transfer plan";
+        return std::nullopt;
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
     }
@@ -1158,6 +1469,61 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         updateTransferMetrics(slices, op_code);
     }
 
+    return future;
+}
+
+// Opens a transfer segment through TENT when active, else the classic
+// engine. Returns false when the endpoint cannot be opened.
+static bool OpenTransferSegment(TransferEngine& engine,
+                                [[maybe_unused]] void* tent_engine,
+                                const std::string& endpoint,
+                                SegmentHandle* out) {
+#ifdef USE_TENT
+    if (tent_engine) {
+        tent::SegmentID seg_id;
+        auto status = static_cast<tent::TransferEngine*>(tent_engine)
+                          ->openSegment(seg_id, endpoint);
+        if (!status.ok()) {
+            return false;
+        }
+        *out = seg_id;
+        return true;
+    }
+#endif
+    *out = engine.openSegment(endpoint);
+    return *out != static_cast<uint64_t>(ERR_INVALID_ARGUMENT);
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitVSegment(
+    const vsegment::VSegmentTransferPlan& plan,
+    TransferRequest::OpCode op_code) {
+    if (!plan || plan.requests.empty()) return std::nullopt;
+    std::vector<TransferRequest> requests;
+    requests.reserve(plan.requests.size());
+    uint64_t bytes = 0;
+    for (const auto& subrequest : plan.requests) {
+        SegmentHandle segment = 0;
+        if (!OpenTransferSegment(engine_, tent_engine_, subrequest.endpoint,
+                                 &segment)) {
+            LOG(ERROR) << "Failed to open vsegment member endpoint='"
+                       << subrequest.endpoint << "'";
+            return std::nullopt;
+        }
+        TransferRequest request;
+        request.opcode = op_code;
+        request.source =
+            reinterpret_cast<void*>(subrequest.transfer.client_address);
+        request.target_id = segment;
+        request.target_offset = subrequest.transfer.physical_offset;
+        request.length = subrequest.transfer.length;
+        requests.push_back(request);
+        bytes += subrequest.transfer.length;
+    }
+    auto future = submitTransfer(requests);
+    if (future) {
+        std::vector<Slice> metric_slices{{nullptr, bytes}};
+        updateTransferMetrics(metric_slices, op_code);
+    }
     return future;
 }
 
@@ -1725,6 +2091,53 @@ void TransferSubmitter::appendMemcpyOperations(
     }
 }
 
+std::optional<TransferFuture>
+TransferSubmitter::submit_batch_push_offload_object(
+    const std::string& requester_te_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& src_pointers,
+    const std::vector<std::vector<OffloadDstSlice>>& dst_slices) {
+    if (keys.size() != src_pointers.size() ||
+        keys.size() != dst_slices.size()) {
+        LOG(ERROR) << "submit_batch_push_offload_object size mismatch: keys="
+                   << keys.size() << ", src_pointers=" << src_pointers.size()
+                   << ", dst_slices=" << dst_slices.size();
+        return std::nullopt;
+    }
+    // Open the requester's segment once: all keys share requester_te_addr.
+    SegmentHandle seg = 0;
+    if (!OpenTransferSegment(engine_, tent_engine_, requester_te_addr, &seg)) {
+        LOG(ERROR) << "Failed to open segment " << requester_te_addr;
+        return std::nullopt;
+    }
+    constexpr uint64_t kMaxAddress = std::numeric_limits<uint64_t>::max();
+    std::vector<TransferRequest> requests;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        // src is the owner's contiguous ClientBuffer blob for this key; it
+        // is split across the requester's destination slices.
+        const uint64_t src = src_pointers[i];
+        uint64_t offset = 0;
+        for (const auto& dst : dst_slices[i]) {
+            if (dst.size == 0) continue;
+            if (src == 0 || src > kMaxAddress - offset ||
+                dst.size > kMaxAddress - src - offset) {
+                LOG(ERROR) << "Invalid offload push range for key: "
+                           << keys[i];
+                return std::nullopt;
+            }
+            TransferRequest request;
+            request.opcode = TransferRequest::WRITE;
+            request.source = reinterpret_cast<char*>(src + offset);
+            request.target_id = seg;
+            request.target_offset = dst.addr;
+            request.length = dst.size;
+            requests.emplace_back(request);
+            offset += dst.size;
+        }
+    }
+    return submitTransfer(requests);
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
@@ -1735,10 +2148,41 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
-    std::vector<MemcpyOperation> operations) {
-    auto state = std::make_shared<MemcpyOperationState>();
+    std::vector<MemcpyOperation> operations, uint64_t trace_id) {
+    auto state = std::make_shared<MemcpyOperationState>(trace_id);
+    if (IsInlineHostMemcpyEnabled()) {
+        // Host-only batches are copied right here: queueing them costs a
+        // thread handoff that dominates small copies. Any accelerator
+        // pointer sends the whole batch to the pool.
+        try {
+            bool host_only = true;
+            auto runtime_accelerator =
+                device::GetAcceleratorRegistry().RuntimeAccelerators();
+            if (!runtime_accelerator.Devices().empty()) {
+                for (const auto& op : operations) {
+                    if (runtime_accelerator.FindDeviceForPointer(op.src) ||
+                        runtime_accelerator.FindDeviceForPointer(op.dest)) {
+                        host_only = false;
+                        break;
+                    }
+                }
+            }
+            if (host_only) {
+                for (const auto& op : operations) {
+                    std::memcpy(op.dest, op.src, op.size);
+                }
+                state->set_completed(ErrorCode::OK);
+                return TransferFuture(state);
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Exception while classifying memcpy pointers: "
+                       << e.what();
+            state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return TransferFuture(state);
+        }
+    }
     const size_t operation_count = operations.size();
-    MemcpyTask task(std::move(operations), state);
+    MemcpyTask task(std::move(operations), state, trace_id);
     memcpy_pool_->submitTask(std::move(task));
 
     VLOG(1) << "Memcpy transfer submitted to worker pool with "

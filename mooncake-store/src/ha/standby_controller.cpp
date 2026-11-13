@@ -52,7 +52,7 @@ StandbyRuntimeCapabilities BuildStandbyRuntimeCapabilities(
 
 MasterRuntimeState MapStandbyRuntimeState(
     const StandbySyncStatus& status,
-    const std::optional<MasterView>& observed_leader,
+    const MasterSources& observed_sources,
     const StandbyRuntimeCapabilities& capabilities) {
     switch (status.state) {
         case StandbyState::STOPPED:
@@ -65,7 +65,7 @@ MasterRuntimeState MapStandbyRuntimeState(
             return MasterRuntimeState::kRecovering;
         case StandbyState::WATCHING:
             if (capabilities.has_oplog_following &&
-                observed_leader.has_value() && status.lag_entries > 0) {
+                !observed_sources.empty() && status.lag_entries > 0) {
                 return MasterRuntimeState::kCatchingUp;
             }
             return MasterRuntimeState::kStandby;
@@ -78,7 +78,10 @@ MasterRuntimeState MapStandbyRuntimeState(
 
 class NoopStandbyController final : public StandbyController {
    public:
-    ErrorCode StartStandby(const std::optional<MasterView>&) override {
+    using StandbyController::StartStandby;
+    using StandbyController::UpdateObservedLeader;
+
+    ErrorCode StartStandby(const MasterSources&) override {
         return ErrorCode::OK;
     }
 
@@ -88,10 +91,12 @@ class NoopStandbyController final : public StandbyController {
 
     tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport()
         override {
+        // Nothing to export without a standby replay: an empty context lets
+        // the primary serve directly instead of looping on promotion.
         return PromotionContext{};
     }
 
-    void UpdateObservedLeader(const std::optional<MasterView>&) override {}
+    void UpdateObservedLeader(const MasterSources&) override {}
 
     MasterRuntimeState GetStandbyRuntimeState() const override {
         return MasterRuntimeState::kStandby;
@@ -187,17 +192,28 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         standby_service_.reset();
     }
 
-    ErrorCode StartStandby(
-        const std::optional<MasterView>& observed_leader) override {
+    using StandbyController::StartStandby;
+    using StandbyController::UpdateObservedLeader;
+
+    ErrorCode StartStandby(const MasterSources& sources) override {
         bool standby_running = false;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            observed_leader_ = observed_leader;
+            observed_sources_ = sources;
             standby_running = standby_running_;
         }
         if (standby_running) {
+            // Running: rebind when the source set changed (CVM dynamic
+            // binding). A single-leader standby always has the same one
+            // unpartitioned source, so this is a no-op there.
+            const ErrorCode err = standby_service_->UpdateSources(
+                sources, oplog_connstring_, config_.cluster_id);
+            if (err != ErrorCode::OK) {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                last_standby_error_ = err;
+            }
             NotifyRuntimeStateIfChanged();
-            return ErrorCode::OK;
+            return err;
         }
 
         if (start_error_injector_) {
@@ -215,9 +231,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             return dependency_init_error_;
         }
 
-        ErrorCode err = standby_service_->Start(
-            observed_leader.has_value() ? observed_leader->leader_address : "",
-            oplog_connstring_, config_.cluster_id);
+        ErrorCode err = standby_service_->Start(sources, oplog_connstring_,
+                                                config_.cluster_id);
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -338,6 +353,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             ctx.applied_cursor = handoff->applied_cursor;
             ctx.producer_view_version = handoff->producer_view_version;
             ctx.max_replica_id = handoff->max_replica_id;
+            ctx.vsegment_partitions = std::move(handoff->vsegment_partitions);
             if (batch_oplog_snapshot_coordinator_) {
                 batch_oplog_snapshot_coordinator_->Stop();
             }
@@ -372,32 +388,32 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         ctx.segments = std::move(snapshot.segments);
         ctx.weight_metadata =
             snapshot.weight_metadata.value_or(WeightMetadataSnapshot{});
+        ctx.vsegment_partitions = std::move(snapshot.vsegment_partitions);
 
         return ctx;
     }
 
-    void UpdateObservedLeader(
-        const std::optional<MasterView>& observed_leader) override {
+    void UpdateObservedLeader(const MasterSources& sources) override {
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            observed_leader_ = observed_leader;
+            observed_sources_ = sources;
         }
         NotifyRuntimeStateIfChanged();
     }
 
     MasterRuntimeState GetStandbyRuntimeState() const override {
-        std::optional<MasterView> observed_leader;
+        MasterSources observed_sources;
         bool standby_running = false;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            observed_leader = observed_leader_;
+            observed_sources = observed_sources_;
             standby_running = standby_running_;
         }
         if (!standby_running) {
             return MasterRuntimeState::kStandby;
         }
         return MapStandbyRuntimeState(standby_service_->GetSyncStatus(),
-                                      observed_leader, capabilities_);
+                                      observed_sources, capabilities_);
     }
 
     ErrorCode RestorePromotionBaseline(PromotionContext context) override {
@@ -454,7 +470,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
     std::string oplog_connstring_;
 
     mutable std::mutex state_mutex_;
-    std::optional<MasterView> observed_leader_;
+    MasterSources observed_sources_;
     bool standby_running_ = false;
     ErrorCode last_standby_error_{ErrorCode::OK};
 

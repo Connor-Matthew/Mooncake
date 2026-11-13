@@ -23,6 +23,7 @@
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_types.h"
+#include "vsegment/vsegment_ha.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
@@ -238,6 +239,27 @@ std::shared_ptr<FakeHaKvBackend> MakeBackendWithBatch(
                            EncodeOpLogBatchRecord(
                                MakeBatch(batch_id, first_seq, last_seq))));
     return backend;
+}
+
+// SP930 port: one batch carrying a VSegment partition state checkpoint, used
+// to prove the standby replays and re-exports partition state.
+OpLogBatchRecord MakeVSegmentBatch(
+    const vsegment::PartitionVSegmentSnapshot& state) {
+    vsegment::VSegmentOpLogRecord record{state.partition_id, state.route_epoch,
+                                         state.metadata_revision,
+                                         "test",
+                                         state,
+                                         true,
+                                         {}};
+    std::string payload;
+    struct_json::to_json(record, payload);
+    OpLogBatchRecord batch;
+    batch.batch_id = 1;
+    batch.first_seq = 1;
+    batch.last_seq = 1;
+    batch.entries.push_back(
+        MakeEntry(1, OpType::VSEGMENT_STATE, state.partition_id, payload));
+    return batch;
 }
 
 bool WaitForAppliedSequence(HotStandbyService& service, uint64_t seq,
@@ -1028,6 +1050,55 @@ TEST_F(PromotionCatchUpTest, FailsPromotionWhenTargetBatchUnreadable) {
     ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
     EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+// SP930 port: the standby applies VSegment state entries from the batch OpLog
+// and hands the partitions back through ExportStandbySnapshot.
+TEST_F(HotStandbyServiceTest, ReplaysAndExportsVSegmentState) {
+    const std::string cluster_id = "standby-vsegment-state";
+    vsegment::PartitionVSegmentSnapshot state;
+    state.partition_id = "partition-1";
+    state.route_epoch = 4;
+    state.metadata_revision = 1;
+
+    auto backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildDurablePrefixKey(cluster_id),
+                           EncodeDurablePrefix(
+                               {.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey(cluster_id, 1),
+                           EncodeOpLogBatchRecord(MakeVSegmentBatch(state))));
+
+    HotStandbyConfig config = config_;
+    config.enable_snapshot_bootstrap = false;
+    config.enable_oplog_following = true;
+    config.oplog_poll_interval_ms = 1;
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpBatchKvBackendForTesting(backend);
+    ASSERT_EQ(ErrorCode::OK, service->Start("", "unused", cluster_id));
+    ASSERT_TRUE(WaitForAppliedSequence(*service, 1));
+
+    StandbySnapshot snapshot;
+    ASSERT_TRUE(service->ExportStandbySnapshot(snapshot));
+    ASSERT_EQ(snapshot.vsegment_partitions.size(), 1u);
+    EXPECT_EQ(snapshot.vsegment_partitions.front().partition_id,
+              state.partition_id);
+    EXPECT_EQ(snapshot.vsegment_partitions.front().metadata_revision, 1u);
+    service->Stop();
+}
+
+// SP930 port: Stop is safe and idempotent before Start.
+TEST_F(HotStandbyServiceTest, TestStop) {
+    service_->Stop();
+    SUCCEED();
+}
+
+// SP930 port: repeated status queries agree and do not crash.
+TEST_F(HotStandbyServiceTest, TestGetSyncStatus) {
+    StandbySyncStatus s1 = service_->GetSyncStatus();
+    StandbySyncStatus s2 = service_->GetSyncStatus();
+    EXPECT_EQ(s1.state, s2.state);
 }
 
 }  // namespace mooncake::test

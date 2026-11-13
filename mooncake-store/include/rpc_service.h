@@ -10,10 +10,17 @@
 
 #include "master_service.h"
 #include "types.h"
+
+// master_service.h 已引入 cvm/cvm_controller.h；显式声明依赖类型。
+namespace mooncake::cvm {
+class CvmController;
+}
 #include "rpc_types.h"
 #include "master_config.h"
 #include "kv_event/kv_event_publisher.h"
+#include "io_pattern/cfm_service.h"
 #include "segment.h"
+#include "partition/vsegment_types.h"
 
 namespace mooncake {
 
@@ -85,11 +92,26 @@ class WrappedMasterService {
                           const std::string& tenant_id = "default");
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key, const std::string& tenant_id = "default");
+        const std::string& key, const std::string& tenant_id = "default",
+        uint64_t client_trace_id = 0, const UUID& client_id = {});
+    vsegment::VSegmentPutStartResult VSegmentPutStart(
+        const std::string& partition_id, uint64_t route_epoch,
+        const std::string& operation_id, uint64_t length,
+        const std::string& profile_name);
+    ErrorCode VSegmentPutEnd(const VSegmentDescriptor& replica,
+                             uint64_t route_epoch,
+                             const std::string& operation_id,
+                             const std::string& object_id);
+    ErrorCode VSegmentPutRevoke(const std::string& partition_id,
+                                const std::string& vsegment_id,
+                                uint64_t route_epoch,
+                                const std::string& operation_id);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
-                        const std::string& tenant_id = "default");
+                        const std::string& tenant_id = "default",
+                        uint64_t client_trace_id = 0,
+                        const UUID& client_id = {});
 
     // Read-only admin variants: no lease grants, no promotion, no metric
     // updates.
@@ -100,58 +122,61 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
         const std::string& key, const std::string& tenant_id = "default");
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
+    tl::expected<PutStartResult, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0,
+        const std::string& operation_id = "");
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        const std::string& operation_id = "");
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
-                  const std::vector<uint64_t>& slice_lengths,
-                  const ReplicateConfig& config,
-                  const std::string& tenant_id = "default");
+    std::vector<tl::expected<PutStartResult, ErrorCode>> BatchPutStart(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& slice_lengths,
+        const ReplicateConfig& config, const std::string& tenant_id = "default",
+        uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
+    tl::expected<PutStartResult, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0);
 
     tl::expected<void, ErrorCode> UpsertEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0,
+        const std::string& operation_id = "");
 
     tl::expected<void, ErrorCode> UpsertRevoke(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", uint64_t client_trace_id = 0,
+        const std::string& operation_id = "");
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchUpsertStart(const UUID& client_id,
-                     const std::vector<std::string>& keys,
-                     const std::vector<uint64_t>& slice_lengths,
-                     const ReplicateConfig& config,
-                     const std::string& tenant_id = "default");
+    std::vector<tl::expected<PutStartResult, ErrorCode>> BatchUpsertStart(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& slice_lengths,
+        const ReplicateConfig& config,
+        const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
@@ -244,17 +269,31 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
         const UUID& client_id);
 
+    /**
+     * @brief 被动坏端点上报（方案二被动层）：client 传输失败后上报目标
+     * transport_endpoint 列表，master 标记进 invalid_replica_endpoints_
+     * 供分配过滤与读路径跳过（worker 重挂载时自愈）。
+     */
+    tl::expected<void, ErrorCode> ReportInvalidReplicaEndpoints(
+        const std::vector<std::string>& endpoints);
+
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
     tl::expected<bool, ErrorCode> PollRemoveAll(const UUID& client_id);
 
+    tl::expected<std::vector<RemoveTaskItem>, ErrorCode> RemoveObjectHeartbeat(
+        const UUID& client_id);
+    tl::expected<void, ErrorCode> AckRemoveObjectHeartbeat(
+        const UUID& client_id, const std::vector<RemoveTaskItem>& tasks);
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    tl::expected<std::vector<std::string>, ErrorCode> GetOffloadEndpoints();
 
     // Promotion-on-hit RPCs.
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
@@ -342,7 +381,9 @@ class WrappedMasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
-        const WeightMetadataSnapshot& weight_metadata = {});
+        const WeightMetadataSnapshot& weight_metadata = {},
+        const std::vector<vsegment::PartitionVSegmentSnapshot>&
+            vsegment_partitions = {});
     // Copies objects out of the handoff; the caller keeps ownership.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         const BatchOpLogPromotionHandoff& handoff,
@@ -352,7 +393,128 @@ class WrappedMasterService {
         DurablePrefix applied_cursor,
         const std::vector<StandbySegmentInfo>& segments,
         ReplicaID max_replica_id,
-        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects,
+        const std::vector<vsegment::PartitionVSegmentSnapshot>&
+            vsegment_partitions = {});
+    // 同身份重启失忆自愈（缺陷3修复）：无 PromotionContext 时从本机
+    // OpLog 流自恢复。Internal（supervisor 调用），NOT an RPC endpoint.
+    tl::expected<bool, ErrorCode> TrySelfRecoverFromOpLog();
+
+    // 环互备领养物化（互备 1.4）：supervisor RingStandbyRuntime 在
+    // ring-adopt staging 期间的编排入口，三态语义见
+    // MasterService::AdoptMaterializeFromDeadOwner。Internal（supervisor
+    // 调用），NOT an RPC endpoint.
+    ErrorCode AdoptMaterializeFromDeadOwner(const std::string& source_id,
+                                            bool& stream_present);
+
+    // CVM slot ownership publishing, driven by the HA supervisor. These
+    // forward to the wrapped MasterService (NOT RPC endpoints).
+    void SetCvmLeaseId(EtcdLeaseId lease_id);
+    void SetCvmController(cvm::CvmController* controller);
+    // vsegment auto-plan 重试策略注入（--vsegment_auto_plan flags 解析），
+    // 转发给内部 MasterService（见 MasterService::SetVSegmentAutoPlanPolicy）。
+    void SetVSegmentAutoPlanPolicy(const vsegment::VSegmentUserPolicy& policy);
+    ErrorCode StartSlotOwnerHeartbeat();
+    void StopSlotOwnerHeartbeat();
+
+    // CVM inter-master RPC lifecycle, driven by the HA supervisor (NOT an
+    // RPC endpoint). Starts/stops the peer discovery + connection pools.
+    ErrorCode StartInterMasterRpc();
+    void StopInterMasterRpc();
+
+    // Inter-master handshake RPC: returns this submaster's identity and
+    // ownership summary so peers can verify the inter-master channel.
+    tl::expected<InterMasterHandshakeResponse, ErrorCode>
+    InterMasterHandshake();
+
+    // Current number of CVM slots owned by this submaster (0 until the
+    // ownership resolver has populated the local lookup). Forwarded to the
+    // wrapped MasterService for use by periodic admin metrics reporting.
+    uint32_t GetOwnedSlotCount() const;
+
+    // One-line vsegment/psegment status summary (vsegment enabled state,
+    // quota generation/profiles, installed partitions, vsegment count and
+    // pool composition). Forwarded for the periodic VSegment Status log.
+    std::string GetVSegmentStatusLogLine() const;
+
+    // Inter-master allocation forwarding (CVM plan B): allocate memory
+    // replicas in this submaster's locally mounted segments on behalf of a
+    // slot-owning peer. Strictly within `preferred_segments` when given.
+    // This submaster keeps the real handles alive (keepalive registry);
+    // the slot owner materializes dummy-allocator replicas from the
+    // returned descriptors and owns the metadata.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    InterMasterAllocateReplicas(
+        const std::string& tenant_id, const std::string& key,
+        uint64_t slice_length, uint64_t replica_num,
+        const std::vector<std::string>& preferred_segments);
+
+    // Frees the keepalive entry (and thus the handles) previously created
+    // by InterMasterAllocateReplicas. Returns true when an entry existed.
+    tl::expected<bool, ErrorCode> InterMasterFreeReplicas(
+        const std::string& tenant_id, const std::string& key);
+
+    // Inter-master read forwarding (CVM plan B): local GetReplicaList /
+    // BatchGetReplicaList query for a forwarding peer. These do NOT
+    // re-forward, so an inconsistent view terminates the chain at the first
+    // hop instead of looping.
+    tl::expected<GetReplicaListResponse, ErrorCode> InterMasterGetReplicaList(
+        const std::string& key, const std::string& tenant_id);
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    InterMasterBatchGetReplicaList(const std::vector<std::string>& keys,
+                                   const std::string& tenant_id);
+
+    // Inter-master write forwarding (model B): relays a FULL PutStart to the
+    // slot-owning submaster so it allocates + writes metadata locally.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    InterMasterPutStart(const UUID& client_id, const std::string& key,
+                        const std::string& tenant_id, uint64_t slice_length,
+                        const ReplicateConfig& config);
+
+    // Upsert variant of InterMasterPutStart (owner overwrites-if-exists).
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    InterMasterUpsertStart(const UUID& client_id, const std::string& key,
+                           const std::string& tenant_id, uint64_t slice_length,
+                           const ReplicateConfig& config);
+
+    // Inter-master slot-metadata migration (确定性哈希方案 §15.7，RPC 直传，
+    // 替代 etcd slot_meta 中转): the new slot owner pulls the object-metadata
+    // export from the previous owner. The previous owner keeps its local
+    // metadata until InterMasterAckSlotImported arrives.
+    tl::expected<SlotMetadataExport, ErrorCode> InterMasterExportSlot(
+        uint16_t slot, const std::string& requester_master_id);
+
+    // New owner notifies the previous owner that `slot`'s metadata has been
+    // imported, so the previous owner can drop its local metadata (and clear
+    // the staged export). Returns true when a staged export existed.
+    tl::expected<bool, ErrorCode> InterMasterAckSlotImported(
+        uint16_t slot, const std::string& importer_master_id);
+
+    // ----- 段级批量迁移（§16.19.2，P4 reshard）-----
+
+    // 源侧批量导出：[first_slot, last_slot] 闭区间内所有 slot 的元数据快照
+    // （staged 优先，缺失时即时构建——kMigrating 冻结写后快照稳定）。幂等：
+    // ack 前源不清数据，重复拉取返回相同内容。
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    InterMasterExportSlotBatch(uint16_t first_slot, uint16_t last_slot,
+                               const std::string& requester_master_id);
+
+    // 心跳交接专用的批量导出变体（slot 就绪加速）：未 staged 的 slot 仅在
+    // 源已观察到失去归属时即时构建（require_not_owned 门控），仍持有归属的
+    // slot 缺席于响应（调用方对其走单 slot 路径重试）。新方法独立注册而非
+    // 改既有签名——滚动升级期间旧 peer 无此方法，调用方收到 RPC 错误后
+    // 回退单 slot 路径，兼容语义由调用方保证。
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    InterMasterExportSlotBatchGated(uint16_t first_slot, uint16_t last_slot,
+                                    const std::string& requester_master_id);
+
+    // 段级 ack：目标安装完成后通知源删除区间内全部本地元数据
+    // （DropSlotMetadataRange）。源未观察到归属已切走时返回
+    // SLOT_MIGRATING（目标稍后重试，重发无损）。
+    tl::expected<bool, ErrorCode> InterMasterAckSlotRangeImported(
+        uint16_t first_slot, uint16_t last_slot,
+        const std::string& importer_master_id);
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
@@ -432,8 +594,11 @@ class WrappedMasterService {
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 
+    io_pattern::CfmRpcService& CfmRpcEndpoint() { return cfm_rpc_service_; }
+
    private:
     MasterService master_service_;
+    io_pattern::CfmRpcService cfm_rpc_service_;
 };
 
 class RpcWorkerPool;

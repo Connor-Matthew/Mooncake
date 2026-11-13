@@ -86,6 +86,16 @@ struct BucketBackendConfig {
     // Set by MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=aligned.
     bool aligned_direct_write = false;
 
+    // Explicit removals persist tombstones; GC rewrites live values without
+    // changing the backend's per-disk placement and quota ownership.
+    bool disable_ssd_eviction = false;
+    bool gc_enable = true;
+    int64_t gc_interval_ms = 1000;
+    double gc_deleted_ratio = 0.25;
+    double gc_high_watermark_ratio = 0.90;
+    int64_t gc_max_buckets_per_round = 1;
+    bool gc_merge_enable = true;
+
     bool Validate() const;
 
     /**

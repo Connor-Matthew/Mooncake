@@ -903,7 +903,216 @@ TEST_F(MasterServiceTest, PutEndAllCompletesMemoryAndNoFReplicas) {
     EXPECT_TRUE(has_complete_memory);
     EXPECT_TRUE(has_complete_nof);
 }
+#endif  // USE_NOF
 
+// Injects a synthetic LOCAL_DISK replica for `key` owned by `client_id` via
+// NotifyOffloadSuccess, without running the full offload pipeline.
+static bool InjectLocalDiskReplicaForTest(
+    MasterService& service, const UUID& client_id, const std::string& key,
+    int64_t size, const std::string& transport_endpoint) {
+    std::vector<OffloadTaskItem> tasks{
+        OffloadTaskItem{.tenant_id = "default", .key = key, .size = size}};
+    StorageObjectMetadata sm;
+    sm.bucket_id = 0;
+    sm.offset = 0;
+    sm.key_size = static_cast<int64_t>(key.size());
+    sm.data_size = size;
+    sm.transport_endpoint = transport_endpoint;
+    std::vector<StorageObjectMetadata> metas{sm};
+    return service.NotifyOffloadSuccess(client_id, tasks, metas).has_value();
+}
+
+// A key offloaded by multiple nodes must keep one LOCAL_DISK replica per node
+// (distinct client_id), instead of dropping later ones.
+TEST_F(MasterServiceTest, AddReplicaRecordsOneLocalDiskPerClient) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const std::string key = "multi_local_disk_key";
+    const UUID node_a = generate_uuid();
+    const UUID node_b = generate_uuid();
+
+    // Node A offloads first.
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
+                                              "endpoint_A"));
+    // Node B offloads the same key from a different node.
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_b, key, 1024,
+                                              "endpoint_B"));
+
+    auto resp = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(resp.has_value());
+
+    std::set<std::string> local_disk_endpoints;
+    for (const auto& replica : resp->replicas) {
+        if (replica.is_local_disk_replica()) {
+            local_disk_endpoints.insert(
+                replica.get_local_disk_descriptor().transport_endpoint);
+        }
+    }
+    // Both nodes' LOCAL_DISK replicas must be recorded.
+    EXPECT_EQ(2u, local_disk_endpoints.size());
+    EXPECT_TRUE(local_disk_endpoints.count("endpoint_A"));
+    EXPECT_TRUE(local_disk_endpoints.count("endpoint_B"));
+}
+
+// A re-offload from the SAME client (e.g. restart re-registration) must update
+// that client's LOCAL_DISK replica endpoint in place, not append a duplicate.
+TEST_F(MasterServiceTest, AddReplicaSameClientUpdatesInPlace) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const std::string key = "idempotent_local_disk_key";
+    const UUID node_a = generate_uuid();
+
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
+                                              "endpoint_A_old"));
+    // Same client reports again with a new endpoint (restart re-register).
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
+                                              "endpoint_A_new"));
+
+    auto resp = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(resp.has_value());
+
+    std::vector<std::string> local_disk_endpoints;
+    for (const auto& replica : resp->replicas) {
+        if (replica.is_local_disk_replica()) {
+            local_disk_endpoints.push_back(
+                replica.get_local_disk_descriptor().transport_endpoint);
+        }
+    }
+    // Still exactly one LOCAL_DISK replica, with the refreshed endpoint.
+    ASSERT_EQ(1u, local_disk_endpoints.size());
+    EXPECT_EQ("endpoint_A_new", local_disk_endpoints[0]);
+}
+
+// Mixed: A and B each recorded; then A re-offloads -> still 2 replicas, only
+// A's endpoint refreshed.
+TEST_F(MasterServiceTest, AddReplicaMixedAppendAndUpdate) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const std::string key = "mixed_local_disk_key";
+    const UUID node_a = generate_uuid();
+    const UUID node_b = generate_uuid();
+
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
+                                              "endpoint_A_old"));
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_b, key, 1024,
+                                              "endpoint_B"));
+    // A re-offloads with a new endpoint.
+    ASSERT_TRUE(InjectLocalDiskReplicaForTest(*service_, node_a, key, 1024,
+                                              "endpoint_A_new"));
+
+    auto resp = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(resp.has_value());
+
+    std::set<std::string> local_disk_endpoints;
+    for (const auto& replica : resp->replicas) {
+        if (replica.is_local_disk_replica()) {
+            local_disk_endpoints.insert(
+                replica.get_local_disk_descriptor().transport_endpoint);
+        }
+    }
+    EXPECT_EQ(2u, local_disk_endpoints.size());
+    EXPECT_TRUE(local_disk_endpoints.count("endpoint_A_new"));
+    EXPECT_TRUE(local_disk_endpoints.count("endpoint_B"));
+    EXPECT_FALSE(local_disk_endpoints.count("endpoint_A_old"));
+}
+
+// A key with replica_num > 1 queues one offload task per MEMORY replica (one
+// per node's LOCAL_DISK segment). Every enqueued source replica must be
+// refcnt-protected: an eviction cycle running before the async offload
+// completes must NOT drop any of them, otherwise the corresponding SSD copy
+// would be lost (the worker NACKs the task once the source is gone). After
+// the offload completes (NotifyOffloadSuccess from each node), the holds are
+// released and the MEMORY replicas become evictable again.
+TEST_F(MasterServiceTest, PutEndProtectsAllOffloadSourceReplicasFromEviction) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(100)
+                              .set_default_kv_soft_pin_ttl(100)
+                              .set_enable_offload(true)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    // Two memory segments owned by two clients, each with an offload-enabled
+    // LOCAL_DISK segment.
+    constexpr size_t buffer_a = 0x300000000;
+    constexpr size_t buffer_b = 0x300000000 + 1024 * 1024 * 16;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    [[maybe_unused]] const auto ctx_a =
+        PrepareSimpleSegment(*service_, "segment_a", buffer_a, segment_size);
+    [[maybe_unused]] const auto ctx_b =
+        PrepareSimpleSegment(*service_, "segment_b", buffer_b, segment_size);
+    ASSERT_TRUE(
+        service_->MountLocalDiskSegment(ctx_a.client_id, true).has_value());
+    ASSERT_TRUE(
+        service_->MountLocalDiskSegment(ctx_b.client_id, true).has_value());
+
+    // One key with replica_num=2: replicas land on segment_a and segment_b.
+    const std::string key = "offload_race_key";
+    ReplicateConfig config;
+    config.replica_num = 2;
+    auto put_start = service_->PutStart(ctx_a.client_id, key,
+                                        TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(2u, put_start->size());
+    ASSERT_TRUE(service_
+                    ->PutEnd(ctx_a.client_id, key, TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+
+    // Each node's offload queue must hold one task for the key.
+    auto tasks_a = service_->OffloadObjectHeartbeat(ctx_a.client_id, true);
+    ASSERT_TRUE(tasks_a.has_value());
+    ASSERT_EQ(1u, tasks_a->size());
+    auto tasks_b = service_->OffloadObjectHeartbeat(ctx_b.client_id, true);
+    ASSERT_TRUE(tasks_b.has_value());
+    ASSERT_EQ(1u, tasks_b->size());
+
+    // Wait for lease/soft-pin expiry, then run an eviction cycle. Both MEMORY
+    // replicas are offload sources and must be refcnt-protected, so eviction
+    // must not remove them.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    service_->RunBatchEvictForTesting(0.5, 0.4);
+
+    auto replica_list = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replica_list.has_value());
+    int memory_replicas = 0;
+    for (const auto& r : replica_list->replicas) {
+        if (r.is_memory_replica() && r.status == ReplicaStatus::COMPLETE) {
+            ++memory_replicas;
+        }
+    }
+    EXPECT_EQ(2, memory_replicas)
+        << "offload-source replicas must survive eviction while protected";
+
+    // Complete both offload tasks (one per node); the refcounts are released
+    // and the LOCAL_DISK replicas are recorded.
+    StorageObjectMetadata sm;
+    sm.bucket_id = 0;
+    sm.offset = 0;
+    sm.key_size = static_cast<int64_t>(key.size());
+    sm.data_size = 1024;
+    sm.transport_endpoint = "segment_a";
+    ASSERT_TRUE(service_->NotifyOffloadSuccess(ctx_a.client_id, *tasks_a, {sm})
+                    .has_value());
+    sm.transport_endpoint = "segment_b";
+    ASSERT_TRUE(service_->NotifyOffloadSuccess(ctx_b.client_id, *tasks_b, {sm})
+                    .has_value());
+
+    // With the holds released, an eviction cycle may now drop the MEMORY
+    // replicas (LOCAL_DISK copies exist, data is safe). Note: the
+    // GetReplicaList above renewed the object lease, so wait for it to
+    // expire again before eviction.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    service_->RunBatchEvictForTesting(0.5, 0.4);
+    auto replica_list2 = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replica_list2.has_value());
+    memory_replicas = 0;
+    for (const auto& r : replica_list2->replicas) {
+        if (r.is_memory_replica() && r.status == ReplicaStatus::COMPLETE) {
+            ++memory_replicas;
+        }
+    }
+    EXPECT_EQ(0, memory_replicas)
+        << "MEMORY replicas must become evictable after offload completes";
+}
+
+#ifdef USE_NOF
 TEST_F(MasterServiceTest, PutEndMemoryDoesNotCompleteNoFReplica) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service_);
@@ -4791,6 +5000,180 @@ TEST_F(MasterServiceTest, StopHttpMetadataCleanupIsNoOpWhenNeverStarted) {
     // Cleanup stays disabled: neither a co-located server nor a remote URL.
     MasterServiceTestPeer(service).CleanupHttpMetadataForTesting("segment_a");
     service.StopHttpMetadataCleanup();
+}
+
+// ---- SP930-only tests (extracted whole from MERGE_HEAD) ----
+
+// 修改二回归（冗余 segment 清理）：client 被 kill 后快速重注册（快于
+// TTL reaper 的 client_live_ttl 窗口）时，同 name + 同 host_id + 同
+// te_endpoint（非 P2PHANDSHAKE 固定端点场景）但不同 owner client 的
+// 旧代 segment 应在新代挂载时被立即驱逐，而非残留等待 TTL 过期。
+TEST_F(MasterServiceTest, StaleGenerationEvictedOnFastClientRemount) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+
+    // 旧代：client1 挂载（host_id 非空才进入 stale generation 清理路径）。
+    auto old_segment = MakeSegment("hostA", buffer1, size, "hostA");
+    UUID client1 = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(old_segment, client1).has_value());
+
+    // 旧代段上写入一个对象。
+    std::string key1 =
+        GenerateKeyForSegment(client1, service_, old_segment.name);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(
+        service_->PutStart(client1, key1, TenantId::Default(), 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service_
+            ->PutEnd(client1, key1, TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_EQ(1, service_->GetKeyCount());
+
+    // 新代：模拟 client 重启后重注册——同 name / host_id / te_endpoint，
+    // 不同 segment.id 与 owner client。驱逐已异步化（MountSegment 仅入队，
+    // stale_evict_thread_ 延迟执行），冲刷队列后再断言。
+    auto new_segment = MakeSegment("hostA", buffer2, size, "hostA");
+    UUID client2 = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(new_segment, client2).has_value());
+    service_->FlushStaleEvictQueueForTesting();
+
+    // 旧代段已被驱逐：旧对象随段卸载清理而消失（不等 TTL）。
+    auto get_result1 = service_->GetReplicaList(key1, TenantId::Default());
+    ASSERT_FALSE(get_result1.has_value());
+    ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
+
+    // 新代段可用：client2 可正常写入并读取。
+    std::string key2 =
+        GenerateKeyForSegment(client2, service_, new_segment.name);
+    auto put_start2 =
+        service_->PutStart(client2, key2, TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put_start2.has_value());
+    ASSERT_TRUE(
+        service_
+            ->PutEnd(client2, key2, TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+    auto get_result2 = service_->GetReplicaList(key2, TenantId::Default());
+    ASSERT_TRUE(get_result2.has_value());
+    ASSERT_EQ(get_result2.value()
+                  .replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              new_segment.name);
+    ASSERT_EQ(1, service_->GetKeyCount());
+
+    // 幂等重挂（同 owner + 同端点）不触发驱逐：新代重复挂载应保留对象。
+    // 重挂同样入队（参考 client=client2 仍持有该 name 段，drain 重新检测
+    // 无旧代 → no-op），冲刷后再断言。
+    ASSERT_TRUE(service_->MountSegment(new_segment, client2).has_value());
+    service_->FlushStaleEvictQueueForTesting();
+    auto get_result3 = service_->GetReplicaList(key2, TenantId::Default());
+    ASSERT_TRUE(get_result3.has_value());
+    ASSERT_EQ(1, service_->GetKeyCount());
+}
+
+TEST_F(MasterServiceTest, StrictReplicaAllocationRejectsPartialAllocation) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_strict_replica_allocation(true)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    // Mount two segments only
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t segment_size = 1024 * 1024 * 64;  // 64MB
+
+    auto segment1 = MakeSegment("segment1", buffer1, segment_size);
+    auto segment2 = MakeSegment("segment2", buffer2, segment_size);
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment1, client_id).has_value());
+    ASSERT_TRUE(service_->MountSegment(segment2, client_id).has_value());
+
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t partial_before = metrics.get_put_start_partial_allocations();
+    const int64_t alloc_fail_before = metrics.get_put_start_alloc_failures();
+
+    // Requesting more replicas than available segments must fail outright
+    // instead of degrading to a partial allocation.
+    ReplicateConfig config;
+    config.replica_num = 3;
+    auto put_start_result = service_->PutStart(
+        client_id, "strict_partial_key", TenantId::Default(), 1024, config);
+    ASSERT_FALSE(put_start_result.has_value());
+    ASSERT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, put_start_result.error());
+    // Strict failures are surfaced as allocation failures, not as partial
+    // allocations.
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before);
+    ASSERT_EQ(metrics.get_put_start_alloc_failures(), alloc_fail_before + 1);
+
+    // A fully satisfiable request still succeeds in strict mode.
+    ReplicateConfig full_config;
+    full_config.replica_num = 2;
+    auto full_result = service_->PutStart(
+        client_id, "strict_full_key", TenantId::Default(), 1024, full_config);
+    ASSERT_TRUE(full_result.has_value());
+    ASSERT_EQ(2u, full_result->size());
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before);
+}
+
+// Covers the exact scenario where strict mode changes behavior: a dual
+// memory replica request that can only allocate one replica (single
+// mounted segment). Best-effort silently degrades to one replica while
+// strict mode rejects the request outright.
+TEST_F(MasterServiceTest, StrictReplicaAllocationRejectsDegradedDualReplica) {
+    constexpr size_t kBufferAddress = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 64;  // 64MB
+    auto& metrics = MasterMetricManager::instance();
+
+    // Baseline (flag off, pre-change behavior): with a single mounted
+    // segment, replica_num=2 degrades to one replica and still succeeds.
+    {
+        std::unique_ptr<MasterService> service_(new MasterService());
+        auto segment = MakeSegment("segment1", kBufferAddress, kSegmentSize);
+        UUID client_id = generate_uuid();
+        ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+        const int64_t partial_before =
+            metrics.get_put_start_partial_allocations();
+        ReplicateConfig config;
+        config.replica_num = 2;
+        auto result = service_->PutStart(client_id, "degraded_dual_key",
+                                         TenantId::Default(), 1024, config);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(1u, result->size());
+        ASSERT_EQ(metrics.get_put_start_partial_allocations(),
+                  partial_before + 1);
+    }
+
+    // Strict mode: the same request must fail instead of degrading.
+    {
+        auto service_config = MasterServiceConfig::builder()
+                                  .set_strict_replica_allocation(true)
+                                  .build();
+        std::unique_ptr<MasterService> service_(
+            new MasterService(service_config));
+        auto segment = MakeSegment("segment1", kBufferAddress, kSegmentSize);
+        UUID client_id = generate_uuid();
+        ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+        const int64_t partial_before =
+            metrics.get_put_start_partial_allocations();
+        const int64_t alloc_fail_before =
+            metrics.get_put_start_alloc_failures();
+        ReplicateConfig config;
+        config.replica_num = 2;
+        auto result = service_->PutStart(client_id, "strict_dual_key",
+                                         TenantId::Default(), 1024, config);
+        ASSERT_FALSE(result.has_value());
+        ASSERT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, result.error());
+        ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before);
+        ASSERT_EQ(metrics.get_put_start_alloc_failures(),
+                  alloc_fail_before + 1);
+    }
 }
 
 }  // namespace mooncake::test

@@ -215,6 +215,10 @@ struct ObjectMetadata {
 
     ObjectPart& MutablePart(size_t index) { return parts_.at(index); }
 
+    bool HasVSegmentReplica() const {
+        return HasReplica([](const Replica& replica) { return replica.is_vsegment_replica(); });
+    }
+
     size_t TotalLength() const {
         size_t total = 0;
         for (const auto& part : parts_) {
@@ -319,6 +323,22 @@ struct ObjectMetadata {
     void GrantReadLease(std::chrono::milliseconds ttl) const {
         SpinLocker locker(&lock);
         lease_->GrantReadLease(ttl);
+    }
+
+    // SP930 port: extend the lease, and — when a soft pin is committed —
+    // the soft pin with it. Both deadlines only ever move forward; an
+    // object without a committed soft pin does not gain one here.
+    std::optional<std::chrono::system_clock::time_point> GrantLease(
+        std::chrono::milliseconds ttl,
+        std::chrono::milliseconds soft_ttl) const {
+        SpinLocker locker(&lock);
+        lease_->GrantReadLease(ttl);
+        if (soft_pin_timeout) {
+            const auto now = std::chrono::system_clock::now();
+            soft_pin_timeout = std::max(*soft_pin_timeout,
+                                        ComputeSoftPinDeadline(now, soft_ttl));
+        }
+        return soft_pin_timeout;
     }
 
     // Whether the authoritative lease is expired.

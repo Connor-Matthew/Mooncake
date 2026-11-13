@@ -13,9 +13,12 @@
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 #include <chrono>
+#include <set>
 #include <unordered_set>
+#include <utility>
 
 #include "client_metric.h"
+#include "client_buffer.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -52,6 +55,11 @@ class QueryResult {
     /** @brief Tenant scope the master resolved the query to, when the master
      * reports it; readers forward it to disk-replica verify requests */
     const std::optional<std::string> resolved_tenant_id;
+    /**
+     * @brief Optional runtime layout table carried by the RPC response.
+     * Only populated for vsegment replicas; shared across a batch.
+     */
+    std::shared_ptr<const std::vector<VSegmentLayoutEntry>> vsegment_layouts;
 
     QueryResult(
         std::vector<Replica::Descriptor>&& replicas_param,
@@ -112,8 +120,25 @@ class Client {
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
             const std::vector<Slice>&)>;
 
+    // Optional diagnostic guard. Configure before starting reads; the callable
+    // must support concurrent invocation. It sees the descriptor actually used
+    // for transfer, including a possible local hot-cache redirection.
+    using ReadReplicaValidator =
+        std::function<bool(const std::string&, const Replica::Descriptor&)>;
+    void SetReadReplicaValidator(ReadReplicaValidator validator) {
+        read_replica_validator_ = std::move(validator);
+    }
+
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+    void SetVSegmentTransferPlanner(
+        std::shared_ptr<vsegment::VSegmentTransferPlanner> planner) {
+        vsegment_transfer_planner_ = std::move(planner);
+    }
+    void SetReplicaTransferStagingAllocator(
+        std::shared_ptr<ClientBufferAllocator> allocator) {
+        replica_transfer_staging_allocator_ = std::move(allocator);
+    }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -149,6 +174,9 @@ class Client {
     // Test-only accessor for the wiring above: the initiator this client
     // ended up with (nullptr = NoF unavailable in this process).
     std::shared_ptr<NVMeoFInitiator> GetNofInitiatorForTesting() const;
+
+    Status configureScheduling(
+        const scheduling::SchedulerConfig& scheduler_config);
 
     /**
      * @brief Retrieves data for a given key
@@ -214,6 +242,11 @@ class Client {
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
     QueryByRegex(const std::string& str);
+
+    /**
+     * @brief Returns unique offload RPC endpoints currently known by master.
+     */
+    tl::expected<std::vector<std::string>, ErrorCode> GetOffloadEndpoints();
 
     /**
      * @brief Batch query object metadata without transferring data
@@ -293,13 +326,21 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool group_by_target = false);
+        bool group_by_target = false,
+        bool prefer_alloc_in_same_node = false);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
 
     /**
      * @brief Stores data with replication
      * @param key Object key
      * @param slices Vector of data slices to store
      * @param config Replication configuration
+     * @param enable_upsert_from_diagnostics Enable upsert_from-only SpDiag
+     *        points and sampled breakdown logging
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Put(const ObjectKey& key,
@@ -385,9 +426,10 @@ class Client {
      * @param config Replication configuration
      * @return ErrorCode indicating success/failure
      */
-    tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
-                                         std::vector<Slice>& slices,
-                                         const ReplicateConfig& config);
+    tl::expected<void, ErrorCode> Upsert(
+        const ObjectKey& key, std::vector<Slice>& slices,
+        const ReplicateConfig& config,
+        bool enable_upsert_from_diagnostics = false);
 
     /**
      * @brief Batch upsert data with replication
@@ -686,6 +728,15 @@ class Client {
      */
     virtual tl::expected<void, ErrorCode> RegisterPrefetchTask(
         const std::string& object_key, const std::string& tenant_id);
+    /**
+     * @brief Fetch pending removed keys for this client's LOCAL_DISK replicas.
+     * The caller marks each key removed and acknowledges the processed tasks.
+     */
+    [[nodiscard]] tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+    RemoveObjectHeartbeat(const UUID& client_id);
+
+    tl::expected<void, ErrorCode> AckRemoveObjectHeartbeat(
+        const UUID& client_id, const std::vector<RemoveTaskItem>& tasks);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
@@ -748,6 +799,21 @@ class Client {
         TransferIntent intent = TransferIntent::kForegroundGet);
 
     /**
+     * @brief Push counterpart of BatchGetOffloadObject, run on the data owner.
+     * WRITEs each key's staged ClientBuffer blob (src_pointers[i]) directly
+     * into the requester's destination slices over the transfer engine.
+     * @param requester_te_addr The requester's Transfer Engine endpoint.
+     * @param keys List of keys (one per src pointer / dst slice group).
+     * @param src_pointers Owner-local ClientBuffer addresses, one per key.
+     * @param dst_slices Per-key destination slices on the requester.
+     */
+    tl::expected<void, ErrorCode> BatchPushOffloadObject(
+        const std::string& requester_te_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& src_pointers,
+        const std::vector<std::vector<OffloadDstSlice>>& dst_slices);
+
+    /**
      * @brief Notifies the master that offloading of specified objects has
      * succeeded.
      * @param keys         A list of object keys (names) that were successfully
@@ -763,6 +829,97 @@ class Client {
         const std::vector<StorageObjectMetadata>& metadatas);
     void SetDfsStorageBackend(
         std::shared_ptr<DistributedStorageBackend> backend);
+
+    // === 多 submaster 定向 offload 控制面（FileStorage 专用） ===
+    // 以下方法与上面的非定向版本对称：多 submaster 下 LOCAL_DISK 段与
+    // offload 任务队列按 slot 分散在各 submaster，需逐 master 定向操作
+    // （不切换业务"当前地址"）。单 master 模式（路由表为空）调用方回退
+    // 非定向版本，GetSubmasterAddresses 返回空 vector 作为回退判定。
+
+    /** 枚举所有 primary submaster 地址；空 = 单 master 模式。 */
+    [[nodiscard]] std::vector<std::string> GetSubmasterAddresses() const;
+
+    /** 定向 MountLocalDiskSegment：向指定 submaster 注册 LOCAL_DISK 段。 */
+    virtual tl::expected<void, ErrorCode> MountLocalDiskSegmentTo(
+        const std::string& address, bool enable_offloading);
+
+    /**
+     * @brief 定向卸载本 worker 的 LOCAL_DISK 段：向指定 submaster 清理
+     * LocalDiskSegment（容量记账、offloading 队列），与 MountLocalDiskSegmentTo
+     * 对称。submaster 移除时由 RefreshSubmasterAddresses removed 分支调用。
+     */
+    virtual tl::expected<void, ErrorCode> UnmountLocalDiskSegmentTo(
+        const std::string& address);
+
+    /** 定向 OffloadObjectHeartbeat：拉取指定 submaster 的卸载任务。 */
+    tl::expected<void, ErrorCode> OffloadObjectHeartbeatTo(
+        const std::string& address, bool enable_offloading,
+        std::vector<OffloadTaskItem>& offloading_objects);
+
+    /** 定向 ReportSsdCapacity：向指定 submaster 上报 SSD 容量。 */
+    tl::expected<void, ErrorCode> ReportSsdCapacityTo(
+        const std::string& address, int64_t ssd_total_capacity_bytes);
+
+    /** 定向 PollRemoveAll：查询指定 submaster 是否要求全量清空 SSD。 */
+    tl::expected<bool, ErrorCode> PollRemoveAllTo(const std::string& address);
+
+    /** 定向拉取/确认指定 submaster 的 SSD tombstone 任务。 */
+    [[nodiscard]] tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+    RemoveObjectHeartbeatTo(const std::string& address);
+    tl::expected<void, ErrorCode> AckRemoveObjectHeartbeatTo(
+        const std::string& address, const std::vector<RemoveTaskItem>& tasks);
+
+    /**
+     * @brief 定向 promotion 执行链（任务状态在 source master 内存中，
+     * AllocStart/Success/Failure 必须回到派发任务的 master 闭环）。
+     * addr 为空时回退非定向调用（单 master 模式）。
+     */
+    virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeatTo(
+        const std::string& address,
+        std::vector<PromotionTaskItem>& promotion_objects);
+    virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStartTo(const std::string& address, const std::string& key,
+                          const std::string& tenant_id, uint64_t size,
+                          const std::vector<std::string>& preferred_segments);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionSuccessTo(
+        const std::string& address, const std::string& key,
+        const std::string& tenant_id);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionFailureTo(
+        const std::string& address, const std::string& key,
+        const std::string& tenant_id);
+
+    /**
+     * @brief 带来源（source master）的 offload 任务。source_address 为
+     * 派发该任务的 submaster 地址（Heartbeat 拉取时记录）；空表示来源
+     * 未知（本地 ScanMeta 重注册）或单 master 模式。双投清理协议依赖
+     * 该信息：offload 完成时若 slot 已迁移到新 owner，任务状态（源副本
+     * refcnt pin + offloading_tasks 条目）仍留在 source master，需要
+     * 额外向 source 发一次"仅清理"通知。
+     */
+    struct SourcedOffloadTask {
+        OffloadTaskItem task;
+        std::string source_address;
+    };
+
+    /**
+     * @brief 按 task 的 slot owner 分组定向上报卸载结果（双投清理协议）。
+     * 多 submaster 模式下逐 task 解析 owner（task 自带 tenant）后分组：
+     * - 成功通知投 owner（建副本）；若 source 非空且 != owner，双投
+     *   source 一份（master 侧发现非本机 slot 但任务在本机时仅清理
+     *   任务状态，不触碰元数据）。
+     * - NACK（data_size<0）只投 source（清理语义）；source 空则回退
+     *   当前连接。
+     * - owner 未解析时投 source（source 侧 slot 校验决定建副本或清理）。
+     * 单 master 模式等价于 NotifyOffloadSuccess。
+     */
+    tl::expected<void, ErrorCode> NotifyOffloadSuccessRouted(
+        const std::vector<SourcedOffloadTask>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
+    /** 旧签名重载：无来源信息的通知（ScanMeta 重注册等），source 为空。 */
+    tl::expected<void, ErrorCode> NotifyOffloadSuccessRouted(
+        const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
      * @brief Fetch tasks assigned to a client
@@ -836,6 +993,28 @@ class Client {
         return transfer_submitter_ != nullptr &&
                transfer_submitter_->canUseLocalMemcpy(endpoint);
     }
+    // Inspect the actual remote transport; allocation descriptors carry a
+    // storage tag rather than the Transfer Engine segment's protocol.
+    [[nodiscard]] bool IsUbTransportSegment(const std::string& endpoint);
+
+    /**
+     * @brief Warmup transport-level connections to all segments
+     * currently registered with the master.
+     *
+     * Allocates a buffer via the given ClientBufferAllocator (whose base is
+     * already registered with the transfer engine) and issues a 1-byte WRITE
+     * then READ per segment to trigger eager connection setup (e.g. RDMA QP
+     * handshakes). This amortises the first-transfer handshake latency and
+     * mitigates TRANSFER_FAIL caused by handshake storms under
+     * high-concurrency small-file workloads.
+     *
+     * @param allocator Client buffer allocator used to allocate/release the
+     *                 warmup buffer; its memory is already registered with
+     *                 the transfer engine.
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> warmup(
+        const std::shared_ptr<ClientBufferAllocator>& allocator);
 
     /**
      * @brief Get the endpoint address for segment operations.
@@ -850,6 +1029,10 @@ class Client {
 
     // Return sorted NUMA node IDs that have at least one RDMA NIC.
     [[nodiscard]] std::vector<int> GetNicNumaNodes() const;
+
+    // Return sorted NUMA node IDs from the local topology. The topology has one
+    // cpu:N entry per node regardless of NIC presence.
+    [[nodiscard]] std::vector<int> GetNumaNodes() const;
 
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
@@ -1002,6 +1185,8 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    ReadReplicaValidator read_replica_validator_;
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -1024,8 +1209,8 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
-    // Submits one transfer without waiting for it. The caller must get() the
-    // returned future before it releases the slices or the replica.
+    // Submits one transfer without waiting on it; callers retain slices and
+    // replicas until the returned future completes.
     tl::expected<TransferFuture, ErrorCode> SubmitSingleTransfer(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code,
@@ -1033,13 +1218,14 @@ class Client {
     ErrorCode TransferData(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code,
-        TransferIntent intent = TransferIntent::kUnspecified);
+        TransferIntent intent = TransferIntent::kUnspecified,
+        std::set<std::string>* failed_endpoints = nullptr,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices, uint64_t src_offset);
+        std::vector<Slice>& slices, uint64_t src_offset,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     // Internal async range submission helpers (return the transfer future).
-    // Used by the synchronous TransferReadRange/WriteRange and the batch
-    // range transfer methods; not part of the public API.
     std::optional<TransferFuture> SubmitRangeRead(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t src_offset);
@@ -1049,26 +1235,31 @@ class Client {
     ErrorCode TransferWrite(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices,
-        TransferIntent intent = TransferIntent::kUnspecified);
-    // Writes the slices to every memory and NoF replica in the list. All
-    // transfers are submitted before any is waited on. Returns the type and
-    // result of each such replica, in order.
+        TransferIntent intent = TransferIntent::kUnspecified,
+        std::set<std::string>* failed_endpoints = nullptr,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
+    // Submits all memory and NoF writes before waiting, preserving overlap.
     std::vector<std::pair<ReplicaType, ErrorCode>> WriteMemoryAndNofReplicas(
         const std::vector<Replica::Descriptor>& replicas,
-        std::vector<Slice>& slices);
+        std::vector<Slice>& slices,
+        std::set<std::string>* failed_endpoints = nullptr,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     ErrorCode TransferRead(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices,
-        TransferIntent intent = TransferIntent::kUnspecified);
-    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices,
-                                uint64_t src_offset);
+        TransferIntent intent = TransferIntent::kUnspecified,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
+    ErrorCode TransferReadRange(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset,
+        const std::vector<VSegmentLayoutEntry>* layouts = nullptr);
     ErrorCode ReadDfsReplica(const std::string& key,
                              const Replica::Descriptor& replica_descriptor,
                              std::vector<Slice>& slices);
     void ReconcileMissingKvcsReplica(
         const std::string& key, const QueryResult& query_result,
         const Replica::Descriptor& replica_descriptor);
+
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
@@ -1140,6 +1331,12 @@ class Client {
     void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
+    // 上一批次 Put 是否含失败 key（relaxed atomic：观测性辅助，非正确性；
+    // 并发批量下尽力转变检测）。失败→恢复的转变批次打一条 INFO——与
+    // CollectResults 的逐 key ERROR 对应，作为「客户端写入恢复」的明确
+    // 观测点（如 SLOT_MIGRATING 风暴后 master 就绪、写入重新流通），
+    // 稳态成功批次静默。
+    std::atomic<bool> last_batch_put_failed_{false};
 
     std::vector<ErrorCode> WriteDfsReplicas(
         const std::vector<std::string>& keys,
@@ -1154,6 +1351,14 @@ class Client {
         const ReplicateConfig& config, const std::vector<PutOperation>& ops,
         const std::vector<size_t>& indices) const;
 
+    /**
+     * @brief 方案二被动层：向 master 上报传输失败副本的坏端点。
+     * 多 submaster 下广播；上报失败仅告警，不阻塞主流程。
+     * 需在延迟指标采集之后调用，避免 RPC 耗时污染延迟统计。
+     */
+    void ReportFailedEndpointsToMasters(
+        const std::set<std::string>& failed_endpoints);
+
     // Client identification
     const UUID client_id_;
 
@@ -1166,6 +1371,11 @@ class Client {
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
     // NoF initiator injected by RealClient; nullptr when NoF is unavailable.
     std::shared_ptr<NVMeoFInitiator> nof_initiator_;
+    std::shared_ptr<vsegment::VSegmentTransferPlanner>
+        vsegment_transfer_planner_;
+    // Registered client memory used when Copy/Move reads a non-local source
+    // (notably a striped vsegment) before writing ordinary target replicas.
+    std::shared_ptr<ClientBufferAllocator> replica_transfer_staging_allocator_;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
@@ -1222,8 +1432,37 @@ class Client {
     std::mutex leader_switch_mutex_;
     std::optional<ha::MasterView> current_master_view_;
     std::string direct_master_address_;
+    // Etcd endpoints parsed from the HA backend entry, used to load the KV
+    // partition routing snapshot. Empty in non-HA mode.
+    std::string etcd_connstring_;
+    // Resolved cluster namespace (cluster_id) cached after the first routing
+    // load; reused by the periodic routing refresh loop.
+    std::string cluster_id_;
+    // CVM multi-submaster mode: set when the client bootstraps from the
+    // /cvm/<ns>/masters/ registry (no single-leader master_view in etcd).
+    // Empty in single-leader HA mode and direct mode. Also drives the
+    // ping-failure re-discovery path.
+    std::string cvm_cluster_namespace_;
+    // CVM 多 submaster：已发现的全部 primary submaster 地址（含当前连接的
+    // 那个）。用于 client 侧全量 mount（同一 segment 挂到所有 submaster）与
+    // 多 submaster 心跳（防止各 submaster 因收不到 ping 而误卸载 segment）。
+    // 由 ConnectToCvmSubmasters 填充。
+    std::mutex cvm_submaster_addresses_mutex_;
+    std::vector<std::string> cvm_submaster_addresses_;
+    // LOCAL_DISK 段对称生命周期状态（RefreshSubmasterAddresses 增量接线
+    // 用）：mount 成功后置位；新 submaster 上线时据此补挂 LOCAL_DISK 段
+    // 并重报容量，移除时定向卸载，保证各 master 容量记账对称闭合。
+    std::atomic<bool> local_disk_mounted_{false};
+    std::atomic<bool> local_disk_offload_enabled_{false};
+    // 最近一次成功上报的 SSD 总容量（<=0 表示未上报过），补挂时重报。
+    std::atomic<int64_t> ssd_total_capacity_bytes_{0};
+    // 串行化 TryLoadRoutingOnce（及其内部对 cluster_id_ 的读写），
+    // 用于 routing-refresh 线程与 SLOT_NOT_OWNED 触发的按需刷新之间。
+    std::mutex routing_load_mutex_;
     std::thread leader_monitor_thread_;
     std::atomic<bool> leader_monitor_running_{false};
+    std::thread routing_refresh_thread_;
+    std::atomic<bool> routing_refresh_running_{false};
     std::thread storage_heartbeat_thread_;
     std::atomic<bool> storage_heartbeat_running_{false};
     std::thread task_poll_thread_;
@@ -1233,8 +1472,25 @@ class Client {
     std::atomic<bool> rpc_meta_publish_pending_{false};
     ErrorCode ConnectMasterEndpoint(const std::string& address);
     ErrorCode SwitchLeader(const ha::MasterView& target_view);
+    // CVM multi-submaster bootstrap/failover: connect the etcd store client,
+    // discover the cluster namespace from /cvm/<ns>/masters/, and connect to
+    // the first live primary submaster (first-registered first, matching the
+    // CvmController ranking). On success sets cvm_cluster_namespace_.
+    ErrorCode ConnectToCvmSubmasters(const std::string& etcd_endpoints);
+    void LoadPartitionRouting();
+    void TryLoadRoutingOnce();
+    void RoutingRefreshThreadMain();
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();
+    // CVM 多 submaster：向所有 primary submaster 定向 Ping（不切换当前连接），
+    // 各 submaster 收到 ping 后会保活该 client；返回 NEED_REMOUNT 的 submaster
+    // 会被重新 mount（重新注册 segment）。单 submaster 失败不影响其他。
+    void HeartbeatAllSubmasters();
+    // CVM 多 submaster：重新扫描 /cvm/<ns>/masters/ 注册表，更新已发现的
+    // primary 地址列表；对新增的 submaster 全量 mount 所有本地 segment，使
+    // 新加入的 submaster 也具备给本 client 分配副本的能力。由路由刷新线程
+    // 周期调用。
+    void RefreshSubmasterAddresses();
     void TaskPollThreadMain();
     void EnsureStorageControlPlaneStarted();
     void PollAndDispatchTasks();
@@ -1256,7 +1512,8 @@ class Client {
         std::function<tl::expected<void, ErrorCode>()> end_fn,
         std::function<tl::expected<void, ErrorCode>()> revoke_fn,
         const Replica::Descriptor& source,
-        const std::vector<Replica::Descriptor>& targets);
+        const std::vector<Replica::Descriptor>& targets,
+        const std::vector<VSegmentLayoutEntry>* layouts);
 
     /**
      * @brief Copy an object's replica to target segments

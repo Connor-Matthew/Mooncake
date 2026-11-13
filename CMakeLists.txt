@@ -50,6 +50,19 @@ option(
   "build a self-contained libmooncake_store.so exposing only the store_c.h C ABI (for dlopen consumers)"
   OFF)
 option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
+# Modified By Yida (v3): NoF over URMA —— SPDK URMA transport 与 GPU Direct。
+# 不复用 USE_UB：Transfer Engine 的 UB transport 与 SPDK URMA transport 的
+# 依赖、配置完全不同，混用会互相污染。
+option(USE_NOF_URMA
+       "Enable SPDK NVMe/URMA transport for NoF SSD pool (requires USE_NOF)" OFF)
+option(USE_NOF_GPU_DIRECT
+       "Enable NoF GPU Direct via SPDK memory domains (requires USE_NOF_URMA)" OFF)
+if(USE_NOF_URMA AND NOT USE_NOF)
+  message(FATAL_ERROR "USE_NOF_URMA requires USE_NOF=ON")
+endif()
+if(USE_NOF_GPU_DIRECT AND NOT USE_NOF_URMA)
+  message(FATAL_ERROR "USE_NOF_GPU_DIRECT requires USE_NOF_URMA=ON")
+endif()
 option(MOONCAKE_ENABLE_TEST_FAILPOINTS
        "Enable file-handshake failpoints for integration tests" OFF)
 if(MOONCAKE_ENABLE_TEST_FAILPOINTS)
@@ -130,6 +143,14 @@ endif()
 
 if(USE_NOF)
   add_compile_definitions(USE_NOF)
+  if (USE_NOF_URMA)
+    add_compile_definitions(USE_NOF_URMA)
+    message(STATUS "USE_NOF_URMA=ON, SPDK URMA transport enabled for NoF")
+  endif()
+  if (USE_NOF_GPU_DIRECT)
+    add_compile_definitions(USE_NOF_GPU_DIRECT)
+    message(STATUS "USE_NOF_GPU_DIRECT=ON, NoF GPU Direct enabled")
+  endif()
 else()
   message(STATUS "USE_NOF=OFF, NoF SSD pool support is disabled")
 endif()

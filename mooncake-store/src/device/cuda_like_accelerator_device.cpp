@@ -39,6 +39,36 @@ class CudaLikeAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         return PointerInfo{.kind = MemoryKind::kHost, .device_id = -1};
     }
 
+    // Modified By Yida (v3): 严格探测。cudaErrorInvalidValue 是 CUDA 11 之前
+    // 对非 CUDA 指针的确定回复，视为 kNotDevice；其他错误属探测失败，不可信。
+    PointerProbeResult ProbePointerStrict(const void* ptr,
+                                          PointerInfo* out_info) const override {
+        cudaPointerAttributes attr{};
+        cudaError_t rc = cudaPointerGetAttributes(&attr, ptr);
+        if (rc == cudaSuccess) {
+            const bool is_device = (attr.type == cudaMemoryTypeDevice);
+            if (out_info) {
+                *out_info = is_device
+                                ? PointerInfo{.kind = MemoryKind::kDevice,
+                                              .device_id = attr.device}
+                                : PointerInfo{.kind = MemoryKind::kHost,
+                                              .device_id = -1};
+            }
+            return is_device ? PointerProbeResult::kDevice
+                             : PointerProbeResult::kNotDevice;
+        }
+        // 清除 sticky 错误，避免污染后续 CUDA 调用
+        cudaGetLastError();
+        if (rc == cudaErrorInvalidValue) {
+            if (out_info) {
+                *out_info = PointerInfo{.kind = MemoryKind::kHost,
+                                        .device_id = -1};
+            }
+            return PointerProbeResult::kNotDevice;
+        }
+        return PointerProbeResult::kProbeError;
+    }
+
     int32_t CurrentDeviceId() const override {
         int device_id = -1;
         return cudaGetDevice(&device_id) == cudaSuccess ? device_id : -1;

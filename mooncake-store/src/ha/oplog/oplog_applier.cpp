@@ -117,6 +117,30 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         case OpType::WEIGHT_LEASE_DELETE:
             applied = ApplyWeightLeaseDelete(entry);
             break;
+        case OpType::VSEGMENT_STATE:
+            if (!vsegment_state_handler_ || !vsegment_state_handler_(entry)) {
+                LOG(ERROR) << "OpLogApplier: vsegment state handler rejected "
+                           << "sequence_id=" << entry.sequence_id;
+                return false;
+            }
+            break;
+        case OpType::VSEGMENT_RESERVE:
+        case OpType::VSEGMENT_RELEASE:
+            // aligned 模式下的 reservation 生命周期记录，复用 vsegment handler：
+            // handler 内部按 entry.op_type 区分（RESERVE / RELEASE）。
+            // 未安装 handler 时（legacy / 仅 full 模式部署）忽略而不阻断重放。
+            if (!vsegment_state_handler_) {
+                VLOG(1) << "OpLogApplier: no vsegment handler installed, "
+                        << "dropping reservation record op_type="
+                        << static_cast<int>(entry.op_type);
+                break;
+            }
+            if (!vsegment_state_handler_(entry)) {
+                LOG(ERROR) << "OpLogApplier: vsegment reservation handler "
+                           << "rejected sequence_id=" << entry.sequence_id;
+                return false;
+            }
+            break;
         default:
             LOG(ERROR) << "OpLogApplier: unsupported op_type="
                        << static_cast<int>(entry.op_type)

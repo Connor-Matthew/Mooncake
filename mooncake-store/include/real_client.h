@@ -94,6 +94,9 @@ class RealClient : public PyClient {
     // Factory to create shared instances and auto-register to ResourceTracker
     static std::shared_ptr<RealClient> create();
 
+    Status configureScheduling(
+        const scheduling::SchedulerConfig &scheduler_config);
+
     int setup_real(
         const std::string &local_hostname, const std::string &metadata_server,
         size_t global_segment_size = 1024 * 1024 * 16,
@@ -127,6 +130,13 @@ class RealClient : public PyClient {
     int register_buffer(void *buffer, size_t size);
 
     int unregister_buffer(void *buffer);
+
+    // Install before concurrent I/O. No metadata lookup is added by this hook.
+    bool set_read_replica_validator(Client::ReadReplicaValidator validator) {
+        if (!client_) return false;
+        client_->SetReadReplicaValidator(std::move(validator));
+        return true;
+    }
 
     struct WritableBufferRegion {
         void *base{nullptr};
@@ -689,9 +699,11 @@ class RealClient : public PyClient {
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
+        size_t offload_rpc_thread_num = 8,
         bool enable_client_http_server = false,
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
-        bool enable_embedded_master = false);
+        bool enable_embedded_master = false,
+        const std::string &ub_numa_nodes = "");
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -715,6 +727,14 @@ class RealClient : public PyClient {
         QueryResult query_result;
         Replica::Descriptor replica;
         uint64_t total_size;
+        int64_t query_us;
+        int64_t select_us;
+        int64_t local_endpoints_us;
+        int64_t select_replica_us;
+        std::string replica_type;
+        size_t replica_count{0};
+        std::string local_endpoint{"-"};
+        std::string remote_endpoint{"-"};
     };
 
     tl::expected<RangedReadMetadata, ErrorCode>
@@ -726,6 +746,9 @@ class RealClient : public PyClient {
         const std::string &key,
         const QueryResultCache *query_result_cache = nullptr,
         bool allow_query_refresh = true);
+
+    bool can_read_ub_device_memory_direct(const Replica::Descriptor &replica,
+                                          void *dst, size_t size) const;
 
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
@@ -926,7 +949,21 @@ class RealClient : public PyClient {
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
     batch_get_offload_object(const std::vector<std::string> &keys,
-                             const std::vector<int64_t> &sizes);
+                             const std::vector<int64_t> &sizes,
+                             uint64_t trace_id = 0);
+
+    /**
+     * @brief Push-mode offload handler, run on the data owner. Reads the
+     * requested keys from SSD into the local ClientBuffer, WRITEs them
+     * directly into the requester's destination slices over the transfer
+     * engine, then releases the ClientBuffer locally. The requester therefore
+     * needs no follow-up READ nor a separate release_offload_buffer RPC.
+     * @param req keys/sizes plus the requester's TE endpoint and dst slices.
+     * @return per-batch result; data already landed in requester memory.
+     */
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>>
+    batch_get_offload_object_push(const BatchGetOffloadObjectPushRequest &req);
 
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
@@ -941,7 +978,7 @@ class RealClient : public PyClient {
      * @param batch_id The unique identifier of the batch to release
      * @return true if batch was found and released, false otherwise
      */
-    bool release_offload_buffer(uint64_t batch_id);
+    bool release_offload_buffer(uint64_t batch_id, uint64_t trace_id = 0);
 
     /**
      * @brief RPC handler: a remote requester asks this node (the LOCAL_DISK
@@ -1450,8 +1487,9 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path, int local_rpc_port,
         bool enable_ssd_offload, bool start_offload_rpc_server,
         const std::string &ssd_offload_path, const std::string &tenant_id,
-        bool enable_client_http_server, int client_http_port,
-        bool enable_embedded_master);
+        size_t offload_rpc_thread_num, bool enable_client_http_server,
+        int client_http_port, bool enable_embedded_master,
+        const std::string &ub_numa_nodes_config);
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;

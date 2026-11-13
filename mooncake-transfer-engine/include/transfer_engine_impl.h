@@ -150,6 +150,22 @@ class TransferEngineImpl {
         return multi_transports_->submitScatter(entries, submission);
     }
 
+    Status configureScheduling(const scheduling::SchedulerConfig& config) {
+        if (!multi_transports_)
+            return Status::InvalidArgument("Initialize TE before scheduling");
+        return multi_transports_->configureScheduling(config);
+    }
+
+    Status submitScheduledTransfer(
+        BatchID batch_id,
+        const std::vector<ScheduledTransferRequest>& entries) {
+        return multi_transports_->submitScheduledTransfer(batch_id, entries);
+    }
+
+    Status cancelTransfer(BatchID batch_id, size_t task_id) {
+        return multi_transports_->cancelTransfer(batch_id, task_id);
+    }
+
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
                                     TransferMetadata::NotifyDesc notify_msg) {
@@ -247,9 +263,15 @@ class TransferEngineImpl {
                                                           detail);
     }
 
+    // Read-only per-slice timing samples (observability); valid only after
+    // the task reached a terminal state. Forwarded to MultiTransport.
+    Status getSliceTimings(BatchID batch_id, size_t task_id,
+                           std::vector<Transport::SliceTiming>& timings) {
+        return multi_transports_->getSliceTimings(batch_id, task_id, timings);
+    }
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus& status) {
-        Status result =
+                             TransferStatus& status) {        Status result =
             multi_transports_->getTransferStatus(batch_id, task_id, status);
 #ifdef WITH_METRICS
         if (!metrics_enabled_ || !result.ok()) {

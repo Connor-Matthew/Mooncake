@@ -28,6 +28,7 @@
 #include <string>
 #include <atomic>
 #include <functional>
+#include <time.h>  // For clock_gettime (Slice::done_ts stamping)
 #include <mutex>
 #include <condition_variable>
 
@@ -184,6 +185,7 @@ class Transport {
         size_t length;
         TransferRequest::OpCode opcode;
         SegmentID target_id;
+        uint64_t trace_id = 0;
         std::string peer_nic_path;
         // Non-owning pointer into the process-lifetime NIC-path intern pool.
         // When set, peerNicPath() returns *interned_peer_nic_path so the
@@ -222,6 +224,10 @@ class Transport {
         uint64_t rdma_congestion_control_endpoint_generation = 0;
 #endif
 
+        // Transport instrumentation runs before completion becomes visible.
+        using CompletionCallback = void (*)(Slice *, bool);
+        CompletionCallback completion_callback = nullptr;
+
         union {
             struct {
                 uint64_t dest_addr;
@@ -243,6 +249,8 @@ class Transport {
                 uint32_t max_retry_cnt;
                 void *r_seg;
                 void *l_seg;
+                uint8_t src_chip_id;
+                uint8_t dst_chip_id;
                 void *endpoint;
             } ub;
             struct {
@@ -296,12 +304,20 @@ class Transport {
         // Every slice must be marked exactly once; the pin protocol below
         // assumes a single terminal publish per slice.
         void markSuccess() {
+            if (task->scheduled) {
+                markScheduledCompletion(true);
+                return;
+            }
             // Pin the BatchDesc before publishing the terminal slice count:
             // a waiter that observes the task complete may freeBatchID()
             // while this callback still dereferences task/batch state.
             // slice->status is transport-internal, not a terminal channel,
             // so its store may stay outside the pin.
             CompletionCallbackPin pin(task);
+            notifyCompletion(true);
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            done_ts = static_cast<int64_t>(now.tv_sec) * 1000000000ll + now.tv_nsec;
             status = Slice::SUCCESS;
             TransferTask *t = task.load(std::memory_order_acquire);
             __atomic_fetch_add(&t->transferred_bytes, length, __ATOMIC_RELAXED);
@@ -314,7 +330,15 @@ class Transport {
         }
 
         void markFailed() {
+            if (task->scheduled) {
+                markScheduledCompletion(false);
+                return;
+            }
             CompletionCallbackPin pin(task);
+            notifyCompletion(false);
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            done_ts = static_cast<int64_t>(now.tv_sec) * 1000000000ll + now.tv_nsec;
             status = Slice::FAILED;
             TransferTask *t = task.load(std::memory_order_acquire);
             __atomic_fetch_add(&t->failed_slice_count, 1, __ATOMIC_ACQ_REL);
@@ -335,8 +359,35 @@ class Transport {
         }
 
         volatile int64_t ts;
+        // Completion timestamp (CLOCK_REALTIME ns); 0 until the slice reaches a
+        // terminal state via markSuccess/markFailed. duration = done_ts - ts.
+        volatile int64_t done_ts = 0;
 
        private:
+        void markScheduledCompletion(bool success) {
+            notifyCompletion(success);
+            status = success ? Slice::SUCCESS : Slice::FAILED;
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            done_ts = static_cast<int64_t>(now.tv_sec) * 1000000000ll + now.tv_nsec;
+            auto* t = task.load(std::memory_order_acquire);
+            if (success) {
+                __atomic_fetch_add(&t->transferred_bytes, length, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&t->success_slice_count, 1, __ATOMIC_RELAXED);
+            } else {
+                __atomic_fetch_add(&t->failed_slice_count, 1, __ATOMIC_RELAXED);
+            }
+            // This release may let the scheduler free the physical grant.
+            // Do not access the task, batch, or slice after publishing it.
+            __atomic_fetch_add(&t->scheduled_completed_slices, 1, __ATOMIC_RELEASE);
+        }
+
+        void notifyCompletion(bool success) {
+            auto callback = completion_callback;
+            completion_callback = nullptr;
+            if (callback) callback(this, success);
+        }
+
         static inline void finishIfComplete(TransferTask *task, uint64_t state,
                                             bool is_failed) {
             // Handshake / dummy slices are not attached to a BatchDesc.
@@ -464,6 +515,8 @@ class Transport {
                 slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
                 tail_++;
                 slice->from_cache = true;
+                slice->peer_nic_path.clear();
+                slice->dest_rkeys.clear();
             }
 
             return slice;
@@ -474,6 +527,7 @@ class Transport {
             // transport-specific cleanup callback into its next use.
             auto cleanup = slice->cleanup_callback;
             slice->cleanup_callback = nullptr;
+            slice->completion_callback = nullptr;
             if (cleanup) cleanup(slice);
             slice->interned_peer_nic_path = nullptr;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
@@ -502,6 +556,9 @@ class Transport {
     };
 
     struct TransferTask {
+        // Publish only after completion has finished accessing batch state.
+        bool scheduled = false;
+        uint64_t scheduled_completed_slices = 0;
         volatile uint64_t slice_count = 0;
         volatile uint64_t success_slice_count = 0;
         volatile uint64_t failed_slice_count = 0;
@@ -565,6 +622,16 @@ class Transport {
             for (auto &slice : slice_list)
                 Transport::getSliceCache().deallocate(slice);
         }
+    };
+
+    // Read-only per-slice timing sample for observability (valid only after
+    // the task reached a terminal state). duration_ns = done_ts - ts (0 when
+    // either timestamp is unset).
+    struct SliceTiming {
+        std::string peer_nic_path;
+        uint64_t length = 0;
+        int64_t post_ts = 0;
+        int64_t done_ts = 0;
     };
 
     struct BatchDesc {
@@ -642,6 +709,14 @@ class Transport {
     // tasks, submits, then seals each task after submitTransferTask() has
     // finished constructing its slices.
     virtual bool supportsBatchCompletionCounter() const { return false; }
+
+    // Bound a proposed byte range by physical descriptor capacity. Only
+    // transports with worker-published completion may opt into scheduling.
+    virtual Status scheduledTransferLength(const TransferRequest &request,
+                                           uint32_t max_slices,
+                                           size_t &length) {
+        return Status::NotImplemented("Transport has no scheduling adapter");
+    }
 
     /// @brief Get the status of a submitted transfer. This function shall not
     /// be called again after completion.

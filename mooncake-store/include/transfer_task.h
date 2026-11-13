@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <ostream>
 #include <queue>
 #include <stack>
+#include <unordered_set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,6 +23,8 @@
 #include "storage_backend.h"
 #include "client_metric.h"
 #include "nof/nvmeof_initiator.h"
+#include "rpc_types.h"
+#include "vsegment/vsegment_transfer.h"
 
 namespace mooncake {
 
@@ -91,7 +95,7 @@ inline std::ostream& operator<<(std::ostream& os,
  */
 class OperationState {
    public:
-    OperationState() = default;
+    explicit OperationState(uint64_t trace_id = 0) : trace_id_(trace_id) {}
     virtual ~OperationState() = default;
 
     // Non-copyable, non-movable
@@ -127,7 +131,11 @@ class OperationState {
      */
     virtual void wait_for_completion() = 0;
 
+    /** Trace id of the request that created this operation (0 = none). */
+    uint64_t trace_id() const { return trace_id_; }
+
    protected:
+    const uint64_t trace_id_ = 0;
     std::optional<ErrorCode> result_ = std::nullopt;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
@@ -152,6 +160,9 @@ class EmptyOperationState : public OperationState {
  */
 class MemcpyOperationState : public OperationState {
    public:
+    explicit MemcpyOperationState(uint64_t trace_id = 0)
+        : OperationState(trace_id) {}
+
     bool is_completed() override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_.has_value();
@@ -218,6 +229,9 @@ class NofOperationState : public OperationState {
 
 class FilereadOperationState : public OperationState {
    public:
+    explicit FilereadOperationState(uint64_t trace_id = 0)
+        : OperationState(trace_id) {}
+
     bool is_completed() override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_.has_value();
@@ -248,8 +262,9 @@ class FilereadOperationState : public OperationState {
 class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
-                                 size_t batch_size)
-        : engine_(engine),
+                                 size_t batch_size, uint64_t trace_id = 0)
+        : OperationState(trace_id),
+          engine_(engine),
           tent_engine_(engine.getTentEngine().get()),
           batch_id_(batch_id),
           batch_size_(batch_size),
@@ -381,17 +396,24 @@ struct MemcpyOperation {
 struct MemcpyTask {
     std::vector<MemcpyOperation> operations;
     std::shared_ptr<MemcpyOperationState> state;
+    uint64_t trace_id;
+    std::chrono::steady_clock::time_point submitted_at;
+    size_t queued_ahead = 0;
 
     MemcpyTask(std::vector<MemcpyOperation> ops,
-               std::shared_ptr<MemcpyOperationState> s)
-        : operations(std::move(ops)), state(std::move(s)) {}
+               std::shared_ptr<MemcpyOperationState> s, uint64_t trace = 0)
+        : operations(std::move(ops)),
+          state(std::move(s)),
+          trace_id(trace),
+          submitted_at(std::chrono::steady_clock::now()) {}
 };
 
 /**
  * @brief Thread pool for asynchronous memcpy operations
  *
- * This class manages a single worker thread that executes memcpy operations
- * asynchronously.
+ * This class manages a bounded worker pool for accelerator copies and for
+ * host copies when MC_STORE_MEMCPY_INLINE is disabled.
+ * MC_STORE_MEMCPY_WORKERS controls the worker count.
  */
 class MemcpyWorkerPool {
    public:
@@ -449,6 +471,16 @@ struct NofTask {
     // Optional metrics sink; wired by TransferSubmitter, nullptr when the
     // client has no metrics.
     NofMetric* metric = nullptr;
+    // Lane count of the task's segment, captured at dispatch. The QoS
+    // inflight budget is split across lanes so a multi-lane segment keeps
+    // the single-lane total.
+    uint32_t lane_count = 1;
+    // Set once the state has been completed. A failing sub-I/O can finish a
+    // task that is still queued at the QoS head; the head is popped later,
+    // so completion must be idempotent.
+    bool completed = false;
+    // Buffer classification for GPU Direct, resolved once per task.
+    NofBufferInfo buffer_info;
 
     NofTask(NofSegmentHandle* handle, void* buf, uint64_t byte_off,
             uint64_t byte_len, NofIOOp op_code,
@@ -489,8 +521,17 @@ struct NofQos {
     int inflight_blocks[static_cast<size_t>(NofIOOp::kNum)];
     NofTask* head[static_cast<size_t>(NofIOOp::kNum)];
     NofTask* tail[static_cast<size_t>(NofIOOp::kNum)];
+    // Tasks with sub-I/O in flight on this lane. When the lane is isolated
+    // their remaining callbacks never run, so they are failed from here.
+    std::unordered_set<NofTask*> live;
+    // Lane isolated: queued and in-flight tasks were failed; no more submits.
+    bool dead = false;
+    // Last submit-from-idle or completion on this lane. With I/O in flight
+    // and no progress for MC_NOF_IO_TIMEOUT_MS the lane is isolated.
+    std::chrono::steady_clock::time_point last_progress{};
 
-    explicit NofQos(uint32_t bs);
+    // lane_count splits the inflight budget across a segment's lanes.
+    explicit NofQos(uint32_t bs, uint32_t lane_count = 1);
 
     bool Empty() const {
         return (head[static_cast<size_t>(NofIOOp::kRead)] == nullptr &&
@@ -541,9 +582,17 @@ class NofWorkerPool {
     std::unique_ptr<std::mutex[]> queue_mutex_;
     std::unique_ptr<std::condition_variable[]> queue_cv_;
     std::atomic<bool> shutdown_;
+    // Picks a healthy lane of `segment` round-robin (nullptr when none) and
+    // reports the segment's lane count. Caller holds seg_mutex_.
+    NofSegmentHandle* PickLaneLocked(NofSegmentHandle* segment,
+                                     uint32_t* lane_count);
+
     std::mutex seg_mutex_;
     int seg_num = 0;
+    // Keyed by lane handle: each lane is polled by exactly one worker.
     std::map<NofSegmentHandle*, int> seg_to_worker_;
+    // Per segment (lane 0 handle): next lane for round-robin dispatch.
+    std::map<NofSegmentHandle*, uint64_t> seg_next_lane_;
 };
 
 /**
@@ -554,14 +603,16 @@ struct FilereadTask {
     size_t object_size;
     std::vector<Slice> slices;
     std::shared_ptr<FilereadOperationState> state;
+    uint64_t trace_id;
 
     FilereadTask(const std::string& path, size_t size,
                  const std::vector<Slice>& slices_ref,
-                 std::shared_ptr<FilereadOperationState> s)
+                 std::shared_ptr<FilereadOperationState> s, uint64_t trace = 0)
         : file_path(path),
           object_size(size),
           slices(slices_ref),
-          state(std::move(s)) {}
+          state(std::move(s)),
+          trace_id(trace) {}
 };
 
 /**
@@ -654,11 +705,17 @@ class TransferSubmitter {
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         TransferIntent intent = TransferIntent::kUnspecified);
 
+    // Co-located memory replicas are combined into one MemcpyTask when local
+    // memcpy is enabled. Mixed or remote batches use TransferEngine.
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
         TransferRequest::OpCode op_code,
         TransferIntent intent = TransferIntent::kUnspecified);
+
+    std::optional<TransferFuture> submitVSegment(
+        const vsegment::VSegmentTransferPlan& plan,
+        TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
@@ -668,6 +725,16 @@ class TransferSubmitter {
             batched_slices,
         OffloadBufferAccess buffer_access,
         TransferIntent intent = TransferIntent::kUnspecified);
+
+    // Push counterpart of submit_batch_get_offload_object, run on the data
+    // owner. WRITEs each key's on-disk blob (staged in the owner's local
+    // ClientBuffer at src_pointers[i]) directly into the requester's
+    // destination slices, opening the requester's segment once.
+    std::optional<TransferFuture> submit_batch_push_offload_object(
+        const std::string& requester_te_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& src_pointers,
+        const std::vector<std::vector<OffloadDstSlice>>& dst_slices);
 
     [[nodiscard]] bool canUseLocalMemcpy(const std::string& endpoint) const;
 
@@ -725,8 +792,10 @@ class TransferSubmitter {
         const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
         uint64_t src_offset = 0);
 
+    // Host-only copies may run inline (MC_STORE_MEMCPY_INLINE); accelerator
+    // copies are queued on the memcpy pool.
     std::optional<TransferFuture> submitMemcpyOperations(
-        std::vector<MemcpyOperation> operations);
+        std::vector<MemcpyOperation> operations, uint64_t trace_id = 0);
 
     /**
      * @brief Submit NoF (NVMe-oF) operation asynchronously

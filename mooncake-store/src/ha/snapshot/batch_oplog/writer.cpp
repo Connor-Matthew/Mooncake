@@ -105,7 +105,12 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     ha::BatchOpLogSnapshotManifest manifest;
     const bool has_weight_state =
         capture.weight_metadata != WeightMetadataSnapshot{};
-    if (has_weight_state) {
+    const bool has_vsegment_state = !capture.vsegment_partitions.empty();
+    if (has_vsegment_state) {
+        // v3 is a superset of v2; it may also carry the weight section.
+        manifest.schema_version = ha::kBatchOpLogVSegmentSnapshotSchemaVersion;
+        manifest.snapshot_format = ha::kBatchOpLogVSegmentSnapshotFormat;
+    } else if (has_weight_state) {
         manifest.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
         manifest.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
     }
@@ -146,6 +151,25 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
                         upload.error());
         }
         std::vector<uint8_t>().swap(weights);
+    }
+
+    if (has_vsegment_state) {
+        const std::string vsegments_key =
+            ha::BuildBatchOpLogSnapshotVSegmentPartitionsKey(snapshot_root,
+                                                             snapshot_id);
+        auto vsegments = EncodeBatchOpLogSnapshotVSegmentPartitions(
+            capture.vsegment_partitions);
+        manifest.vsegment_partitions = ha::BatchOpLogSnapshotObjectDescriptor{
+            .key = vsegments_key,
+            .stored_size = vsegments.size(),
+            .crc32c = Crc32cValue(vsegments.data(), vsegments.size()),
+        };
+        upload = object_store_.UploadBuffer(vsegments_key, vsegments);
+        if (!upload) {
+            return fail("Failed to upload snapshot vsegment partitions: " +
+                        upload.error());
+        }
+        std::vector<uint8_t>().swap(vsegments);
     }
 
     uint64_t chunk_index = 0;
@@ -191,6 +215,15 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
         verify = VerifyObject(object_store_, manifest.weight_metadata->key,
                               manifest.weight_metadata->stored_size,
                               manifest.weight_metadata->crc32c);
+        if (!verify) {
+            return fail(std::move(verify.error()));
+        }
+    }
+    if (manifest.vsegment_partitions) {
+        verify = VerifyObject(object_store_,
+                              manifest.vsegment_partitions->key,
+                              manifest.vsegment_partitions->stored_size,
+                              manifest.vsegment_partitions->crc32c);
         if (!verify) {
             return fail(std::move(verify.error()));
         }
@@ -255,6 +288,9 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
             metrics.chunk_bytes + manifest.segments.stored_size +
             (manifest.weight_metadata ? manifest.weight_metadata->stored_size
                                       : 0) +
+            (manifest.vsegment_partitions
+                 ? manifest.vsegment_partitions->stored_size
+                 : 0) +
             manifest_json.size() + descriptor_json.size();
     });
     return metric_timer.Success(descriptor_json);

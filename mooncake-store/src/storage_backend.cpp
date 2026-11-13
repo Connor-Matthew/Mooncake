@@ -18,11 +18,13 @@
 #include <cctype>
 #include <optional>
 #include <regex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <unordered_set>
 
 #include <ylt/struct_pb.hpp>
@@ -75,6 +77,11 @@ std::string ErrnoSuffix(int err) {
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
 
+// spdiag perf points for the offload owner-side disk load breakdown.
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
+
 namespace mooncake {
 
 namespace {
@@ -94,7 +101,13 @@ bool PathContainsOrEquals(const std::string& base, const std::string& other) {
     return true;
 }
 
+thread_local StorageReadStats* current_storage_read_stats = nullptr;
 }  // namespace
+
+StorageReadStats* CurrentStorageReadStats() { return current_storage_read_stats; }
+ScopedStorageReadStats::ScopedStorageReadStats(StorageReadStats* stats)
+    : previous_(current_storage_read_stats) { current_storage_read_stats = stats; }
+ScopedStorageReadStats::~ScopedStorageReadStats() { current_storage_read_stats = previous_; }
 
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
@@ -1443,7 +1456,10 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    auto* stats = CurrentStorageReadStats();
+    if (stats) stats->io_mode = "preadv";
     for (const auto& [key, slice] : batched_slices) {
+        const auto io_start = std::chrono::steady_clock::now();
         KVEntry kv;
         kv.key = key;
         auto path = FileUtil::ResolvePathFromKey(
@@ -1457,6 +1473,11 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
 
         auto r = storage_backend_->LoadObject(path, kv_buf, kv_buf.size());
         if (!r) {
+            if (stats) {
+                stats->status = "read_fail";
+                stats->error_key = key;
+                stats->error_code = r.error();
+            }
             LOG(ERROR) << "Failed to load from file";
             return tl::make_unexpected(r.error());
         }
@@ -1465,6 +1486,17 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
 
         if (!kv.value.empty()) {
             std::memcpy(slice.ptr, kv.value.data(), kv.value.size());
+        }
+        if (stats) {
+            const auto io_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - io_start)
+                    .count();
+            stats->disk_read_us += io_us;
+            if (io_us > stats->slowest_disk_read_us) {
+                stats->slowest_disk_read_us = io_us;
+                stats->slowest_key = key;
+            }
         }
     }
     return {};
@@ -1634,6 +1666,12 @@ BucketStorageBackend::BucketStorageBackend(
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
+    // Stop background GC thread first, before clearing any state it touches.
+    if (gc_running_.load(std::memory_order_acquire)) {
+        gc_running_.store(false, std::memory_order_release);
+        gc_cv_.notify_all();
+        if (gc_thread_.joinable()) gc_thread_.join();
+    }
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
@@ -1902,6 +1940,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadSpans(
 tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
     std::unordered_map<std::string, StorageValueSpan>& spans,
     bool require_exact_size) {
+    auto* stats = CurrentStorageReadStats();
+    const auto plan_start = std::chrono::steady_clock::now();
     // Step 1: Build read plan by copying metadata under lock
     // BucketReadGuard increments inflight_reads_ to prevent deletion during IO.
     // When the guard goes out of scope, it decrements the counter.
@@ -1921,6 +1961,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
     std::unordered_map<int64_t, std::vector<ReadPlan>> bucket_read_plans;
     std::vector<BucketReadGuard> bucket_guards;  // RAII guards for all buckets
 
+    // Phase 1: build read plan under lock (OwnerLoadPlan). Pure in-memory
+    // metadata lookups; the error early-returns let the dtor Abandon the
+    // unfinished sample.
+    SpDiag::PerfPoint pt_plan(PerfKey::GET_SSD_OWNER_LOAD_PLAN,
+                              SpDiag::PerfLevel::MODULE);
+    pt_plan.Start();
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
         for (const auto& [key, span] : spans) {
@@ -1928,6 +1974,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
             // Lookup key -> metadata
             auto object_it = object_bucket_map_.find(key);
             if (object_it == object_bucket_map_.end()) {
+                if (stats) {
+                    stats->plan_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - plan_start)
+                            .count();
+                    stats->status = "plan_fail";
+                    stats->error_key = key;
+                    stats->error_code = ErrorCode::INVALID_KEY;
+                }
                 LOG(ERROR) << "Key not found: " << key;
                 return tl::make_unexpected(ErrorCode::INVALID_KEY);
             }
@@ -1936,6 +1991,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
             // Lookup bucket -> BucketMetadata
             auto bucket_it = buckets_.find(metadata.bucket_id);
             if (bucket_it == buckets_.end()) {
+                if (stats) {
+                    stats->plan_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - plan_start)
+                            .count();
+                    stats->status = "plan_fail";
+                    stats->error_key = key;
+                    stats->error_code = ErrorCode::BUCKET_NOT_FOUND;
+                }
                 LOG(ERROR) << "Bucket not found for key: " << key
                            << ", bucket_id=" << metadata.bucket_id;
                 return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
@@ -1993,12 +2057,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                          dest_slice, bucket_it->second->disk_index});
         }
     }
+    pt_plan.End(0);
+    if (stats) {
+        stats->plan_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - plan_start)
+                .count();
+    }
     // Lock released here - bucket files protected by BucketReadGuards
     // which remain alive until this function returns (~line bucket_guards
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
     // Step 2: Perform IO without holding any locks
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+        const auto open_start = std::chrono::steady_clock::now();
         // Open file for this bucket (cheap syscall, no lock needed).
         // Every plan in a bucket came from that bucket's metadata, so they all
         // carry the same disk. The vector is never empty: entries are only
@@ -2006,13 +2078,31 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
         auto filepath_res =
             GetBucketDataPath(bucket_id, read_plans.front().disk_index);
         if (!filepath_res) {
+            if (stats) {
+                stats->file_open_us +=
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - open_start)
+                        .count();
+                stats->status = "open_fail";
+                stats->error_code = ErrorCode::INTERNAL_ERROR;
+            }
             LOG(ERROR) << "Failed to get bucket data path, bucket_id="
                        << bucket_id;
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
 
         auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
+        if (stats) {
+            stats->file_open_us +=
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - open_start)
+                    .count();
+        }
         if (!file_res) {
+            if (stats) {
+                stats->status = "open_fail";
+                stats->error_code = file_res.error();
+            }
             LOG(ERROR) << "Failed to open bucket file: "
                        << filepath_res.value();
             return tl::make_unexpected(file_res.error());
@@ -2038,8 +2128,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                     plan.offset + plan.key_size + plan.value_offset;
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
-                int64_t data_end =
-                    actual_offset + static_cast<int64_t>(plan.dest_slice.size);
+                int64_t data_end = actual_offset +
+                                   static_cast<int64_t>(plan.dest_slice.size);
                 int64_t aligned_end = static_cast<int64_t>(align_up(
                     static_cast<size_t>(data_end), kDirectIOAlignment));
                 size_t aligned_size =
@@ -2112,6 +2202,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                 return tl::make_unexpected(read_result.error());
             }
             if (read_result.value() != plan.dest_slice.size) {
+                if (stats) {
+                    stats->status = "short_read";
+                    stats->error_key = plan.key;
+                    stats->error_code = ErrorCode::FILE_READ_FAIL;
+                }
                 LOG(ERROR) << "Read size mismatch for key: " << plan.key
                            << ", expected: " << plan.dest_slice.size
                            << ", got: " << read_result.value();
@@ -2370,6 +2465,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 disk.fifo_index.insert(bucket_id);
                 disk.lru_index.emplace(0LL, bucket_id);
                 for (size_t i = 0; i < meta.keys.size(); i++) {
+                    const auto& key = meta.keys[i];
+                    if (std::find(meta.tombstones.begin(),
+                                  meta.tombstones.end(), key) !=
+                        meta.tombstones.end()) {
+                        metadata->deleted_bytes_.fetch_add(
+                            meta.metadatas[i].key_size +
+                                meta.metadatas[i].data_size,
+                            std::memory_order_relaxed);
+                        continue;
+                    }
                     object_bucket_map_.emplace(
                         meta.keys[i], StorageObjectMetadata{
                                           bucket_id, meta.metadatas[i].offset,
@@ -2561,6 +2666,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
                    << std::endl;
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // Start background GC thread if enabled.
+    if (bucket_backend_config_.gc_enable) {
+        gc_running_.store(true, std::memory_order_release);
+        gc_thread_ = std::thread(&BucketStorageBackend::GCThreadFunc, this);
     }
 
     return {};
@@ -4147,6 +4258,543 @@ void BucketStorageBackend::RemoveAll() {
     LOG(INFO) << "RemoveAll: removed " << bucket_ids.size() << " bucket(s)";
 }
 
+// --- Explicit-delete-only GC ---
+tl::expected<void, ErrorCode> BucketStorageBackend::MarkRemoved(
+    const std::string& key) {
+    SharedMutexLocker lock(&mutex_);
+    auto it = object_bucket_map_.find(key);
+    if (it == object_bucket_map_.end()) {
+        return {};
+    }
+    int64_t bucket_id = it->second.bucket_id;
+    int64_t freed = it->second.data_size + it->second.key_size;
+    auto bucket_it = buckets_.find(bucket_id);
+    if (bucket_it == buckets_.end()) {
+        return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+    }
+    auto bucket = bucket_it->second;
+    const auto object_metadata = it->second;
+    object_bucket_map_.erase(it);
+    bucket->tombstones.push_back(key);
+    auto persist_result =
+        StoreBucketMetadata(bucket_id, bucket, bucket->disk_index);
+    if (!persist_result) {
+        object_bucket_map_.emplace(key, object_metadata);
+        bucket->tombstones.pop_back();
+        return tl::make_unexpected(persist_result.error());
+    }
+    bucket->deleted_bytes_.fetch_add(freed, std::memory_order_relaxed);
+    ++bucket->generation_;
+    return {};
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::BatchMarkRemoved(
+    const std::vector<std::string>& keys) {
+    for (const auto& key : keys) {
+        auto result = MarkRemoved(key);
+        if (!result) {
+            return result;
+        }
+    }
+    return {};
+}
+
+bool BucketStorageBackend::CompactBucket(int64_t bucket_id) {
+    return CompactBuckets({bucket_id}, true);
+}
+
+bool BucketStorageBackend::CompactBuckets(
+    const std::vector<int64_t>& bucket_ids, bool space_pressure) {
+    if (bucket_ids.empty()) return true;
+
+    // Step 1: lock-snapshot live keys from ALL old buckets + mark compacting_
+    struct LiveKeyInfo {
+        std::string key;
+        int64_t old_bucket_id;
+        BucketObjectMetadata meta;
+    };
+    std::vector<LiveKeyInfo> live_keys_info;
+    // old_bucket_id -> {shared_ptr, last_access_ns}
+    std::unordered_map<int64_t,
+                       std::pair<std::shared_ptr<BucketMetadata>, int64_t>>
+        old_buckets;
+    std::unordered_map<int64_t, uint64_t> old_bucket_generations;
+    {
+        SharedMutexLocker lock(&mutex_);
+        for (int64_t bid : bucket_ids) {
+            auto it = buckets_.find(bid);
+            if (it == buckets_.end()) continue;
+            auto& bucket = it->second;
+            if (bucket->compacting_.load(std::memory_order_relaxed)) continue;
+            bucket->compacting_.store(true, std::memory_order_relaxed);
+            int64_t ts = bucket->last_access_ns_.load(
+                std::memory_order_relaxed);
+            old_buckets[bid] = {bucket, ts};
+            old_bucket_generations[bid] = bucket->generation_;
+
+            for (size_t i = 0; i < bucket->keys.size(); ++i) {
+                const auto& key = bucket->keys[i];
+                auto map_it = object_bucket_map_.find(key);
+                if (map_it != object_bucket_map_.end() &&
+                    map_it->second.bucket_id == bid) {
+                    live_keys_info.push_back(
+                        {key, bid, bucket->metadatas[i]});
+                }
+            }
+        }
+    }
+
+    if (old_buckets.empty()) return true;
+
+    auto reset_compacting = [&]() {
+        for (auto& [bid, pr] : old_buckets) {
+            pr.first->compacting_.store(false, std::memory_order_relaxed);
+        }
+    };
+
+    // Identify buckets with zero live keys — delete them immediately
+    // without waiting for merge. Buckets with live keys participate in
+    // the merge.
+    std::set<int64_t> buckets_with_live;
+    for (const auto& info : live_keys_info) {
+        buckets_with_live.insert(info.old_bucket_id);
+    }
+
+    std::vector<int64_t> empty_buckets;
+    for (auto& [bid, pr] : old_buckets) {
+        if (buckets_with_live.find(bid) == buckets_with_live.end()) {
+            empty_buckets.push_back(bid);
+        }
+    }
+
+    if (!empty_buckets.empty()) {
+        std::vector<int64_t> to_delete;
+        {
+            SharedMutexLocker lock(&mutex_);
+            for (int64_t bid : empty_buckets) {
+                auto it = buckets_.find(bid);
+                const auto& original = old_buckets.at(bid).first;
+                if (it != buckets_.end() && it->second == original &&
+                    original->generation_ == old_bucket_generations.at(bid)) {
+                    auto& disk = disks_[original->disk_index];
+                    disk.total_size -= original->data_size + original->meta_size;
+                    disk.fifo_index.erase(bid);
+                    disk.lru_index.erase({old_buckets.at(bid).second, bid});
+                    buckets_.erase(it);
+                    to_delete.push_back(bid);
+                } else {
+                    original->compacting_.store(false, std::memory_order_relaxed);
+                }
+            }
+        }
+        for (int64_t bid : to_delete) {
+            const auto& bucket = old_buckets.at(bid).first;
+            WaitForInflightReads(bucket);
+            DeleteBucketFiles(bid, bucket->disk_index);
+        }
+        // Remove deleted buckets from old_buckets so they don't interfere
+        // with the merge logic below.
+        for (int64_t bid : empty_buckets) {
+            old_buckets.erase(bid);
+        }
+    }
+
+    // If no live keys remain (all buckets were empty), we're done.
+    if (live_keys_info.empty()) {
+        return true;
+    }
+
+    // Step 2: group live keys by bucket_keys_limit / bucket_size_limit
+    // using metadata only (no file IO). Only the FIRST group that fills up
+    // will be written as a new bucket; remaining keys are deferred to the
+    // next round.
+    struct GroupedKey {
+        std::string key;
+        int64_t old_bucket_id;
+        BucketObjectMetadata meta;
+        int64_t total_size;  // key_size + data_size
+    };
+    std::vector<GroupedKey> first_group_keys;
+    int64_t group_count = 0;
+    int64_t group_size = 0;
+
+    for (const auto& info : live_keys_info) {
+        int64_t key_total =
+            info.meta.key_size + info.meta.data_size;
+        if (group_count >= bucket_backend_config_.bucket_keys_limit ||
+            (group_count > 0 && group_size + key_total >
+                                    bucket_backend_config_.bucket_size_limit)) {
+            break;  // first group is full
+        }
+        first_group_keys.push_back(
+            {info.key, info.old_bucket_id, info.meta, key_total});
+        group_size += key_total;
+        ++group_count;
+    }
+
+    // Check if first group is full enough to write.
+    bool group_full =
+        (group_count >= bucket_backend_config_.bucket_keys_limit) ||
+        (group_size >= bucket_backend_config_.bucket_size_limit);
+    if (!group_full && !space_pressure) {
+        // Not enough live keys to fill a bucket; defer to next round.
+        LOG(INFO) << "[GC] CompactBuckets deferred: group_count="
+                  << group_count
+                  << " group_size=" << group_size
+                  << " bucket_keys_limit="
+                  << bucket_backend_config_.bucket_keys_limit
+                  << " bucket_size_limit="
+                  << bucket_backend_config_.bucket_size_limit
+                  << " total_live_keys=" << live_keys_info.size();
+        reset_compacting();
+        return true;
+    }
+
+    // Step 3: read ONLY the first group's live key data from old buckets
+    // (lock-free IO). Open each old bucket file once, read only the keys
+    // that are in the first group.
+    std::unordered_map<std::string, std::string> live_data_buffers;
+    std::unordered_map<std::string, std::vector<Slice>> first_group;
+
+    // Group first_group_keys by old_bucket_id to open each file once.
+    std::unordered_map<int64_t,
+                       std::vector<const GroupedKey*>> keys_by_bucket;
+    for (const auto& gk : first_group_keys) {
+        keys_by_bucket[gk.old_bucket_id].push_back(&gk);
+    }
+
+    for (auto& [bid, keys_ptr] : keys_by_bucket) {
+        auto& old_bucket = old_buckets[bid].first;
+        bool read_ok = true;
+        {
+            BucketReadGuard guard(old_bucket);
+            auto data_path = GetBucketDataPath(bid, old_bucket->disk_index);
+            if (!data_path) {
+                read_ok = false;
+            } else {
+                auto file_result =
+                    OpenFile(data_path.value(), FileMode::Read);
+                if (!file_result) {
+                    read_ok = false;
+                } else {
+                    auto& file = file_result.value();
+                    for (const auto* gk : keys_ptr) {
+                        std::string data;
+                        data.resize(gk->meta.data_size);
+                        int64_t actual_offset =
+                            gk->meta.offset + gk->meta.key_size;
+                        iovec iov{data.data(),
+                                  static_cast<size_t>(gk->meta.data_size)};
+                        auto read_res =
+                            file->vector_read(&iov, 1, actual_offset);
+                        if (!read_res ||
+                            read_res.value() !=
+                                static_cast<size_t>(gk->meta.data_size)) {
+                            LOG(ERROR)
+                                << "CompactBuckets: read failed for key: "
+                                << gk->key << ", bucket_id=" << bid;
+                            read_ok = false;
+                            break;
+                        }
+                        live_data_buffers[gk->key] = std::move(data);
+                        first_group.emplace(
+                            gk->key,
+                            std::vector<Slice>{Slice{
+                                live_data_buffers[gk->key].data(),
+                                live_data_buffers[gk->key].size()}});
+                    }
+                }
+            }
+        }  // guard released
+
+        if (!read_ok) {
+            reset_compacting();
+            return false;
+        }
+    }
+
+    // Step 4: write the first group as a new bucket.
+    int64_t new_bucket_id = bucket_id_generator_->NextId();
+    std::vector<iovec> iovs;
+    std::vector<StorageObjectMetadata> new_metas;
+    auto build_result =
+        BuildBucket(new_bucket_id, first_group, iovs, new_metas);
+    if (!build_result) {
+        LOG(ERROR) << "CompactBuckets: BuildBucket failed";
+        reset_compacting();
+        return false;
+    }
+    // Rewrite onto a source disk so all file operations and quota
+    // bookkeeping remain in the same per-disk namespace.
+    const int new_disk_index = old_buckets.at(first_group_keys.front().old_bucket_id)
+                                   .first->disk_index;
+    build_result.value()->disk_index = new_disk_index;
+    auto write_result =
+        WriteBucket(new_bucket_id, build_result.value(), iovs, new_disk_index);
+    if (!write_result) {
+        LOG(ERROR) << "CompactBuckets: WriteBucket failed";
+        reset_compacting();
+        return false;
+    }
+
+    // Step 5: atomic swap under lock with re-validation.
+    auto& new_bucket = build_result.value();
+    // Determine which old buckets have ALL their live keys migrated.
+    // A key is "migrated" if it's in the first_group AND still maps to an
+    // old bucket being compacted. Old buckets with no remaining live keys
+    // (all migrated or removed) can be deleted.
+    std::set<int64_t> old_bucket_ids_set(bucket_ids.begin(),
+                                         bucket_ids.end());
+    // Use the coldest last_access_ns among old buckets for the new bucket.
+    int64_t new_last_access_ns = std::numeric_limits<int64_t>::max();
+    for (auto& [bid, pr] : old_buckets) {
+        new_last_access_ns = std::min(new_last_access_ns, pr.second);
+    }
+    if (new_last_access_ns == std::numeric_limits<int64_t>::max()) {
+        new_last_access_ns = 0;
+    }
+
+    std::vector<int64_t> buckets_to_delete;
+    {
+        SharedMutexLocker lock(&mutex_);
+        for (const auto& [bid, pr] : old_buckets) {
+            auto current_it = buckets_.find(bid);
+            auto generation_it = old_bucket_generations.find(bid);
+            if (current_it == buckets_.end() ||
+                generation_it == old_bucket_generations.end() ||
+                current_it->second->generation_ != generation_it->second) {
+                // A delete changed the source bucket after the snapshot. The
+                // data file was built from a stale view, so do not publish it
+                // or replace any object mappings with it.
+                lock.unlock();
+                CleanupOrphanedBucket(new_bucket_id, new_disk_index);
+                reset_compacting();
+                LOG(INFO) << "CompactBuckets discarded stale snapshot for "
+                          << "bucket_id=" << bid;
+                return true;
+            }
+        }
+        // Re-validate and remap each key in the new bucket.
+        for (size_t i = 0; i < new_bucket->keys.size(); ++i) {
+            const auto& key = new_bucket->keys[i];
+            auto map_it = object_bucket_map_.find(key);
+            if (map_it != object_bucket_map_.end() &&
+                old_bucket_ids_set.count(map_it->second.bucket_id)) {
+                // Still live at an old bucket -> remap to new bucket.
+                map_it->second = new_metas[i];
+            }
+            // else: key was removed or remapped -> skip.
+        }
+
+        // Insert new bucket.
+        auto& new_disk = disks_[new_disk_index];
+        new_disk.total_size += new_bucket->data_size + new_bucket->meta_size;
+        new_bucket->last_access_ns_.store(
+            new_last_access_ns, std::memory_order_relaxed);
+        buckets_.emplace(new_bucket_id, new_bucket);
+        new_disk.fifo_index.insert(new_bucket_id);
+        new_disk.lru_index.emplace(new_last_access_ns, new_bucket_id);
+
+        // Determine which old buckets can be deleted: those whose live keys
+        // are all now absent from object_bucket_map_ or remapped to the new
+        // bucket (i.e., no key still points at the old bucket).
+        for (auto& [bid, pr] : old_buckets) {
+            auto& old_bucket = pr.first;
+            bool has_remaining_live = false;
+            for (const auto& key : old_bucket->keys) {
+                auto map_it = object_bucket_map_.find(key);
+                if (map_it != object_bucket_map_.end() &&
+                    map_it->second.bucket_id == bid) {
+                    // This key is still live at the old bucket — it was not
+                    // in the first group (deferred to next round).
+                    has_remaining_live = true;
+                    break;
+                }
+            }
+            if (!has_remaining_live) {
+                buckets_to_delete.push_back(bid);
+            } else {
+                // Reset compacting_ so this bucket can be compacted later.
+                old_bucket->compacting_.store(false,
+                                              std::memory_order_relaxed);
+            }
+        }
+
+        // Remove old buckets that are fully migrated.
+        for (int64_t bid : buckets_to_delete) {
+            auto it = buckets_.find(bid);
+            if (it != buckets_.end()) {
+                auto& disk = disks_[it->second->disk_index];
+                disk.total_size -=
+                    it->second->data_size + it->second->meta_size;
+                disk.fifo_index.erase(bid);
+                disk.lru_index.erase({old_buckets[bid].second, bid});
+                buckets_.erase(it);
+            }
+        }
+    }
+
+    // Step 6: wait for inflight reads + delete old bucket files.
+    for (int64_t bid : buckets_to_delete) {
+        WaitForInflightReads(old_buckets[bid].first);
+        DeleteBucketFiles(bid, old_buckets[bid].first->disk_index);
+    }
+
+    return true;
+}
+
+void BucketStorageBackend::WaitForInflightReads(
+    std::shared_ptr<BucketMetadata> bucket) {
+    constexpr int kMaxSpinIterations = 1000;
+    constexpr auto kMaxWaitTime = std::chrono::seconds(10);
+    int spin_count = 0;
+    auto wait_start = std::chrono::steady_clock::now();
+    while (bucket->inflight_reads_.load(std::memory_order_acquire) > 0) {
+        if (++spin_count > kMaxSpinIterations) {
+            std::this_thread::yield();
+            spin_count = 0;
+            if (std::chrono::steady_clock::now() - wait_start >
+                kMaxWaitTime) {
+                LOG(ERROR) << "CompactBucket: timed out waiting for "
+                              "in-flight reads, inflight_reads="
+                           << bucket->inflight_reads_.load(
+                                  std::memory_order_relaxed);
+                break;
+            }
+        } else {
+            PAUSE();
+        }
+    }
+}
+
+void BucketStorageBackend::DeleteBucketFiles(int64_t bucket_id,
+                                             int disk_index) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto data_path = GetBucketDataPath(bucket_id, disk_index);
+    if (data_path) {
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(data_path.value());
+        }
+        fs::remove(data_path.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(ERROR) << "CompactBucket: failed to remove data file: "
+                       << data_path.value() << ", error: " << ec.message();
+        }
+    }
+    auto meta_path = GetBucketMetadataPath(bucket_id, disk_index);
+    if (meta_path) {
+        ec.clear();
+        fs::remove(meta_path.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(ERROR) << "CompactBucket: failed to remove meta file: "
+                       << meta_path.value() << ", error: " << ec.message();
+        }
+    }
+}
+
+// GCThreadFunc: background tombstone compaction loop.
+void BucketStorageBackend::GCThreadFunc() {
+    LOG(INFO) << "[GC] background compaction thread started";
+    while (gc_running_.load(std::memory_order_acquire)) {
+        // Sleep for gc_interval_ms or until woken for shutdown.
+        {
+            std::unique_lock<std::mutex> lock(gc_mutex_);
+            gc_cv_.wait_for(
+                lock,
+                std::chrono::milliseconds(
+                    bucket_backend_config_.gc_interval_ms),
+                [this]() {
+                    return !gc_running_.load(std::memory_order_relaxed);
+                });
+        }
+        if (!gc_running_.load(std::memory_order_acquire)) break;
+
+        if (!bucket_backend_config_.gc_enable) continue;
+
+        // Trigger pressure-mode compaction when any disk is near its quota.
+        bool space_pressure = false;
+        {
+            SharedMutexLocker lock(&mutex_, shared_lock);
+            for (const auto& disk : disks_) {
+                if (disk.max_total_size > 0 &&
+                    static_cast<double>(disk.total_size) /
+                            static_cast<double>(disk.max_total_size) >=
+                        bucket_backend_config_.gc_high_watermark_ratio) {
+                    space_pressure = true;
+                    break;
+                }
+            }
+        }
+
+        // Collect GC candidate buckets (up to gc_max_buckets_per_round).
+        std::vector<int64_t> candidates;
+        {
+            SharedMutexLocker lock(&mutex_);
+            int64_t count = 0;
+            for (auto it = buckets_.begin();
+                 it != buckets_.end() &&
+                 count < bucket_backend_config_.gc_max_buckets_per_round;
+                 ++it) {
+                int64_t deleted =
+                    it->second->deleted_bytes_.load(
+                        std::memory_order_relaxed);
+                if (deleted <= 0) continue;
+                if (it->second->compacting_.load(
+                        std::memory_order_relaxed))
+                    continue;
+                int64_t data_size = it->second->data_size;
+                double ratio =
+                    (data_size > 0)
+                        ? static_cast<double>(deleted) /
+                              static_cast<double>(data_size)
+                        : 0.0;
+                if (!space_pressure &&
+                    ratio < bucket_backend_config_.gc_deleted_ratio) {
+                    continue;
+                }
+                candidates.push_back(it->first);
+                ++count;
+            }
+        }
+
+        if (!candidates.empty()) {
+            if (bucket_backend_config_.gc_merge_enable &&
+                candidates.size() > 1) {
+                // Cross-bucket merge: collect live keys from multiple
+                // tombstone buckets into one new bucket.
+                if (CompactBuckets(candidates, space_pressure)) {
+                    LOG(INFO) << "[GC] merged " << candidates.size()
+                              << " bucket(s)";
+                } else {
+                    LOG(WARNING) << "[GC] CompactBuckets failed for "
+                                 << candidates.size()
+                                 << " bucket(s), will retry next round";
+                }
+            } else {
+                // Single-bucket compaction (one at a time).
+                int64_t compacted = 0;
+                for (int64_t bid : candidates) {
+                    if (CompactBuckets({bid}, space_pressure)) {
+                        ++compacted;
+                    } else {
+                        LOG(WARNING)
+                            << "[GC] CompactBuckets failed for bucket "
+                            << bid << ", will retry next round";
+                        break;
+                    }
+                }
+                if (compacted > 0) {
+                    LOG(INFO) << "[GC] compacted " << compacted
+                              << " bucket(s)";
+                }
+            }
+        }
+    }
+    LOG(INFO) << "[GC] background compaction thread stopped";
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     int64_t id, std::shared_ptr<BucketMetadata> metadata, int disk_index) {
     auto meta_path_res = GetBucketMetadataPath(id, disk_index);
@@ -4155,28 +4803,69 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto meta_path = meta_path_res.value();
-    auto open_file_result = OpenFile(meta_path, FileMode::Write);
-    if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
+    std::string encoded;
+    struct_pb::to_pb(*metadata, encoded);
+    // Never truncate the live metadata when persisting a tombstone. A crash
+    // during that overwrite could lose every other object in this bucket.
+    // The owned directory serializes writers; the temporary is on the same
+    // filesystem so rename is atomic.
+    const std::string temp_path = meta_path + ".tmp";
+    const int fd = ::open(temp_path.c_str(),
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        NotifyDiskError(errno, "open");
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
-    auto file = std::move(open_file_result.value());
-    std::string str;
-    struct_pb::to_pb(*metadata, str);
-    auto write_result = file->write(str, str.size());
-    if (!write_result) {
-        NotifyDiskError(file->sys_errno(), "write");
-        LOG(ERROR) << "Write failed for: " << meta_path
-                   << ", error: " << write_result.error();
-        return tl::make_unexpected(write_result.error());
+    size_t written = 0;
+    while (written < encoded.size()) {
+        const ssize_t n = ::write(fd, encoded.data() + written,
+                                  encoded.size() - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            const int error = n < 0 ? errno : EIO;
+            ::close(fd);
+            ::unlink(temp_path.c_str());
+            NotifyDiskError(error, "write");
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        written += static_cast<size_t>(n);
     }
-    if (write_result.value() != str.size()) {
-        LOG(ERROR) << "Write size mismatch for: " << meta_path
-                   << ", expected: " << str.size()
-                   << ", got: " << write_result.value();
+    if (::fsync(fd) != 0) {
+        const int error = errno;
+        ::close(fd);
+        ::unlink(temp_path.c_str());
+        NotifyDiskError(error, "fsync");
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    metadata->meta_size = str.size();
+    if (::close(fd) != 0) {
+        const int error = errno;
+        ::unlink(temp_path.c_str());
+        NotifyDiskError(error, "close");
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (::rename(temp_path.c_str(), meta_path.c_str()) != 0) {
+        const int error = errno;
+        ::unlink(temp_path.c_str());
+        NotifyDiskError(error, "rename");
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    // The rename has committed the new metadata. A directory sync failure
+    // must not roll the in-memory tombstone back against the installed file.
+    const int dir_fd = ::open(disk_paths_[disk_index].c_str(),
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) {
+        NotifyDiskError(errno, "open_directory");
+        LOG(ERROR) << "Failed to open metadata directory for sync: "
+                   << disk_paths_[disk_index];
+    } else {
+        if (::fsync(dir_fd) != 0) {
+            NotifyDiskError(errno, "fsync_directory");
+            LOG(ERROR) << "Failed to sync metadata directory: "
+                       << disk_paths_[disk_index];
+        }
+        ::close(dir_fd);
+    }
+    metadata->meta_size = encoded.size();
     return {};
 }
 
@@ -6118,6 +6807,8 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoadSpans(
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadOffsetValues(
     std::unordered_map<std::string, StorageValueSpan>& spans,
     bool require_exact_size) {
+    auto* stats = CurrentStorageReadStats();
+    const auto plan_start = std::chrono::steady_clock::now();
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -6187,7 +6878,15 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadOffsetValues(
 
     // Step 2: Perform disk I/O without holding any locks
     // Allocations and data file are kept alive by shared_ptr refs in read_plans
+    if (stats) {
+        stats->plan_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - plan_start)
+                .count();
+        stats->io_mode = "preadv";
+    }
     for (const auto& plan : read_plans) {
+        const auto disk_start = std::chrono::steady_clock::now();
         // Read header first.  The CRC is NOT verified here: records are
         // CRC-validated once during recovery, and during normal operation
         // a key only becomes visible after its write completed, so the
@@ -6257,6 +6956,17 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadOffsetValues(
                        << ", expected: " << plan.dest_slice.size
                        << ", got: " << read_value_result.value();
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (stats) {
+            const auto read_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - disk_start)
+                    .count();
+            stats->disk_read_us += read_us;
+            if (read_us > stats->slowest_disk_read_us) {
+                stats->slowest_disk_read_us = read_us;
+                stats->slowest_key = plan.key;
+            }
         }
     }
 

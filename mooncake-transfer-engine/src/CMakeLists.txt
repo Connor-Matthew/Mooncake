@@ -22,6 +22,7 @@ if(HAVE_IBV_ACTIVE_SPEED_EX)
   add_compile_definitions(HAVE_IBV_ACTIVE_SPEED_EX)
 endif()
 
+include(${CMAKE_CURRENT_LIST_DIR}/../../mooncake-common/FindSpDiag.cmake)
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -82,7 +83,8 @@ target_include_directories(
          $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/../include>
          $<INSTALL_INTERFACE:include>
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-          ${CMAKE_CURRENT_SOURCE_DIR}/shared_segment)
+          ${CMAKE_CURRENT_SOURCE_DIR}/shared_segment
+          ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-integration/store)
 target_compile_definitions(transfer_engine PRIVATE MOONCAKE_USE_ETCD
                                                    CMAKE_INCLUDE)
 target_link_libraries(
@@ -99,7 +101,7 @@ target_link_libraries(
          numa
          asio_shared
          yalantinglibs::yalantinglibs
-  PRIVATE transport transfer_metadata_plugin)
+  PRIVATE transport transfer_metadata_plugin SpDiag::spdiag_lib)
 if(UNIX AND NOT APPLE)
   # shm_open/shm_unlink live in librt on glibc; OBJECT-library PRIVATE deps do
   # not propagate through $<TARGET_OBJECTS:shm_transport>.

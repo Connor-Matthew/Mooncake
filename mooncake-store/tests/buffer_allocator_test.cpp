@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "allocator.h"
+#include "common/client_buffer_allocation.h"
 #include "master_metric_manager.h"
 #include "replica.h"
 #include "types.h"
@@ -69,6 +70,26 @@ class BufferAllocatorTest : public ::testing::Test {
     std::vector<BufferAllocatorType> allocator_types_ = {
         BufferAllocatorType::CACHELIB, BufferAllocatorType::OFFSET};
 };
+
+TEST(ClientBufferAllocationTest, ParseNumaNodes) {
+    auto nodes = try_parse_numa_nodes("0, 2,3");
+    ASSERT_TRUE(nodes.has_value());
+    EXPECT_EQ(nodes.value(), (std::vector<int>{0, 2, 3}));
+
+    nodes = try_parse_numa_nodes("7");
+    ASSERT_TRUE(nodes.has_value());
+    EXPECT_EQ(nodes.value(), (std::vector<int>{7}));
+}
+
+TEST(ClientBufferAllocationTest, RejectsInvalidNumaNodes) {
+    EXPECT_FALSE(try_parse_numa_nodes("").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("0,").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("0,,2").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("-1").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("1,1").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("numa0").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("2147483648").has_value());
+}
 
 TEST_F(BufferAllocatorTest, DescriptorFollowsPublishedAndClearedLocality) {
     auto allocator = CreateTestAllocator("receiver", 0, 16 * 1024 * 1024,
@@ -258,12 +279,28 @@ TEST_F(BufferAllocatorTest, ImportedOffsetHandleReleasesItsExactAddress) {
     auto restored = ImportOffsetBufferAllocator(
         "restore-release", kBase, kCapacity, endpoint, "tcp", allocations);
     ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->allocator->size(), 128);
 
     restored->buffers[0].reset();
     auto replacement = restored->allocator->allocate(64);
     ASSERT_NE(replacement, nullptr);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(replacement->data()),
               kBase + allocations[0].offset_from_base);
+}
+
+TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsReleaseAddressGaps) {
+    constexpr uintptr_t kBase = 0x1A0000000ULL;
+    constexpr size_t kCapacity = 4096;
+    const std::string endpoint = "restore-release";
+    std::vector<LiveAllocation> allocations = {{0, 64}, {512, 64}};
+    auto restored = ImportOffsetBufferAllocator(
+        "restore-release", kBase, kCapacity, endpoint, "tcp", allocations);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->allocator->size(), 128);
+
+    auto gap_buffer = restored->allocator->allocate(64);
+    ASSERT_NE(gap_buffer, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(gap_buffer->data()), kBase);
 }
 
 TEST_F(BufferAllocatorTest, ImportOffsetAllocationsHasNoArbitraryGapLimit) {

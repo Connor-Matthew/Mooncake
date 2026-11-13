@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -65,6 +66,14 @@ class OpLogApplier {
      */
     void LoadSegmentRegistry(const std::vector<StandbySegmentInfo>& segments);
 
+    // Installs the partition-vsegment state handler used by a standby that
+    // owns a VSegmentService. Keeping this callback optional preserves legacy
+    // deployments that never emit VSEGMENT_STATE records.
+    void SetVSegmentStateHandler(
+        std::function<bool(const OpLogEntry&)> handler) {
+        vsegment_state_handler_ = std::move(handler);
+    }
+
    private:
     /**
      * @brief Apply PUT_END operation
@@ -99,6 +108,7 @@ class OpLogApplier {
 
     // Standby segment registry
     StandbySegmentRegistry segment_registry_;
+    std::function<bool(const OpLogEntry&)> vsegment_state_handler_;
 };
 
 }  // namespace mooncake

@@ -101,12 +101,53 @@ struct HABackendSpec {
     ClusterNamespace cluster_namespace;
     // Leadership lease TTL in seconds. Currently honored by the etcd backend.
     int64_t leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
+    // TTL in seconds for the master-view lease (redis/k8s backends). Controls
+    // how fast a standby detects a dead primary. Alias of
+    // leader_lease_ttl_sec: the supervisor fills both from
+    // --ha_leader_lease_ttl_sec unless --master_view_lease_ttl_sec is set.
+    int64_t master_view_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
 };
 
 struct MasterView {
     std::string leader_address;
     ViewVersionId view_version = 0;
 };
+
+// A single submaster replay source for a standby. master_id doubles as the
+// per-source OpLog namespace (see ha/oplog/oplog_batch_types.h).
+struct MasterSource {
+    std::string master_id;
+    std::string address;
+};
+
+using MasterSources = std::vector<MasterSource>;
+
+// OpLog source namespace written by a producer. Only multi-submaster (CVM)
+// clusters partition the OpLog per master; single-leader HA keeps the
+// unpartitioned layout so batch snapshots, compaction and leader failover
+// all continue on one stream. Producer and standby must both derive the
+// namespace through this function.
+inline std::string OpLogSourceId(const std::string& master_id,
+                                 uint32_t submaster_count) {
+    return submaster_count > 1 ? master_id : std::string();
+}
+
+// Replay source set for a single-leader standby: the observed leader on the
+// unpartitioned stream. Empty when no leader is known.
+inline MasterSources SingleLeaderSources(
+    const std::optional<MasterView>& leader_view) {
+    if (!leader_view || leader_view->leader_address.empty()) {
+        return {};
+    }
+    return {MasterSource{std::string(), leader_view->leader_address}};
+}
+
+// True for the single-leader layout (one unpartitioned source). Batch
+// OpLog snapshots and compaction are only supported in this mode; multi-
+// source standbys replay every source from the beginning.
+inline bool IsUnpartitionedSingleSource(const MasterSources& sources) {
+    return sources.size() == 1 && sources.front().master_id.empty();
+}
 
 struct LeadershipSession {
     MasterView view;

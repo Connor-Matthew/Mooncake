@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <charconv>
+#include <cmath>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -33,6 +34,12 @@ bool BucketBackendConfig::Validate() const {
                        << "] must > 0, got " << max_total_size_per_disk[i];
             return false;
         }
+    }
+    if (gc_interval_ms <= 0 || gc_max_buckets_per_round <= 0 ||
+        !std::isfinite(gc_deleted_ratio) || gc_deleted_ratio < 0.0 || gc_deleted_ratio > 1.0 ||
+        !std::isfinite(gc_high_watermark_ratio) || gc_high_watermark_ratio < 0.0 || gc_high_watermark_ratio > 1.0) {
+        LOG(ERROR) << "BucketBackendConfig: invalid GC interval, limit, or ratio";
+        return false;
     }
     return true;
 }
@@ -114,6 +121,20 @@ BucketBackendConfig::FromEnvironment() {
         config.eviction_policy = BucketEvictionPolicy::NONE;
     }
 
+    config.disable_ssd_eviction = Environ::ReadOr(
+        EnvironmentVariable<bool>{"MOONCAKE_OFFLOAD_DISABLE_SSD_EVICTION"}, config.disable_ssd_eviction);
+    config.gc_enable = Environ::ReadOr(
+        EnvironmentVariable<bool>{"MOONCAKE_OFFLOAD_BUCKET_GC_ENABLE"}, config.gc_enable);
+    config.gc_interval_ms = Environ::ReadOr(
+        EnvironmentVariable<int64_t>{"MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_MS"}, config.gc_interval_ms);
+    config.gc_deleted_ratio = Environ::ReadOr(
+        EnvironmentVariable<double>{"MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO"}, config.gc_deleted_ratio);
+    config.gc_high_watermark_ratio = Environ::ReadOr(
+        EnvironmentVariable<double>{"MOONCAKE_OFFLOAD_BUCKET_GC_HIGH_WATERMARK_RATIO"}, config.gc_high_watermark_ratio);
+    config.gc_max_buckets_per_round = Environ::ReadOr(
+        EnvironmentVariable<int64_t>{"MOONCAKE_OFFLOAD_BUCKET_GC_MAX_BUCKETS_PER_ROUND"}, config.gc_max_buckets_per_round);
+    config.gc_merge_enable = Environ::ReadOr(
+        EnvironmentVariable<bool>{"MOONCAKE_OFFLOAD_BUCKET_GC_MERGE_ENABLE"}, config.gc_merge_enable);
     return config;
 }
 

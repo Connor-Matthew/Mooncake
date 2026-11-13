@@ -98,6 +98,23 @@ fi
 # Parse command line arguments
 SKIP_CONFIRM=false
 INSTALL_SPDK=false
+# Modified By Yida (v3): NoF/URMA 支持——SPDK 来源与 URMA transport 开关。
+# URMA 模式默认使用本项目 fork 的 SPDK，并固定到具体 commit（initiator/target
+# 两端 wire 版本必须一致，只固定分支名不够）。
+# Modified By Yida (v6): 默认引用升级到 urma_modified_v6（c44ccce27）。v6 与
+# v3 wire 兼容，但两端仍统一 v6：hdr+capsule 合并发送、TCP_NODELAY、poller
+# 批量排空、大 I/O 与 per-I/O trace 开关只在 v6 生效。
+# Modified By Yida (urma_enable_v2): SE_Review v2 生命周期收敛 (da037fbc7) 与
+# Round 7 v2 阶段遥测与 queued response 生命周期修复；wire v4，两端必须同版本部署。
+# Modified By Senorita (urma_enable_v2 前移): qpair drain 收尾（retire posted
+# receive refs）、split I/O qpair 容量、URMA/NVMe 读取尾段阶段遥测与
+# urma_stage_buffer 统一缓冲处理（9b5cd59ca..e12b7cb21，共 5 提交）。
+SPDK_URMA_REPO_DEFAULT="https://github.com/yyyuanhao426-hash/spdk.git"
+SPDK_URMA_REF_DEFAULT="e12b7cb213a9c1a2a22b99ab4732c8c11f95032c" # urma_enable_v2
+SPDK_REPO_URL=""
+SPDK_REF="v23.01.1"
+WITH_URMA=false
+UMDK_ROOT=""
 for arg in "$@"; do
     case $arg in
         -y|--yes)
@@ -106,17 +123,51 @@ for arg in "$@"; do
         --with-spdk)
             INSTALL_SPDK=true
             ;;
+        --spdk-repo=*)
+            SPDK_REPO_URL="${arg#*=}"
+            ;;
+        --spdk-ref=*)
+            SPDK_REF="${arg#*=}"
+            ;;
+        --with-urma)
+            WITH_URMA=true
+            ;;
+        --with-urma=*)
+            WITH_URMA=true
+            UMDK_ROOT="${arg#*=}"
+            ;;
+        --umdk-root=*)
+            WITH_URMA=true
+            UMDK_ROOT="${arg#*=}"
+            ;;
         -h|--help)
             echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
             echo -e "Usage: ./dependencies.sh [OPTIONS]"
             echo -e "\nOptions:"
             echo -e "  -y, --yes       Skip confirmation and install all dependencies"
             echo -e "  --with-spdk     Install SPDK for NVMe-oF support"
+            echo -e "  --spdk-repo=URL Clone SPDK from the given repo instead of upstream"
+            echo -e "                  (default with URMA: ${SPDK_URMA_REPO_DEFAULT})"
+            echo -e "  --spdk-ref=REF  Checkout the given branch/tag/commit (default: ${SPDK_REF})"
+            echo -e "                  (default with URMA: ${SPDK_URMA_REF_DEFAULT})"
+            echo -e "  --with-urma[=DIR] Configure SPDK with the URMA transport."
+            echo -e "                  DIR may point to a UMDK install prefix (defaults to"
+            echo -e "                  \${UMDK_ROOT} or system paths)"
+            echo -e "  --umdk-root=DIR Alias of --with-urma=DIR"
             echo -e "  -h, --help      Show this help message and exit"
             exit 0
             ;;
     esac
 done
+
+if [ "$WITH_URMA" = true ]; then
+    if [ -z "$SPDK_REPO_URL" ]; then
+        SPDK_REPO_URL="${SPDK_URMA_REPO_DEFAULT}"
+    fi
+    if [ "$SPDK_REF" = "v23.01.1" ]; then
+        SPDK_REF="${SPDK_URMA_REF_DEFAULT}"
+    fi
+fi
 
 # Print welcome message
 echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
@@ -460,17 +511,22 @@ if [ "$INSTALL_SPDK" = true ]; then
     fi
 
     # Clone SPDK
-    echo "Cloning SPDK from ${GITHUB_PROXY}/spdk/spdk.git..."
-    git clone ${GITHUB_PROXY}/spdk/spdk.git
+    # Modified By Yida (v3): SPDK 来源与版本可通过 --spdk-repo/--spdk-ref 覆盖，
+    # URMA 模式默认克隆本项目 fork 并固定 commit。
+    if [ -z "$SPDK_REPO_URL" ]; then
+        SPDK_REPO_URL="${GITHUB_PROXY}/spdk/spdk.git"
+    fi
+    echo "Cloning SPDK from ${SPDK_REPO_URL}..."
+    git clone "${SPDK_REPO_URL}" spdk
     check_success "Failed to clone SPDK"
 
     cd spdk
     check_success "Failed to change to SPDK directory"
 
     # Checkout specific version
-    echo "Checking out SPDK version v23.01.1..."
-    git checkout v23.01.1
-    check_success "Failed to checkout SPDK version v23.01.1"
+    echo "Checking out SPDK version ${SPDK_REF}..."
+    git checkout "${SPDK_REF}"
+    check_success "Failed to checkout SPDK version ${SPDK_REF}"
 
     # Initialize submodules
     echo "Initializing SPDK submodules..."
@@ -483,9 +539,20 @@ if [ "$INSTALL_SPDK" = true ]; then
     check_success "Failed to install SPDK RDMA dependencies"
 
     # Configure SPDK with RDMA support
+    # Modified By Yida (v3): --with-urma 启用 URMA transport；DIR 指向 UMDK
+    # 安装前缀（缺省时依赖系统路径）。URMA 模式下目标节点必须先装好 UMDK。
     echo "Configuring SPDK with RDMA support..."
-    ./configure --with-rdma
-    check_success "Failed to configure SPDK"
+    if [ "$WITH_URMA" = true ]; then
+        if [ -n "$UMDK_ROOT" ]; then
+            ./configure --with-rdma --with-urma="$UMDK_ROOT"
+        else
+            ./configure --with-rdma --with-urma
+        fi
+        check_success "Failed to configure SPDK (with URMA; ensure UMDK is installed)"
+    else
+        ./configure --with-rdma
+        check_success "Failed to configure SPDK"
+    fi
 
     # Build SPDK
     echo "Building SPDK (using $(nproc) cores)..."
@@ -493,9 +560,27 @@ if [ "$INSTALL_SPDK" = true ]; then
     check_success "Failed to build SPDK"
 
     # Install SPDK
+    # Modified By Yida (v6): SPDK 26.x 的 install 链末尾用 uv pip 打包
+    # spdk/python（PEP 517 需在线拉 hatchling）。出口受限或 sudo 剥离代理 env
+    # 时该步骤报 Error 2，但此时静态库与头文件已全部装完——Mooncake 只依赖
+    # /usr/local 下的库与头文件（ADR-0018）。因此退出码只作参考，判定收敛
+    # 为产物完整性检查。
     echo "Installing SPDK..."
-    make install
-    check_success "Failed to install SPDK"
+    if ! make install; then
+        echo -e "${YELLOW}make install exited nonzero (usually the spdk/python hatchling step); core artifacts may already be installed.${NC}"
+    fi
+
+    INSTALL_INCOMPLETE=""
+    for _f in libspdk_event.a libspdk_nvme.a; do
+        if [ ! -f "/usr/local/lib/${_f}" ]; then
+            echo -e "${RED}NOT INSTALLED: /usr/local/lib/${_f}${NC}"
+            INSTALL_INCOMPLETE=1
+        fi
+    done
+    if [ -n "$INSTALL_INCOMPLETE" ]; then
+        print_error "SPDK install incomplete. Rerun 'sudo -E make install' in $(pwd) (sudo -E keeps proxy env for the hatchling step; see ADR-0018)"
+    fi
+    print_success "SPDK core static libraries verified in /usr/local/lib"
 
     # Copy DPDK libraries to system library path
     if ls dpdk/build/lib/*.a >/dev/null 2>&1; then
@@ -519,7 +604,11 @@ echo -e "  ${GREEN}✓${NC} System packages"
 echo -e "  ${GREEN}✓${NC} Git submodules"
 echo -e "  ${GREEN}✓${NC} Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
-    echo -e "  ${GREEN}✓${NC} SPDK (v23.01.1)"
+    if [ "$WITH_URMA" = true ]; then
+        echo -e "  ${GREEN}✓${NC} SPDK (${SPDK_REF}, URMA transport enabled)"
+    else
+        echo -e "  ${GREEN}✓${NC} SPDK (${SPDK_REF})"
+    fi
 fi
 echo
 echo -e "You can now build and run Mooncake."

@@ -23,6 +23,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <sstream>
 #include <strings.h>
@@ -391,6 +393,24 @@ void loadGlobalConfig(GlobalConfig& config) {
             LOG(WARNING) << "Invalid MC_HANDSHAKE_LISTEN_BACKLOG environment "
                             "value: "
                          << handshake_listen_backlog << ". Error: " << e.what();
+        }
+    }
+
+    const char* handshake_worker_threads =
+        std::getenv("MC_HANDSHAKE_WORKER_THREADS");
+    if (handshake_worker_threads) {
+        try {
+            int val = std::stoi(handshake_worker_threads);
+            if (val > 0) {
+                config.handshake_worker_threads = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_HANDSHAKE_WORKER_THREADS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_HANDSHAKE_WORKER_THREADS environment "
+                            "value: "
+                         << handshake_worker_threads << ". Error: " << e.what();
         }
     }
 
@@ -871,6 +891,79 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (std::getenv("MC_URMA_BONDING_BALANCE")) {
+        config.urma_bonding_balance = true;
+    }
+
+    const char* eid_index_env = std::getenv("MC_EID_INDEX");
+    if (eid_index_env) {
+        int value = -1;
+        const char* end = eid_index_env + std::strlen(eid_index_env);
+        auto parsed = std::from_chars(eid_index_env, end, value);
+        if (parsed.ec != std::errc() || parsed.ptr != end || value < 0) {
+            config.eid_index = -1;
+            LOG(ERROR) << "Invalid MC_EID_INDEX='" << eid_index_env
+                       << "': expected a non-negative decimal int; "
+                          "UB context creation will fail";
+        } else {
+            config.eid_index = value;
+        }
+    }
+
+    const char* urma_trans_mode_env = std::getenv("MC_URMA_TRANS_MODE");
+    if (urma_trans_mode_env && *urma_trans_mode_env) {
+        std::string val(urma_trans_mode_env);
+        if (val == "RM" || val == "RC" || val == "UM")
+            config.urma_trans_mode = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_URMA_TRANS_MODE, it should be RM|RC|UM";
+    }
+
+    const char* urma_active_port_env = std::getenv("MC_URMA_ACTIVE_PORT");
+    if (urma_active_port_env && *urma_active_port_env) {
+        try {
+            int val = std::stoi(urma_active_port_env);
+            if (val >= 0) {
+                config.urma_active_port = val;
+                LOG(INFO) << "MC_URMA_ACTIVE_PORT is " << val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_URMA_ACTIVE_PORT, it should be >= 0; "
+                                "using auto-selection (scan active ports)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Failed to parse MC_URMA_ACTIVE_PORT='"
+                         << urma_active_port_env << "': " << e.what()
+                         << "; using auto-selection (scan active ports)";
+        }
+    }
+
+    const char* urma_bonding_multipath_enable =
+        std::getenv("MC_URMA_BONDING_MULTIPATH_ENABLE");
+    if (urma_bonding_multipath_enable && *urma_bonding_multipath_enable) {
+        std::string val(urma_bonding_multipath_enable);
+        if (val == "true" || val == "1" || val == "on") {
+            config.urma_bonding_multipath = true;
+            LOG(WARNING) << "MC_URMA_BONDING_MULTIPATH_ENABLE is " << val;
+        } else
+            LOG(WARNING)
+                << "Ignore value from environment variable "
+                   "MC_URMA_BONDING_MULTIPATH_ENABLE, it should be true|1|on";
+    }
+
+    const char* ub_numa_affinity_enable =
+        std::getenv("MC_UB_NUMA_AFFINITY_ENABLE");
+    if (ub_numa_affinity_enable && *ub_numa_affinity_enable) {
+        std::string val(ub_numa_affinity_enable);
+        if (val == "true" || val == "1" || val == "on") {
+            config.ub_numa_affinity = true;
+            LOG(WARNING) << "MC_UB_NUMA_AFFINITY_ENABLE is " << val;
+        } else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_UB_NUMA_AFFINITY_ENABLE, it should be true|1|on";
+    }
+
     const char* mlx5_qp_lag_port_balance_env =
         std::getenv("MC_MLX5_QP_LAG_PORT_BALANCE");
     if (mlx5_qp_lag_port_balance_env && *mlx5_qp_lag_port_balance_env) {
@@ -954,6 +1047,12 @@ void dumpGlobalConfig() {
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
     LOG(INFO) << "rdma_worker_idle_spin_us = "
               << config.rdma_worker_idle_spin_us;
+    LOG(INFO) << "handshake_listen_backlog = "
+              << config.handshake_listen_backlog;
+    LOG(INFO) << "handshake_worker_threads = "
+              << config.handshake_worker_threads;
+    LOG(INFO) << "handshake_connect_timeout = "
+              << config.handshake_connect_timeout;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
@@ -980,6 +1079,10 @@ void dumpGlobalConfig() {
               << config.rdma_notify_max_pending_sends;
     LOG(INFO) << "rdma_notify_oob_fallback = "
               << (config.rdma_notify_oob_fallback ? "true" : "false");
+    LOG(INFO) << "eid_index = " << config.eid_index;
+    LOG(INFO) << "urma_trans_mode = " << config.urma_trans_mode;
+    LOG(INFO) << "urma_bonding_balance = "
+              << (config.urma_bonding_balance ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {

@@ -289,6 +289,20 @@ struct SpdkControllerEnvironmentVariables {
     MC_DEFINE_ENV_VAR(uint64_t, MC_NVME_FABRICS_CONNECT_TIMEOUT_US);
     MC_DEFINE_ENV_VAR(bool, MC_NVME_HEADER_DIGEST);
     MC_DEFINE_ENV_VAR(bool, MC_NVME_DATA_DIGEST);
+    // Unset keeps SPDK's default KATO (10 s); 0 disables keep-alive.
+    MC_DEFINE_ENV_VAR(uint32_t, MC_NVME_KEEP_ALIVE_TIMEOUT_MS);
+    // I/O queue pairs ("lanes") opened per NoF segment, 1..64 (default 4).
+    MC_DEFINE_ENV_VAR(uint32_t, MC_NOF_QPAIRS_PER_SEGMENT);
+};
+
+// SPDK *environment* knobs, read before spdk_env_init(). Kept separate from
+// SpdkControllerEnvironmentVariables: those feed one controller's
+// spdk_nvme_ctrlr_opts in the probe callback, while these describe the
+// process-wide EAL setup.
+struct SpdkEnvEnvironmentVariables {
+    // Default true. false keeps EAL's main-lcore placement of the initializing
+    // thread instead of restoring the caller's mask.
+    MC_DEFINE_ENV_VAR(bool, MC_SPDK_RESET_AFFINITY);
 };
 
 struct NvmeKvConnectorEnvironmentVariables {

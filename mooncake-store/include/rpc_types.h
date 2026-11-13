@@ -1,6 +1,11 @@
 #pragma once
 
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
+
+#include <ylt/struct_pack/compatible.hpp>
+#include <ylt/util/tl/expected.hpp>
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -57,6 +62,33 @@ struct ReplicaActionLease {
 YLT_REFL(ReplicaActionLease, proposal_id, lease_id, action, tenant_id, key,
          source_segment, target_segment, target_domain, version_epoch,
          expire_at_ms_epoch, task_id);
+// Runtime-resolved location of one vsegment member. Only filled for vsegment
+// replicas; ordinary memory/NoF/disk replicas carry their own endpoint/base in
+// Replica::Descriptor.
+struct VSegmentLayoutMember {
+    std::string segment_id;
+    uint64_t base_offset{0};
+    uint64_t length{0};
+    std::string endpoint;
+    uint64_t base_address{0};
+};
+YLT_REFL(VSegmentLayoutMember, segment_id, base_offset, length, endpoint,
+         base_address);
+
+// Deduplicated per-vsegment layout carried alongside replica descriptors.
+// The layout is immutable; endpoint/base are runtime values resolved by the
+// owner master when the response is built.
+struct VSegmentLayoutEntry {
+    std::string vsegment_id;
+    std::string partition_id;
+    uint64_t stripe_size{0};
+    uint64_t logical_capacity{0};
+    uint32_t mapping_algorithm{0};
+    uint32_t checksum{0};
+    std::vector<VSegmentLayoutMember> members;
+};
+YLT_REFL(VSegmentLayoutEntry, vsegment_id, partition_id, stripe_size,
+         logical_capacity, mapping_algorithm, checksum, members);
 
 /**
  * @brief Response structure for Ping operation
@@ -91,6 +123,9 @@ struct GetReplicaListResponse {
     // the exact scope the write path used. Empty when the master predates
     // this field.
     struct_pack::compatible<std::string, 1> resolved_tenant_id;
+    // Only entries for vsegment replicas in `replicas`; empty otherwise.
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -102,7 +137,84 @@ struct GetReplicaListResponse {
           object_checksum(object_checksum_param) {}
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
-         resolved_tenant_id);
+         resolved_tenant_id, vsegment_layouts);
+
+/**
+ * @brief PutStart 响应（vsegment 两阶段写预留接口）。
+ * operation_id 关联本次 PutStart 预留的逻辑区间，供 PutEnd / PutRevoke
+ * 引用；旧直达写路径不使用 vsegment，operation_id 为空字符串。
+ */
+struct PutStartResult {
+    std::string operation_id;
+    std::vector<Replica::Descriptor> replicas;
+    // Only entries for vsegment replicas in `replicas`; empty otherwise.
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
+
+    PutStartResult() = default;
+    PutStartResult(std::string operation_id_param,
+                   std::vector<Replica::Descriptor> replicas_param)
+        : operation_id(std::move(operation_id_param)),
+          replicas(std::move(replicas_param)) {}
+};
+YLT_REFL(PutStartResult, operation_id, replicas, vsegment_layouts);
+
+// BatchGetReplicaList keeps its legacy vector wire type. Its deduplicated table
+// rides on the first successful per-key GetReplicaListResponse, whose
+// compatible field keeps that RPC wire-compatible. BatchPutStart and
+// BatchUpsertStart intentionally return per-key PutStartResult values instead;
+// those direct RPC type changes require clients and masters to be upgraded
+// together.
+
+// Attaches the deduplicated batch table to the first successful per-key
+// response. No-op when there is no table or no successful key.
+inline void AttachVSegmentLayoutTableToFirstSuccess(
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>& results,
+    std::vector<VSegmentLayoutEntry> layouts) {
+    if (layouts.empty()) return;
+    for (auto& result : results) {
+        if (result) {
+            result->vsegment_layouts = std::move(layouts);
+            return;
+        }
+    }
+}
+
+// Collects layout tables carried by any per-key response of a batch (new
+// masters put one deduplicated table on the first successful key; legacy
+// masters carry none). Deduplicated by vsegment_id.
+inline void MergeVSegmentLayoutTablesFromResults(
+    const std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>& results,
+    std::vector<VSegmentLayoutEntry>& target);
+
+// Appends `incoming` to `target`, keeping the first entry per vsegment_id.
+// Used to merge tables built by different masters (route groups) into the
+// table of one batch response.
+inline void MergeVSegmentLayoutTable(
+    std::vector<VSegmentLayoutEntry>& target,
+    const std::vector<VSegmentLayoutEntry>& incoming) {
+    if (incoming.empty()) return;
+    // Hash-based dedup: a 30k-key batch can carry thousands of entries, and the
+    // merge runs once per route group.
+    std::unordered_set<std::string> seen;
+    seen.reserve(target.size() + incoming.size());
+    for (const auto& entry : target) seen.insert(entry.vsegment_id);
+    for (const auto& entry : incoming) {
+        if (seen.insert(entry.vsegment_id).second) {
+            target.push_back(entry);
+        }
+    }
+}
+
+inline void MergeVSegmentLayoutTablesFromResults(
+    const std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>& results,
+    std::vector<VSegmentLayoutEntry>& target) {
+    for (const auto& result : results) {
+        if (result && result->vsegment_layouts.has_value()) {
+            MergeVSegmentLayoutTable(target, *result->vsegment_layouts);
+        }
+    }
+}
 
 struct CachedQueryResultResponse {
     bool success;
@@ -152,8 +264,13 @@ YLT_REFL(NoFSegmentOwnerInfo, segment_id, client_id);
 struct CopyStartResponse {
     Replica::Descriptor source;
     std::vector<Replica::Descriptor> targets;
+    // Hard C: layout table for vsegment descriptors in source/targets. The
+    // client has no endpoint RPC to fall back to, so a vsegment copy without
+    // this table fails.
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
 };
-YLT_REFL(CopyStartResponse, source, targets);
+YLT_REFL(CopyStartResponse, source, targets, vsegment_layouts);
 
 /**
  * @brief Response structure for PromotionAllocStart (L2->L1 promotion-on-hit).
@@ -170,8 +287,49 @@ YLT_REFL(PromotionAllocStartResponse, memory_descriptor);
 struct MoveStartResponse {
     Replica::Descriptor source;
     std::optional<Replica::Descriptor> target;
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
 };
-YLT_REFL(MoveStartResponse, source, target);
+YLT_REFL(MoveStartResponse, source, target, vsegment_layouts);
+
+/**
+ * @brief Response structure for InterMasterHandshake: identity + ownership
+ * summary of a submaster, used by other submasters to verify the inter-master
+ * RPC channel (CVM multi-submaster coordination, forwarding path).
+ */
+struct InterMasterHandshakeResponse {
+    std::string master_id;
+    uint64_t lease_id{0};
+    uint32_t owned_slot_count{0};
+    std::string version;
+
+    InterMasterHandshakeResponse() = default;
+};
+YLT_REFL(InterMasterHandshakeResponse, master_id, lease_id, owned_slot_count,
+         version);
+
+/**
+ * @brief InterMasterExportSlot request (确定性哈希方案 §15.7): the new slot
+ * owner pulls the object-metadata export of `slot` from the previous owner.
+ * The previous owner serializes and returns its SlotMetadataExport without
+ * dropping local metadata until InterMasterAckSlotImported arrives.
+ */
+struct InterMasterExportSlotRequest {
+    uint16_t slot{0};
+    std::string requester_master_id;
+};
+YLT_REFL(InterMasterExportSlotRequest, slot, requester_master_id);
+
+/**
+ * @brief InterMasterAckSlotImported request: the new owner notifies the
+ * previous owner that `slot`'s metadata has been materialized locally, so the
+ * previous owner can drop its local metadata (and clear the staged export).
+ */
+struct InterMasterAckSlotImportedRequest {
+    uint16_t slot{0};
+    std::string importer_master_id;
+};
+YLT_REFL(InterMasterAckSlotImportedRequest, slot, importer_master_id);
 
 enum class JobType {
     DRAIN = 0,
@@ -388,5 +546,43 @@ struct VerifyDiskReplicaResponse {
         : states(std::move(states_param)) {}
 };
 YLT_REFL(VerifyDiskReplicaResponse, states);
+// One destination slice on the requester side. In push mode the data owner
+// writes (one-sided) the on-disk blob of a key directly into these addresses.
+struct OffloadDstSlice {
+    uint64_t addr;
+    uint64_t size;
+
+    OffloadDstSlice() : addr(0), size(0) {}
+    OffloadDstSlice(uint64_t addr_param, uint64_t size_param)
+        : addr(addr_param), size(size_param) {}
+};
+YLT_REFL(OffloadDstSlice, addr, size);
+
+// Push-mode offload request. Unlike the pull path (where the requester gets
+// back ClientBuffer pointers and issues the RDMA READ itself), here the
+// requester hands the owner its own transfer engine endpoint and destination
+// slice addresses. The owner reads SSD into its registered ClientBuffer and
+// then WRITEs straight into the requester's memory, so the requester needs no
+// follow-up READ nor a separate release_offload_buffer RPC.
+struct BatchGetOffloadObjectPushRequest {
+    std::vector<std::string> keys;  // tenant-scoped storage keys
+    std::vector<int64_t> sizes;     // total bytes per key (for FileStorage)
+    std::string requester_te_addr;  // requester's transfer engine endpoint
+    std::vector<std::vector<OffloadDstSlice>> dst_slices;  // per-key dst slices
+    uint64_t trace_id{0};
+
+    BatchGetOffloadObjectPushRequest() = default;
+};
+YLT_REFL(BatchGetOffloadObjectPushRequest, keys, sizes, requester_te_addr,
+         dst_slices, trace_id);
+
+struct BatchGetOffloadObjectPushResponse {
+    ErrorCode error_code;  // overall result; data is already in requester memory
+
+    BatchGetOffloadObjectPushResponse() : error_code(ErrorCode::OK) {}
+    explicit BatchGetOffloadObjectPushResponse(ErrorCode error_code_param)
+        : error_code(error_code_param) {}
+};
+YLT_REFL(BatchGetOffloadObjectPushResponse, error_code);
 
 }  // namespace mooncake

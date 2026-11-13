@@ -13,6 +13,7 @@
 
 #include <async_simple/Promise.h>
 
+#include "mooncake_logging.h"
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "ha_metric_manager.h"
 
@@ -444,6 +445,12 @@ bool OrderedOpLogWriter::IsAccepting() const {
     return impl_->accepting;
 }
 
+bool OrderedOpLogWriter::IsCallbackThread() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->callback_thread.joinable() &&
+           impl_->callback_thread.get_id() == std::this_thread::get_id();
+}
+
 ErrorCode OrderedOpLogWriter::LastError() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->last_error;
@@ -467,6 +474,29 @@ void OrderedOpLogWriter::SetTerminalCallback(TerminalCallback callback) {
     if (terminal && notify) {
         notify(*terminal);
     }
+}
+
+ErrorCode OrderedOpLogWriter::WaitDurable(
+    uint64_t sequence_id, std::chrono::milliseconds warning_interval) {
+    warning_interval = std::max(warning_interval, std::chrono::milliseconds(1));
+    std::unique_lock<std::mutex> lock(impl_->mutex);
+    if (sequence_id == 0 || sequence_id >= impl_->next_sequence_id)
+        return ErrorCode::INVALID_PARAMS;
+    // Accepted entries cannot be cancelled. In particular, callbacks may
+    // submit allocator updates and wait here: the storage thread, rather
+    // than another callback, advances this predicate.
+    while (!impl_->cv.wait_for(lock, warning_interval, [&] {
+        return impl_->durable_prefix.last_seq >= sequence_id ||
+               impl_->terminal_state.has_value() || impl_->stop_requested;
+    })) {
+        MC_LOG(WARNING) << "Still waiting for durable OpLog, sequence_id="
+                        << sequence_id << ", writer_error=" << impl_->last_error;
+    }
+    if (impl_->durable_prefix.last_seq < sequence_id) {
+        return impl_->terminal_state ? impl_->terminal_state->error
+                                     : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    return ErrorCode::OK;
 }
 
 void OrderedOpLogWriter::Start() {

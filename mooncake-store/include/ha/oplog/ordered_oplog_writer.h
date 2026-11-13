@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -108,6 +109,10 @@ class OrderedOpLogWriter {
     async_simple::Future<ErrorCode> AwaitDurable(uint64_t sequence);
 
     bool IsAccepting() const;
+    bool IsCallbackThread() const;
+    // Waits for storage durability, independently of the callback queue.
+    ErrorCode WaitDurable(uint64_t sequence_id,
+                          std::chrono::milliseconds warning_interval);
     ErrorCode LastError() const;
     std::optional<OrderedOpLogWriterTerminalState> GetTerminalState() const;
     void SetTerminalCallback(TerminalCallback callback);

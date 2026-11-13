@@ -1,8 +1,12 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include <atomic>  // For std::atomic
-#include <chrono>  // For std::chrono
+#include <dirent.h>  // For opendir (MC_LOG_DIR validation)
+#include <unistd.h>  // For access/W_OK (MC_LOG_DIR validation)
+
+#include <atomic>     // For std::atomic
+#include <chrono>     // For std::chrono
+#include <algorithm>  // For std::max
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
@@ -27,11 +31,17 @@
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
 #include "rpc_worker_pool.h"
+#include "mooncake_logging.h"
 #include "rpc_service.h"
 #include "shutdown_request.h"
 #include "types.h"
 #include "common/network.h"
 #include "glog_compat.h"
+
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "vsegment/partition_quota_planner.h"
+#endif
 
 #include "master_config.h"
 #include "version.h"
@@ -143,6 +153,10 @@ DEFINE_string(metrics_host,
               std::string(mooncake::MetricsBootstrapConfig::kDefaultHost),
               "Address for the HTTP metrics/admin server to listen on. "
               "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
+
+DEFINE_int32(admin_metrics_log_interval_sec, 10,
+             "Interval in seconds for the admin metrics log and the periodic "
+             "VSegment status log (clamped to >= 1)");
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
               "Default lease time for kv objects. Supports raw milliseconds "
               "or duration strings with ms, s, m, or h suffixes");
@@ -181,6 +195,32 @@ DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
 DEFINE_double(nof_eviction_high_watermark_ratio,
               mooncake::DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in NoF SSD");
+DEFINE_bool(io_pattern_cold_eviction, false,
+            "Enable report-driven cold-data eviction (embedded CFM component): "
+            "merged client reports may drive bounded evictions of the coldest "
+            "keys even when the memory high-watermark is not exceeded");
+DEFINE_uint64(io_pattern_cold_eviction_bytes_per_cycle, 0,
+              "Max bytes one report-driven cold-eviction pass may request "
+              "(0 disables the cold driver)");
+DEFINE_uint64(io_pattern_cold_idle_threshold_us, 0,
+              "Minimum idle_time_us for a key to be eligible for a "
+              "report-driven cold-eviction pass (0 disables the idle gate)");
+DEFINE_uint64(
+    io_pattern_tier_down_bytes_per_cycle, 0,
+    "Max bytes one report-driven tier-down pass may copy per cycle. "
+    "The pass runs below the memory watermark and copies the coldest "
+    "objects down while keeping their MEMORY replica, so a later "
+    "reclaim can discard them safely; a cycle that reaches the "
+    "watermark evicts instead. 0 keeps the driver off, so this budget "
+    "is the only switch the driver has");
+DEFINE_uint32(io_pattern_admission_frequency_threshold, 2,
+              "Min access count for a reported key before the io_pattern "
+              "policy admits it (set 1 to admit on first sight)");
+DEFINE_double(io_pattern_admission_watermark_ratio, -1.0,
+              "Capacity watermark for io_pattern admission, as a ratio of "
+              "capacity; a negative value derives it from "
+              "eviction_high_watermark_ratio so admission stops before "
+              "eviction starts");
 // RPC server configuration parameters (new, preferred)
 // TODO: deprecate port and max_threads in the future
 DEFINE_int32(rpc_thread_num, 0,
@@ -237,11 +277,34 @@ DEFINE_validator(nof_eviction_ratio, [](const char* flagname, double value) {
 });
 DEFINE_bool(enable_ha, false,
             "Enable high availability using the configured HA backend");
+
+// vsegment 配额自动规划（启动 bootstrap，etcd HA 模式专属）：quota 快照
+// 不存在时按以下策略自动「发现→规划→发布」（等价 vsegment_quota_planner
+// --publish；高级参数 required_medium/io_alignment 等走 master 的
+// POST /vsegment_quota 端点）。多实例并发安全：etcd 原子首写，
+// first-writer-wins。变更策略需先删除已发布快照再重启（或改用端点重发）。
+DEFINE_bool(vsegment_auto_plan, false,
+            "Auto-plan and publish the vsegment quota snapshot at startup "
+            "when none exists (etcd HA mode only)");
+DEFINE_uint32(vsegment_member_count, 0,
+              "vsegment auto-plan: number of distinct members per vsegment");
+DEFINE_uint64(vsegment_stripe_size, 0,
+              "vsegment auto-plan: stripe size in bytes");
+DEFINE_uint64(vsegment_member_extent_size, 0,
+              "vsegment auto-plan: extent size per member in bytes");
+DEFINE_double(vsegment_reserved_ratio, 0.0,
+              "vsegment auto-plan: fraction reserved outside vsegment "
+              "quotas, in [0, 1). Default 0 means no reservation.");
+
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
             "Force-evict objects exceeding offload cap without disk offload");
+DEFINE_bool(strict_replica_allocation, false,
+            "Require memory-only multi-replica PutStart/UpsertStart to "
+            "allocate exactly replica_num replicas instead of best-effort "
+            "degradation to fewer replicas");
 DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
@@ -361,6 +424,11 @@ DEFINE_int64(client_suspicion_ttl_sec,
              "Seconds a suspected client may recover before going offline; "
              "defaults to 20 seconds, or to an explicitly configured active "
              "TTL when omitted");
+
+DEFINE_int64(master_view_lease_ttl_sec,
+             mooncake::DEFAULT_MASTER_VIEW_LEASE_TTL_SEC,
+             "Alias for --ha_leader_lease_ttl_sec; explicit values override "
+             "the shared leader lease TTL.");
 DEFINE_int64(nof_heartbeat_interval_sec,
              mooncake::DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC,
              "How often master probes each mounted NoF segment");
@@ -381,6 +449,27 @@ DEFINE_int64(global_file_segment_size,
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");
+DEFINE_uint32(submaster_count, 1,
+              "Maximum number of simultaneously serving submaster in the "
+              "cluster (CVM quota coordination, first-come-first-served). "
+              "Masters ranked beyond this limit are demoted to standby.");
+DEFINE_uint32(cvm_http_port, 0,
+              "Port for the CVM external HTTP API (CvmHttpServer). 0 keeps it "
+              "disabled.");
+DEFINE_string(cvm_http_host, "0.0.0.0",
+              "Bind host for the CVM external HTTP API (CvmHttpServer).");
+// 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现）。
+DEFINE_string(cvm_segment_default_medium, "REGISTERED_MEMORY",
+              "Default physical medium reported for segments at mount time. "
+              "Must match VSegmentProfile.required_medium used by the vsegment "
+              "quota planner. Default \"REGISTERED_MEMORY\".");
+DEFINE_bool(cvm_segments_vsegment_exclusive, false,
+            "Optional hint: declare that this cluster's segments are "
+            "dedicated to vsegment and currently empty. true makes the "
+            "planner verify used_bytes==0 (fast path, full capacity used); "
+            "false (default) makes the planner use [used_bytes, capacity) "
+            "as the allocatable range. No longer required — users need not "
+            "set this for normal deployment.");
 
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
@@ -406,6 +495,21 @@ DEFINE_uint32(oplog_batch_max_entries, 1024,
               "batch-record OpLog waiting batch.");
 DEFINE_uint32(batch_oplog_retry_timeout_sec, 180,
               "Maximum time to retry transient batch OpLog standby errors.");
+
+// Metrics reporting to HA backend (etcd/redis)
+DEFINE_bool(enable_metrics_report_to_backend,
+            mooncake::DEFAULT_ENABLE_METRICS_REPORT_TO_BACKEND,
+            "Periodically push master storage metrics to the HA backend "
+            "(etcd/redis) so external monitoring services can discover "
+            "cluster-wide usage without scraping each master's /metrics "
+            "endpoint.");
+DEFINE_int32(metrics_report_interval_sec,
+             mooncake::DEFAULT_METRICS_REPORT_INTERVAL_SEC,
+             "Interval in seconds between master metrics pushes.");
+DEFINE_int32(metrics_report_lease_ttl_sec,
+             mooncake::DEFAULT_METRICS_REPORT_LEASE_TTL_SEC,
+             "TTL in seconds for the dedicated metrics-report lease. "
+             "Must be > metrics_report_interval_sec.");
 
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
@@ -580,6 +684,28 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("nof_eviction_high_watermark_ratio",
                              &master_config.nof_eviction_high_watermark_ratio,
                              FLAGS_nof_eviction_high_watermark_ratio);
+    default_config.GetBool("io_pattern_cold_eviction",
+                           &master_config.io_pattern_cold_eviction,
+                           FLAGS_io_pattern_cold_eviction);
+    default_config.GetUInt64(
+        "io_pattern_cold_eviction_bytes_per_cycle",
+        &master_config.io_pattern_cold_eviction_bytes_per_cycle,
+        FLAGS_io_pattern_cold_eviction_bytes_per_cycle);
+    default_config.GetUInt64("io_pattern_cold_idle_threshold_us",
+                             &master_config.io_pattern_cold_idle_threshold_us,
+                             FLAGS_io_pattern_cold_idle_threshold_us);
+    default_config.GetUInt64(
+        "io_pattern_tier_down_bytes_per_cycle",
+        &master_config.io_pattern_tier_down_bytes_per_cycle,
+        FLAGS_io_pattern_tier_down_bytes_per_cycle);
+    default_config.GetUInt32(
+        "io_pattern_admission_frequency_threshold",
+        &master_config.io_pattern_admission_frequency_threshold,
+        FLAGS_io_pattern_admission_frequency_threshold);
+    default_config.GetDouble(
+        "io_pattern_admission_watermark_ratio",
+        &master_config.io_pattern_admission_watermark_ratio,
+        FLAGS_io_pattern_admission_watermark_ratio);
     default_config.GetInt64("nof_heartbeat_interval_sec",
                             &master_config.nof_heartbeat_interval_sec,
                             FLAGS_nof_heartbeat_interval_sec);
@@ -599,6 +725,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_force_evict",
                            &master_config.offload_force_evict,
                            FLAGS_offload_force_evict);
+    default_config.GetBool("strict_replica_allocation",
+                           &master_config.strict_replica_allocation,
+                           FLAGS_strict_replica_allocation);
     {
         uint64_t tmp_offloading_queue_limit = FLAGS_offloading_queue_limit;
         default_config.GetUInt64("offloading_queue_limit",
@@ -689,6 +818,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetInt32("etcd_max_send_message_bytes",
                             &master_config.etcd_max_send_message_bytes,
                             FLAGS_etcd_max_send_message_bytes);
+    default_config.GetInt64("master_view_lease_ttl_sec",
+                            &master_config.master_view_lease_ttl_sec,
+                            FLAGS_master_view_lease_ttl_sec);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
     default_config.GetBool("enable_oplog", &master_config.enable_oplog,
@@ -719,6 +851,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("batch_oplog_retry_timeout_sec",
                              &master_config.batch_oplog_retry_timeout_sec,
                              FLAGS_batch_oplog_retry_timeout_sec);
+    default_config.GetBool("enable_metrics_report_to_backend",
+                           &master_config.enable_metrics_report_to_backend,
+                           FLAGS_enable_metrics_report_to_backend);
+    default_config.GetInt32("metrics_report_interval_sec",
+                            &master_config.metrics_report_interval_sec,
+                            FLAGS_metrics_report_interval_sec);
+    default_config.GetInt32("metrics_report_lease_ttl_sec",
+                            &master_config.metrics_report_lease_ttl_sec,
+                            FLAGS_metrics_report_lease_ttl_sec);
     default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
                              FLAGS_root_fs_dir);
     default_config.GetInt64("global_file_segment_size",
@@ -935,6 +1076,46 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.nof_eviction_high_watermark_ratio =
             FLAGS_nof_eviction_high_watermark_ratio;
     }
+    if ((google::GetCommandLineFlagInfo("io_pattern_cold_eviction", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cold_eviction = FLAGS_io_pattern_cold_eviction;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "io_pattern_cold_eviction_bytes_per_cycle", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cold_eviction_bytes_per_cycle =
+            FLAGS_io_pattern_cold_eviction_bytes_per_cycle;
+    }
+    if ((google::GetCommandLineFlagInfo("io_pattern_cold_idle_threshold_us",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_cold_idle_threshold_us =
+            FLAGS_io_pattern_cold_idle_threshold_us;
+    }
+    if ((google::GetCommandLineFlagInfo("io_pattern_tier_down_bytes_per_cycle",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_tier_down_bytes_per_cycle =
+            FLAGS_io_pattern_tier_down_bytes_per_cycle;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "io_pattern_admission_frequency_threshold", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_admission_frequency_threshold =
+            FLAGS_io_pattern_admission_frequency_threshold;
+    }
+    if ((google::GetCommandLineFlagInfo("io_pattern_admission_watermark_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_admission_watermark_ratio =
+            FLAGS_io_pattern_admission_watermark_ratio;
+    }
     if ((google::GetCommandLineFlagInfo("enable_ha", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -954,6 +1135,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.offload_force_evict = FLAGS_offload_force_evict;
+    }
+    if ((google::GetCommandLineFlagInfo("strict_replica_allocation", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.strict_replica_allocation =
+            FLAGS_strict_replica_allocation;
     }
     if ((google::GetCommandLineFlagInfo("offloading_queue_limit", &info) &&
          !info.is_default) ||
@@ -1143,6 +1330,17 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.etcd_max_send_message_bytes =
             FLAGS_etcd_max_send_message_bytes;
     }
+    if ((google::GetCommandLineFlagInfo("master_view_lease_ttl_sec", &info) &&
+         !info.is_default)) {
+        master_config.master_view_lease_ttl_sec =
+            FLAGS_master_view_lease_ttl_sec;
+    } else if (master_config.master_view_lease_ttl_sec ==
+               mooncake::DEFAULT_MASTER_VIEW_LEASE_TTL_SEC) {
+        // Alias: no explicit flag and no config-file value -> share the
+        // leader lease TTL.
+        master_config.master_view_lease_ttl_sec =
+            master_config.ha_leader_lease_ttl_sec;
+    }
     if (master_config.etcd_max_send_message_bytes <= 0) {
         LOG(FATAL) << "etcd_max_send_message_bytes must be positive";
     }
@@ -1170,6 +1368,42 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.cluster_id = FLAGS_cluster_id;
+    }
+    if ((google::GetCommandLineFlagInfo("submaster_count", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.submaster_count = FLAGS_submaster_count;
+    }
+    if ((google::GetCommandLineFlagInfo("cvm_http_port", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cvm_http_port =
+            static_cast<uint16_t>(FLAGS_cvm_http_port);
+    }
+    if ((google::GetCommandLineFlagInfo("admin_metrics_log_interval_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.admin_metrics_log_interval_sec =
+            std::max(1, FLAGS_admin_metrics_log_interval_sec);
+    }
+    if ((google::GetCommandLineFlagInfo("cvm_http_host", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cvm_http_host = FLAGS_cvm_http_host;
+    }
+    if ((google::GetCommandLineFlagInfo("cvm_segment_default_medium", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cvm_segment_default_medium =
+            FLAGS_cvm_segment_default_medium;
+    }
+    if ((google::GetCommandLineFlagInfo("cvm_segments_vsegment_exclusive",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cvm_segments_vsegment_exclusive =
+            FLAGS_cvm_segments_vsegment_exclusive;
     }
     if ((google::GetCommandLineFlagInfo("enable_oplog", &info) &&
          !info.is_default) ||
@@ -1229,6 +1463,26 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.batch_oplog_retry_timeout_sec =
             FLAGS_batch_oplog_retry_timeout_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_metrics_report_to_backend",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_metrics_report_to_backend =
+            FLAGS_enable_metrics_report_to_backend;
+    }
+    if ((google::GetCommandLineFlagInfo("metrics_report_interval_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.metrics_report_interval_sec =
+            FLAGS_metrics_report_interval_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("metrics_report_lease_ttl_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.metrics_report_lease_ttl_sec =
+            FLAGS_metrics_report_lease_ttl_sec;
     }
     if ((google::GetCommandLineFlagInfo("root_fs_dir", &info) &&
          !info.is_default) ||
@@ -1439,16 +1693,135 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
     }
 }
 
+#ifdef STORE_USE_ETCD
+// --vsegment_auto_plan 策略解析（flags → VSegmentUserPolicy，一次解析两处
+// 使用：启动 bootstrap + supervisor 注入 MasterService 重试组件）。返回空
+// 表示未启用 / 参数不完整 / 后端不符（各告警一次，不阻断启动——quota 可
+// 随后经 planner CLI 或 master POST /vsegment_quota 端点手工发布，参数
+// 补齐后随重启生效）。
+std::optional<mooncake::vsegment::VSegmentUserPolicy>
+BuildVSegmentAutoPlanPolicy(const mooncake::MasterConfig& config) {
+    if (!FLAGS_vsegment_auto_plan) return std::nullopt;
+    if (config.ha_backend_type != "etcd") {
+        LOG(WARNING) << "--vsegment_auto_plan requires the etcd HA backend; "
+                        "skipping";
+        return std::nullopt;
+    }
+    if (FLAGS_vsegment_member_count == 0 || FLAGS_vsegment_stripe_size == 0 ||
+        FLAGS_vsegment_member_extent_size == 0) {
+        LOG(WARNING) << "--vsegment_auto_plan is enabled but requires "
+                        "--vsegment_member_count, --vsegment_stripe_size and "
+                        "--vsegment_member_extent_size; skipping";
+        return std::nullopt;
+    }
+    mooncake::vsegment::VSegmentUserPolicy policy;
+    policy.member_count = FLAGS_vsegment_member_count;
+    policy.stripe_size = FLAGS_vsegment_stripe_size;
+    policy.member_extent_size = FLAGS_vsegment_member_extent_size;
+    policy.reserved_ratio = FLAGS_vsegment_reserved_ratio;
+    LOG(INFO) << "VSegment auto-plan policy: member_count="
+              << policy.member_count << ", stripe_size=" << policy.stripe_size
+              << ", member_extent_size=" << policy.member_extent_size
+              << ", reserved_ratio=" << policy.reserved_ratio
+              << ", required_medium="
+              << (policy.required_medium.empty() ? "auto"
+                                                 : policy.required_medium)
+              << ", io_alignment=" << policy.io_alignment;
+    return policy;
+}
+
+// --vsegment_auto_plan 启动 bootstrap（一次性，etcd HA 模式专属）：quota
+// 快照不存在时按用户策略「发现→规划→发布」。执行于 supervisor 启动前。
+// 多实例并发安全：EtcdHelper::Create 原子首写，first-writer-wins（输家得
+// TRANSACTION_FAIL，视为已完成）。失败仅告警不阻断启动——quota 可随后经
+// planner CLI 或 master POST /vsegment_quota 端点手工发布，或由
+// MasterService::MaybeRetryVSegmentAutoPlan 在运行期节流重试自愈。
+void TryAutoPlanVSegmentQuota(
+    const mooncake::MasterConfig& config,
+    const std::optional<mooncake::vsegment::VSegmentUserPolicy>& policy_opt) {
+    if (!policy_opt) return;
+    const std::string connstring = ResolveHABackendConnstring(config);
+    if (connstring.empty()) {
+        LOG(WARNING) << "vsegment auto-plan: no etcd endpoints configured; "
+                        "skipping";
+        return;
+    }
+    auto err = mooncake::EtcdHelper::ConnectToEtcdStoreClient(connstring);
+    if (err != mooncake::ErrorCode::OK) {
+        LOG(ERROR) << "vsegment auto-plan: cannot connect to etcd: "
+                   << mooncake::toString(err);
+        return;
+    }
+    mooncake::vsegment::PartitionPhysicalQuotaSnapshot existing;
+    mooncake::vsegment::EtcdPartitionQuotaSnapshotStore store(
+        config.cluster_id);
+    if (store.Load(&existing) == mooncake::ErrorCode::OK) {
+        LOG(INFO) << "vsegment auto-plan: quota generation "
+                  << existing.config_generation
+                  << " already published; skipping";
+        return;
+    }
+    const auto& policy = *policy_opt;
+    std::string summary;
+    err = mooncake::vsegment::PlanAndPublishDiscoveredQuota(
+        config.cluster_id, policy,
+        mooncake::vsegment::kDefaultQuotaMaxEtcdValueBytes,
+        /*detail=*/nullptr, &summary);
+    if (err == mooncake::ErrorCode::OK) {
+        LOG(INFO) << "vsegment auto-plan published: " << summary;
+        mooncake::vsegment::LogVSegmentPoolFormed(config.cluster_id);
+    } else if (err == mooncake::ErrorCode::ETCD_TRANSACTION_FAIL) {
+        LOG(INFO) << "vsegment auto-plan: another instance published "
+                     "concurrently; skipping";
+    } else {
+        LOG(WARNING) << "VSegment auto-plan deferred: no eligible psegment "
+                        "pool yet ("
+                     << mooncake::toString(err)
+                     << "), will retry on psegment mount / heartbeat";
+    }
+}
+#endif  // STORE_USE_ETCD
+
 int main(int argc, char* argv[]) {
     mooncake::init_ylt_log_level();
     // Initialize gflags
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    if (!FLAGS_log_dir.empty()) {
-        // MC_LOG_DIR may have initialized glog (and set FLAGS_log_dir) from
-        // a static initializer before main — see glog_compat.h.
-        mooncake::InitGoogleLoggingOnce(argv[0]);
+    // The master does not go through the transfer engine's globalConfig(),
+    // which is where MC_LOG_DIR is normally applied. Without this, master logs
+    // ignore MC_LOG_DIR and only go to stderr. Honor it here, mirroring
+    // config.cpp: validate the directory and fall back to stderr if it is
+    // missing or unwritable. --log_dir (if passed) takes precedence.
+    const char* mc_log_dir =
+        FLAGS_log_dir.empty() ? std::getenv("MC_LOG_DIR") : nullptr;
+    // Resolve the log directory BEFORE initializing glog: SetLogDestination
+    // below builds the journal path from FLAGS_log_dir, so FLAGS_log_dir must
+    // already hold the MC_LOG_DIR value at that point. Validate the directory
+    // and fall back to stderr if it is missing or unwritable. These early
+    // LOG(WARNING)s run before InitGoogleLogging and therefore go to stderr,
+    // which is the intended fallback sink anyway.
+    if (mc_log_dir) {
+        if (opendir(mc_log_dir) == nullptr) {
+            LOG(WARNING) << "MC_LOG_DIR [" << mc_log_dir
+                         << "] is not a valid directory. Logging to stderr.";
+        } else if (access(mc_log_dir, W_OK) != 0) {
+            LOG(WARNING) << "MC_LOG_DIR [" << mc_log_dir
+                         << "] is not writable. Logging to stderr.";
+        } else {
+            FLAGS_log_dir = mc_log_dir;
+            FLAGS_logtostderr = 0;
+            FLAGS_stop_logging_if_full_disk = true;
+        }
+    }
+    // Init glog if either --log_dir was passed or MC_LOG_DIR resolved to a
+    // valid directory above. main() runs at most once per process, so a
+    // local latch is enough to avoid a double init without depending on
+    // glog's version-specific IsGoogleLoggingInitialized().
+    static bool glog_initialized = false;
+    if (!FLAGS_log_dir.empty() && !glog_initialized) {
+        glog_initialized = true;
+        google::InitGoogleLogging(argv[0]);
         // Merge all master logs into a single journal file in --log_dir,
         // reusing glog: every record is already written to its own severity
         // file and all lower ones, so the INFO sink is a complete journal.
@@ -1465,6 +1838,7 @@ int main(int argc, char* argv[]) {
 
     LOG(INFO) << "Mooncake master version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;
+    mooncake::logging::ApplyMooncakeLogEnableToGlog();
 
     // Initialize the master configuration
     mooncake::MasterConfig master_config;
@@ -1728,10 +2102,33 @@ int main(int argc, char* argv[]) {
                            "refusing to start";
             return 1;
         }
+#ifdef STORE_USE_ETCD
+        // vsegment 配额自动规划（--vsegment_auto_plan）：supervisor 启动前
+        // 一次性 bootstrap（仅当快照不存在时执行，详见函数注释）；同时把
+        // 策略注入 supervisor → MasterService，供心跳/mount 触发点在快照
+        // 缺失期间节流重试发布（发布侧自愈，
+        // 见 MasterService::MaybeRetryVSegmentAutoPlan）。
+        const auto auto_plan_policy =
+            BuildVSegmentAutoPlanPolicy(master_config);
+        TryAutoPlanVSegmentQuota(master_config, auto_plan_policy);
+#endif
         mooncake::MasterServiceSupervisorConfig supervisor_config{
             master_config};
         supervisor_config.http_metadata_server = metadata_server_ptr;
         supervisor_config.http_metadata_remote_url = http_metadata_remote_url;
+#ifdef STORE_USE_ETCD
+        if (auto_plan_policy) {
+            supervisor_config.vsegment_auto_plan = true;
+            supervisor_config.vsegment_auto_plan_member_count =
+                auto_plan_policy->member_count;
+            supervisor_config.vsegment_auto_plan_stripe_size =
+                auto_plan_policy->stripe_size;
+            supervisor_config.vsegment_auto_plan_member_extent_size =
+                auto_plan_policy->member_extent_size;
+            supervisor_config.vsegment_auto_plan_reserved_ratio =
+                auto_plan_policy->reserved_ratio;
+        }
+#endif
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);
         const int result = supervisor.Start();
         // Finish a requested process exit without further main/static
@@ -1742,6 +2139,16 @@ int main(int argc, char* argv[]) {
         }
         return result;
     } else {
+#ifdef STORE_USE_ETCD
+        // enable_ha=false 时 auto_plan flag 被静默忽略：显式提示，防止
+        // 用户以为已自动发布（quota 可在 HA 启用后随重启生效，或届时
+        // 手工 curl POST /vsegment_quota）。
+        if (FLAGS_vsegment_auto_plan) {
+            LOG(WARNING) << "--vsegment_auto_plan is set but enable_ha is "
+                            "false; the flag is ignored (vsegment quota "
+                            "auto-planning requires the etcd HA mode)";
+        }
+#endif
         // version is not used in non-HA mode, just pass a dummy value
         mooncake::ViewVersionId version = 0;
         coro_rpc::coro_rpc_server server(
@@ -1763,7 +2170,8 @@ int main(int argc, char* argv[]) {
                 metadata_server_ptr, http_metadata_remote_url);
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics.port),
-            master_config.metrics.enabled, master_config.metrics.host);
+            master_config.metrics.enabled, master_config.metrics.host,
+            master_config.admin_metrics_log_interval_sec);
         if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;

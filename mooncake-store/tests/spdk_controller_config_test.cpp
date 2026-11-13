@@ -43,11 +43,12 @@ class SpdkControllerConfigTest : public ::testing::Test {
         FLAGS_logtostderr = original_logtostderr_;
     }
 
-    inline static constexpr std::array<const char*, 8> kVariables = {
-        "MC_NVME_NUM_IO_QUEUES",     "MC_NVME_IO_QUEUE_SIZE",
-        "MC_NVME_IO_QUEUE_REQUESTS", "MC_NVME_TRANSPORT_ACK_TIMEOUT",
-        "MC_NVME_ADMIN_QUEUE_SIZE",  "MC_NVME_FABRICS_CONNECT_TIMEOUT_US",
-        "MC_NVME_HEADER_DIGEST",     "MC_NVME_DATA_DIGEST",
+    inline static constexpr std::array<const char*, 10> kVariables = {
+        "MC_NVME_NUM_IO_QUEUES",         "MC_NVME_IO_QUEUE_SIZE",
+        "MC_NVME_IO_QUEUE_REQUESTS",     "MC_NVME_TRANSPORT_ACK_TIMEOUT",
+        "MC_NVME_ADMIN_QUEUE_SIZE",      "MC_NVME_FABRICS_CONNECT_TIMEOUT_US",
+        "MC_NVME_HEADER_DIGEST",         "MC_NVME_DATA_DIGEST",
+        "MC_NVME_KEEP_ALIVE_TIMEOUT_MS", "MC_NOF_QPAIRS_PER_SEGMENT",
     };
     std::array<std::optional<std::string>, kVariables.size()> original_;
     bool original_logtostderr_ = false;
@@ -147,6 +148,35 @@ TEST_F(SpdkControllerConfigTest,
     EXPECT_FALSE(config.data_digest.has_value());
 
     EXPECT_TRUE(diagnostics.empty()) << diagnostics;
+}
+
+TEST_F(SpdkControllerConfigTest, ReadsKeepAliveTimeoutOverride) {
+    EXPECT_FALSE(SpdkControllerConfig::FromEnvironment()
+                     .keep_alive_timeout_ms.has_value());
+
+    ASSERT_EQ(setenv("MC_NVME_KEEP_ALIVE_TIMEOUT_MS", "0", 1), 0);
+    EXPECT_EQ(SpdkControllerConfig::FromEnvironment().keep_alive_timeout_ms,
+              0u);
+
+    ASSERT_EQ(setenv("MC_NVME_KEEP_ALIVE_TIMEOUT_MS", "30000", 1), 0);
+    EXPECT_EQ(SpdkControllerConfig::FromEnvironment().keep_alive_timeout_ms,
+              30000u);
+}
+
+TEST_F(SpdkControllerConfigTest, ReadsAndValidatesQpairsPerSegment) {
+    EXPECT_EQ(SpdkControllerConfig::FromEnvironment().qpairs_per_segment, 4u);
+
+    ASSERT_EQ(setenv("MC_NOF_QPAIRS_PER_SEGMENT", "1", 1), 0);
+    EXPECT_EQ(SpdkControllerConfig::FromEnvironment().qpairs_per_segment, 1u);
+    ASSERT_EQ(setenv("MC_NOF_QPAIRS_PER_SEGMENT", "64", 1), 0);
+    EXPECT_EQ(SpdkControllerConfig::FromEnvironment().qpairs_per_segment, 64u);
+
+    for (const char* invalid : {"0", "65", "not-a-number"}) {
+        ASSERT_EQ(setenv("MC_NOF_QPAIRS_PER_SEGMENT", invalid, 1), 0);
+        EXPECT_EQ(SpdkControllerConfig::FromEnvironment().qpairs_per_segment,
+                  4u)
+            << "input=" << invalid;
+    }
 }
 
 TEST_F(SpdkControllerConfigTest, EachConstructionReadsCurrentEnvironment) {

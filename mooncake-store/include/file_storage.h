@@ -172,6 +172,13 @@ class FileStorage {
      */
     bool ReleaseBuffer(uint64_t batch_id);
 
+    // Forward explicit-delete tombstone to the storage backend.
+    // For BucketStorageBackend: marks tombstone + enables GC.
+    // For other backends: no-op (default in StorageBackendInterface).
+    tl::expected<void, ErrorCode> MarkRemoved(const std::string& key);
+    tl::expected<void, ErrorCode> BatchMarkRemoved(
+        const std::vector<std::string>& keys);
+
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;
@@ -203,8 +210,12 @@ class FileStorage {
 
     /**
      * @brief Offload object data and metadata.
+     * @param offloading_objects 待卸载任务，携带派发它的 source master
+     * 地址（单 master/来源未知时为空），供完成后的双投清理协议使用。
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
+    tl::expected<void, ErrorCode> OffloadObjects(
+        const std::vector<Client::SourcedOffloadTask>& offloading_objects);
     tl::expected<void, ErrorCode> OffloadObjects(
         const std::vector<OffloadTaskItem>& offloading_objects);
 
@@ -267,7 +278,7 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> PromoteOneKeyFromLocalDisk(
         const std::string& key, const std::string& tenant_id, int64_t size,
-        bool* dram_pressure);
+        bool* dram_pressure, const std::string& source_address = {});
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
@@ -418,6 +429,10 @@ class FileStorage {
     // in which case the master's TTL reaper reclaims the orphaned tasks.
     std::unordered_map<std::string, OffloadTaskItem>
         deferred_task_by_storage_key_;
+    // Preserve the originating master across a bucket deferral, so eventual
+    // completion or NACK also clears its offload task after slot migration.
+    std::unordered_map<std::string, std::string>
+        deferred_source_by_storage_key_;
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;

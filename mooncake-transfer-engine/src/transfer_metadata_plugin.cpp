@@ -24,12 +24,13 @@
 #include <poll.h>
 #include <sys/socket.h>
 
+#include <condition_variable>
+#include <mutex>
+#include <queue>
 #include <random>
 
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
-
-#include <mutex>
 #endif
 
 #ifdef USE_HTTP

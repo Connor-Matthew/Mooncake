@@ -19,12 +19,60 @@
 #include <cstddef>
 #include <cstdlib>
 #include <thread>
+#include <limits>
+#include <optional>
+#include <string>
 
 #include "config.h"
 #include "transport/batch_registration.h"
 
 namespace mooncake {
 namespace {
+
+class EidIndexEnvTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        if (const char* value = std::getenv("MC_EID_INDEX")) saved_ = value;
+        ::unsetenv("MC_EID_INDEX");
+    }
+    void TearDown() override {
+        if (saved_) {
+            ::setenv("MC_EID_INDEX", saved_->c_str(), 1);
+        } else {
+            ::unsetenv("MC_EID_INDEX");
+        }
+    }
+    std::optional<std::string> saved_;
+};
+
+TEST_F(EidIndexEnvTest, UnsetPreservesConfiguredIndex) {
+    GlobalConfig config;
+    EXPECT_EQ(config.eid_index, 0);
+    config.eid_index = 4;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.eid_index, 4);
+}
+
+TEST_F(EidIndexEnvTest, AcceptsPortAndPrimaryIndices) {
+    for (int index : {0, 1, 4, 5, std::numeric_limits<int>::max()}) {
+        ASSERT_EQ(::setenv("MC_EID_INDEX", std::to_string(index).c_str(), 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.eid_index, index);
+    }
+}
+
+TEST_F(EidIndexEnvTest, MalformedOverrideDisablesUbInsteadOfUsingDefault) {
+    for (const char* value : {"", "-1", "-2", "abc", "1junk", "1.0", " 1",
+                              "1 ", "+1", "0x1", "999999999999999999999"}) {
+        SCOPED_TRACE(value);
+        ASSERT_EQ(::setenv("MC_EID_INDEX", value, 1), 0);
+        GlobalConfig config;
+        config.eid_index = 4;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.eid_index, -1);
+    }
+}
 
 // --- MC_PKEY_INDEX (stoi with try-catch, range 0-65535) ---
 

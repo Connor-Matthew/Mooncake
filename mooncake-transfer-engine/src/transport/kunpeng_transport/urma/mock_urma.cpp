@@ -1,6 +1,7 @@
 #include "urma_api.h"
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -302,6 +303,26 @@ urma_status_t urma_unregister_seg(urma_target_seg_t *seg) {
     return URMA_SUCCESS;
 }
 
+// Mock the delegated segment export with a small opaque driver extension.
+// Importers must preserve the complete blob even though this mock only reads
+// the leading urma_seg_t.
+extern "C" urma_status_t urma_get_seg_ctx(urma_target_seg_t *tseg,
+                                          urma_seg_t **seg, uint32_t *length) {
+    if (!tseg || !seg || !length || seg_map.find(tseg) == seg_map.end()) {
+        return URMA_EINVAL;
+    }
+    constexpr uint32_t kMockExtensionSize = 8;
+    const uint32_t blob_size = sizeof(urma_seg_t) + kMockExtensionSize;
+    auto *out = static_cast<urma_seg_t *>(calloc(1, blob_size));
+    if (!out) return URMA_EINVAL;
+    memcpy(out, &tseg->seg, sizeof(urma_seg_t));
+    *seg = out;
+    *length = blob_size;
+    return URMA_SUCCESS;
+}
+
+extern "C" void urma_put_seg_ctx(urma_seg_t *seg) { free(seg); }
+
 urma_target_seg_t *urma_import_seg(urma_context_t *ctx, urma_seg_t *seg,
                                    urma_token_t *token_value, uint64_t addr,
                                    urma_import_seg_flag_t flag) {
@@ -375,6 +396,30 @@ urma_status_t urma_unbind_jetty(urma_jetty_t *jetty) {
     jetty->remote_jetty = nullptr;
     return URMA_SUCCESS;
 }
+
+// Mock of the newer-UMDK delegated rjetty export: allocate a plain
+// urma_rjetty_t filled from the local jetty (non-bonding path). Must keep
+// C linkage so its ABI matches liburma. Mock builds bind these functions
+// directly, allowing unit tests to exercise the blob path even when the
+// transfer engine is linked statically.
+extern "C" urma_status_t urma_get_rjetty(urma_jetty_t *jetty,
+                                          urma_rjetty_t **rjetty,
+                                          uint32_t *length) {
+    if (!jetty || !rjetty || !length ||
+        jetty_map.find(jetty) == jetty_map.end()) {
+        return URMA_EINVAL;
+    }
+    auto *out = static_cast<urma_rjetty_t *>(calloc(1, sizeof(urma_rjetty_t)));
+    out->jetty_id = jetty->jetty_id;
+    out->trans_mode = jetty->jetty_cfg.jfs_cfg.trans_mode;
+    out->type = URMA_JETTY;
+    out->tp_type = URMA_CTP;
+    *rjetty = out;
+    *length = sizeof(urma_rjetty_t);
+    return URMA_SUCCESS;
+}
+
+extern "C" void urma_put_rjetty(urma_rjetty_t *rjetty) { free(rjetty); }
 
 urma_target_jetty_t *urma_import_jetty(urma_context_t *ctx,
                                        urma_rjetty_t *rjetty,

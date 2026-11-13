@@ -147,6 +147,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
             tenant_id="tenant-a",
             enable_client_http_server=False,
             client_http_port=9300,
+            ub_numa_nodes="1,3",
         )
 
         with patch(
@@ -173,6 +174,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
                         "tenant_id": "tenant-a",
                         "enable_client_http_server": False,
                         "client_http_port": 9300,
+                        "ub_numa_nodes": "1,3",
                     },
                 )
             ],

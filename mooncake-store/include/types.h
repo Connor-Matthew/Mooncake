@@ -108,10 +108,15 @@ static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr double DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
-static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
+static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 3;  // in seconds, old value is 5
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
 static constexpr int64_t DEFAULT_CLIENT_SUSPICION_TTL_SEC = 20;  // in seconds
 static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
+
+// Metrics reporter defaults (push master storage metrics to HA backend)
+static constexpr bool DEFAULT_ENABLE_METRICS_REPORT_TO_BACKEND = false;
+static constexpr int DEFAULT_METRICS_REPORT_INTERVAL_SEC = 5;
+static constexpr int DEFAULT_METRICS_REPORT_LEASE_TTL_SEC = 10;
 static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS = 1000;
 static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD = 3;
 static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
@@ -229,6 +234,7 @@ constexpr const char* CONFIG_KEY_GLOBAL_SEGMENT_SIZE = "global_segment_size";
 constexpr const char* CONFIG_KEY_LOCAL_BUFFER_SIZE = "local_buffer_size";
 constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";
 constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
+constexpr const char* CONFIG_KEY_UB_NUMA_NODES = "ub_numa_nodes";
 constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
 constexpr const char* CONFIG_KEY_ENABLE_EGM_STORE_POOL =
@@ -288,6 +294,16 @@ struct PromotionTaskItem {
 };
 YLT_REFL(PromotionTaskItem, tenant_id, key, size);
 
+struct RemoveTaskItem {
+    std::string tenant_id;
+    std::string key;
+
+    bool operator==(const RemoveTaskItem& other) const {
+        return tenant_id == other.tenant_id && key == other.key;
+    }
+};
+YLT_REFL(RemoveTaskItem, tenant_id, key);
+
 // Store client configuration validation limits
 static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
 static constexpr size_t MAX_SEGMENT_SIZE = 1024ULL * 1024 * 1024 * 1024;  // 1TB
@@ -337,6 +353,14 @@ enum class ErrorCode : int32_t {
     SEGMENT_NOT_FOUND = -101,         ///< No available segments found.
     SEGMENT_ALREADY_EXISTS = -102,    ///< Segment already exists.
     CLIENT_NOT_FOUND = -103,          ///< Client not found.
+    VSEGMENT_STATIC_QUOTA_INSUFFICIENT =
+        -104,  ///< Partition quota cannot satisfy the configured layout.
+    VSEGMENT_CREATING =
+        -105,  ///< A single-flight vsegment creation is in progress.
+    VSEGMENT_SERVICE_NOT_READY =
+        -106,  ///< VSegment service init in progress; retry later.
+    VSEGMENT_MOUNT_QUIET_PERIOD =
+        -107,  ///< Mount stream not settled; publish deferred, retry later.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =
@@ -407,6 +431,8 @@ enum class ErrorCode : int32_t {
     UNAVAILABLE_IN_CURRENT_MODE =
         -1011,              ///< Request cannot be done in current mode.
     NOT_SUPPORTED = -1012,  ///< Operation is not supported in current mode.
+    SLOT_NOT_OWNED = -1013,  ///< Client must re-route to the slot owner.
+    SLOT_MIGRATING = -1014,  ///< Client must retry after slot metadata import.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.
@@ -445,6 +471,18 @@ enum class ErrorCode : int32_t {
     TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
     TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
     TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
+
+    // vsegment / Partition routing errors (Range: -1800 to -1899)
+    NOT_OWNER = -1800,            ///< Wrong SubMaster; response carries owner
+                                  ///< and route epoch.
+    STALE_ROUTE = -1801,          ///< route_epoch is stale; refresh KV PT and
+                                  ///< retry.
+    MIGRATION_IN_PROGRESS = -1802,  ///< Partition is switching owners; PutStart
+                                    ///< may bounded-retry.
+    STALE_ALLOCATOR_EPOCH = -1803,  ///< allocator_epoch is stale; retry with the
+                                    ///< same allocation_id.
+    VSEGMENT_NOT_FOUND = -1804,   ///< VSegmentView is missing.
+    VSEGMENT_INVALID = -1805,     ///< VSegmentView failed validation.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -513,11 +551,17 @@ struct Segment {
     std::string protocol;
     std::string host_id{};
     struct_pack::compatible<SegmentLocality, 1> locality;
+    // 物理介质标识，由 client 在 MountSegment 时从 location 参数提取并上报
+    // （如 "cpu:0" / "cuda:0" / "ssd:0"）。PublishSegmentOwnerForCvm 优先用
+    // 此值填充 SegmentDescriptor.medium，缺省回退 master 的
+    // --cvm_segment_default_medium。支持混合介质集群：不同 segment 可上报
+    // 不同 medium，planner 按 profile.required_medium 自动过滤。
+    std::string medium{};
     Segment() = default;
     bool operator==(const Segment&) const = default;
 };
 YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id,
-         locality);
+         locality, medium);
 
 /**
  * @brief Allocation strategy type for segment allocation

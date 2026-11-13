@@ -183,6 +183,7 @@ class MooncakeStoreService:
                             self.config.enable_client_http_server
                         ),
                         "client_http_port": self.config.client_http_port,
+                        "ub_numa_nodes": getattr(self.config, "ub_numa_nodes", ""),
                     }
                 )
 

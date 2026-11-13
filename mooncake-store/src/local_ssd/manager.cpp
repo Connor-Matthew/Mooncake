@@ -114,6 +114,39 @@ bool LocalSsdTaskMailbox::ConsumeRemoveAll() {
     return std::exchange(pending_remove_all_, false);
 }
 
+ErrorCode LocalSsdTaskMailbox::EnqueueRemoved(RemoveTaskItem task) {
+    MutexLocker lock(&mutex_);
+    // Dedup, matching the SP930 segment registry: a re-erase of the same key
+    // must not queue a second marker for the client.
+    if (std::find(removed_keys_.begin(), removed_keys_.end(), task) !=
+        removed_keys_.end()) {
+        return ErrorCode::OBJECT_ALREADY_EXISTS;
+    }
+    removed_keys_.push_back(std::move(task));
+    return ErrorCode::OK;
+}
+
+std::vector<RemoveTaskItem> LocalSsdTaskMailbox::TakeRemovedKeys() const {
+    MutexLocker lock(&mutex_);
+    // Snapshot semantics (SP930): the heartbeat returns the pending list,
+    // the entries stay queued until the client acks the physical deletion.
+    return removed_keys_;
+}
+
+size_t LocalSsdTaskMailbox::AckRemovedKeys(
+    const std::vector<RemoveTaskItem>& tasks) {
+    MutexLocker lock(&mutex_);
+    const size_t before = removed_keys_.size();
+    removed_keys_.erase(
+        std::remove_if(removed_keys_.begin(), removed_keys_.end(),
+                       [&tasks](const RemoveTaskItem& task) {
+                           return std::find(tasks.begin(), tasks.end(), task) !=
+                                  tasks.end();
+                       }),
+        removed_keys_.end());
+    return before - removed_keys_.size();
+}
+
 ErrorCode LocalSsdManager::RegisterClient(const UUID& client_id,
                                           bool enable_offloading) {
     std::unique_lock lock(mutex_);
@@ -351,6 +384,58 @@ tl::expected<bool, ErrorCode> LocalSsdManager::ConsumeRemoveAll(
         return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     return client->record->mailbox.ConsumeRemoveAll();
+}
+
+ErrorCode LocalSsdManager::EnqueueRemoved(const UUID& client_id,
+                                          RemoveTaskItem task) {
+    auto client = FindClient(client_id);
+    if (!client) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    return client->record->mailbox.EnqueueRemoved(std::move(task));
+}
+
+tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+LocalSsdManager::TakeRemovedKeys(const UUID& client_id) {
+    auto client = FindClient(client_id);
+    if (!client) {
+        return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    return client->record->mailbox.TakeRemovedKeys();
+}
+
+tl::expected<void, ErrorCode> LocalSsdManager::AckRemovedKeys(
+    const UUID& client_id, const std::vector<RemoveTaskItem>& tasks) {
+    auto client = FindClient(client_id);
+    if (!client) {
+        return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    client->record->mailbox.AckRemovedKeys(tasks);
+    return {};
+}
+
+void LocalSsdManager::SetClientSegmentName(const UUID& client_id,
+                                           const std::string& name) {
+    auto client = FindClient(client_id);
+    if (!client) {
+        return;
+    }
+    auto& record = *client->record;
+    MutexLocker stats_lock(&record.stats_mutex);
+    if (record.segment_name.empty()) {
+        record.segment_name = name;
+    }
+}
+
+std::optional<std::string> LocalSsdManager::GetClientSegmentName(
+    const UUID& client_id) const {
+    auto client = FindClient(client_id);
+    if (!client) {
+        return std::nullopt;
+    }
+    auto& record = *client->record;
+    MutexLocker stats_lock(&record.stats_mutex);
+    return record.segment_name;
 }
 
 void LocalSsdManager::Clear() {

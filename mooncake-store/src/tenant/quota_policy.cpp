@@ -44,7 +44,7 @@ ErrorCode ToErrorCode(TenantQuotaError error) {
 
 bool HasProcessingMemoryReplica(const ObjectMetadata& metadata) {
     return metadata.HasReplica([](const Replica& replica) {
-        return replica.is_memory_replica() && replica.is_processing();
+        return (replica.is_memory_replica() || replica.is_vsegment_replica()) && replica.is_processing();
     });
 }
 
@@ -136,7 +136,7 @@ uint64_t TenantQuotaPolicy::MemoryCharge(const ObjectMetadata& metadata) {
     // replica is dropped, so both are charged.
     const auto holding_replicas =
         metadata.CountReplicas([](const Replica& replica) {
-            if (!replica.is_memory_replica()) {
+            if (!replica.is_memory_replica() && !replica.is_vsegment_replica()) {
                 return false;
             }
             switch (replica.status()) {

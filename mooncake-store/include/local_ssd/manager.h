@@ -35,6 +35,15 @@ class LocalSsdTaskMailbox {
     void RequestRemoveAll();
     bool ConsumeRemoveAll();
 
+    // SP930 port: per-key SSD deletion work for the client. Enqueued by the
+    // master when a durable erase removes LOCAL_DISK replicas; drained by
+    // RemoveObjectHeartbeat (returns a snapshot, the queue keeps the items
+    // until AckRemovedKeys) and released by AckRemoveObjectHeartbeat after
+    // the client physically deleted the files.
+    ErrorCode EnqueueRemoved(RemoveTaskItem task);
+    std::vector<RemoveTaskItem> TakeRemovedKeys() const;
+    size_t AckRemovedKeys(const std::vector<RemoveTaskItem>& tasks);
+
    private:
     mutable Mutex mutex_;
     bool enable_offloading_ GUARDED_BY(mutex_);
@@ -51,6 +60,7 @@ class LocalSsdTaskMailbox {
     std::unordered_map<std::string, PromotionEntry> pending_promotions_
         GUARDED_BY(mutex_);
     uint64_t promotion_seq_ GUARDED_BY(mutex_){0};
+    std::vector<RemoveTaskItem> removed_keys_ GUARDED_BY(mutex_);
     bool pending_remove_all_ GUARDED_BY(mutex_){false};
 
     friend class LocalSsdManager;
@@ -105,6 +115,23 @@ class LocalSsdManager {
     void RequestRemoveAll(const std::vector<UUID>& clients);
     tl::expected<bool, ErrorCode> ConsumeRemoveAll(const UUID& client_id);
 
+    // SP930 port: per-key SSD deletion queue, drained by the client's
+    // RemoveObjectHeartbeat / AckRemoveObjectHeartbeat RPC pair.
+    ErrorCode EnqueueRemoved(const UUID& client_id, RemoveTaskItem task);
+    tl::expected<std::vector<RemoveTaskItem>, ErrorCode> TakeRemovedKeys(
+        const UUID& client_id);
+    tl::expected<void, ErrorCode> AckRemovedKeys(
+        const UUID& client_id, const std::vector<RemoveTaskItem>& tasks);
+
+    // SP930 port (P2-8-2): the first memory segment name mounted by this
+    // client, recorded so generational (stale-generation) eviction can
+    // filter same-host co-tenants by name. A LOCAL_DISK-only client never
+    // mounts a memory segment and stays empty, degrading to the original
+    // host-level merge.
+    void SetClientSegmentName(const UUID& client_id, const std::string& name);
+    std::optional<std::string> GetClientSegmentName(
+        const UUID& client_id) const;
+
     void Clear();
 
    private:
@@ -118,6 +145,9 @@ class LocalSsdManager {
         mutable Mutex stats_mutex;
         int64_t total_capacity_bytes GUARDED_BY(stats_mutex){0};
         std::atomic<int64_t> used_bytes{0};
+        // SP930 port (P2-8-2): first memory segment name mounted by this
+        // client; name-level co-tenant filter for stale-generation eviction.
+        std::string segment_name GUARDED_BY(stats_mutex);
         LocalSsdTaskMailbox mailbox;
     };
 

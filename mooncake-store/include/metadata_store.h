@@ -9,8 +9,10 @@
 #include <vector>
 
 #include "replica.h"
+#include "vsegment/vsegment_manager.h"
 #include "types.h"
 #include "weight_metadata_store.h"
+#include "partition/vsegment_types.h"
 
 namespace mooncake {
 
@@ -83,6 +85,28 @@ struct StandbyObjectEntry {
 };
 
 /**
+ * @brief Object-metadata export for a single KV slot (live primary -> live
+ * primary handoff).
+ *
+ * When a live primary gracefully releases a slot it no longer owns (scale-out /
+ * scale-in rebalance), it exports the object metadata of every key in that
+ * slot to etcd. The new owner then imports it to materialize the same
+ * key -> Replica::Descriptor[] mapping without moving any data bytes (which
+ * stay in their segments). Serialized with struct_pack (msgpack binary) and
+ * stored as a binary etcd value.
+ */
+struct SlotMetadataExport {
+    uint16_t slot{0};
+    std::string source_master_id;
+    std::vector<StandbyObjectEntry> objects;
+    struct_pack::compatible<vsegment::PartitionVSegmentSnapshot, 1>
+        vsegment_partition;
+
+    YLT_REFL(SlotMetadataExport, slot, source_master_id, objects,
+             vsegment_partition);
+};
+
+/**
  * Complete snapshot exported from standby at promotion time.
  * Includes applied OpLog sequence ID, all object metadata,
  * and all registered segments.
@@ -92,9 +116,9 @@ struct StandbySnapshot {
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
     struct_pack::compatible<WeightMetadataSnapshot, 1> weight_metadata;
-
+    std::vector<vsegment::PartitionVSegmentSnapshot> vsegment_partitions;
     YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
-             weight_metadata);
+             weight_metadata, vsegment_partitions);
 };
 
 /**

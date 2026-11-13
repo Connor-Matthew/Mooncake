@@ -1,0 +1,104 @@
+--- a/ylt/coro_rpc/impl/coro_rpc_client.hpp
++++ b/ylt/coro_rpc/impl/coro_rpc_client.hpp
+@@ -58,0 +59 @@
++#include "mooncake_submit_trace.hpp"
+@@ -107,0 +109,2 @@
++  // Borrowed only until the outer submission Lazy returns. Never retained by recv.
++  mooncake_submit_trace_t *mooncake_submit_trace = nullptr;
+@@ -1607 +1610 @@
+-        soc, id,
++        soc, id, config.mooncake_submit_trace,
+@@ -1887,0 +1891,3 @@
++    auto *trace = config.mooncake_submit_trace;
++    using Trace = mooncake_submit_trace_t;
++    if (trace) trace->Mark(Trace::Begin);
+@@ -1895,0 +1902 @@
++    if (trace) trace->request_id = id;
+@@ -1905,0 +1913 @@
++    if (trace) trace->Mark(Trace::HandlerLockBegin);
+@@ -1907,0 +1916 @@
++      if (trace) trace->Mark(Trace::HandlerLockAcquired);
+@@ -1909,0 +1919 @@
++    if (trace) trace->Mark(Trace::HandlerRegistered);
+@@ -1918,0 +1929 @@
++    if (trace) trace->Mark(Trace::SendReturned);
+@@ -1929,0 +1941 @@
++    if (trace) trace->Mark(Trace::RecvBegin);
+@@ -1930,0 +1943 @@
++      if (trace) trace->recv_started = true;
+@@ -1935,0 +1949 @@
++    if (trace) trace->Mark(Trace::RecvDone);
+@@ -1945,0 +1960,33 @@
++  // Preserve coro_io cancellation and awaiter semantics. Only sampled TCP
++  // requests wrap the Asio completion callback; other paths use async_write.
++  // The callback timestamp measures its execution, not kernel completion.
++  template <typename Socket, typename Buffer>
++  static auto mooncake_submit_write(Socket &socket, Buffer buffer,
++                                   mooncake_submit_trace_t *trace) noexcept
++      -> async_simple::coro::Lazy<std::pair<std::error_code, size_t>> {
++    using Trace = mooncake_submit_trace_t;
++    if constexpr (std::is_same_v<Socket, asio::ip::tcp::socket>) {
++      if (trace) {
++        return coro_io::async_io<std::pair<std::error_code, size_t>>(
++            [&, buffer, trace](auto callback) mutable {
++              trace->write_begin_tid = Trace::Tid();
++              trace->Mark(Trace::WriteStarted);
++              asio::async_write(
++                  socket, buffer,
++                  [trace, callback = std::move(callback)](
++                      const std::error_code &ec, size_t bytes) mutable {
++                    trace->write_callback_tid = Trace::Tid();
++                    trace->Mark(Trace::WriteCallback);
++                    callback(ec, bytes);
++                  });
++            },
++            socket);
++      }
++    }
++    if (trace) {
++      trace->write_begin_tid = Trace::Tid();
++      trace->Mark(Trace::WriteStarted);
++    }
++    return coro_io::async_write(socket, buffer);
++  }
++
+@@ -1948,2 +1995,4 @@
+-      Socket &socket, uint32_t &id, coro_io::data_view req_attachment,
+-      Args &&...args) {
++      Socket &socket, uint32_t &id, mooncake_submit_trace_t *trace,
++      coro_io::data_view req_attachment, Args &&...args) {
++    using Trace = mooncake_submit_trace_t;
++    if (trace) trace->Mark(Trace::SerializeBegin);
+@@ -1951,0 +2001,4 @@
++    if (trace) {
++      trace->Mark(Trace::Serialized);
++      trace->request_bytes = buffer.size() + req_attachment.size();
++    }
+@@ -2010,0 +2064 @@
++      if (trace) trace->Mark(Trace::WriteLockBegin);
+@@ -2015,0 +2070,2 @@
++        // Includes spurious weak-CAS failures, not just competing writers.
++        if (trace) ++trace->write_lock_retries;
+@@ -2021,0 +2078 @@
++      if (trace) trace->Mark(Trace::WriteLockAcquired);
+@@ -2036,0 +2094 @@
++      if (trace) trace->Mark(Trace::WriteReady);
+@@ -2038,2 +2096,2 @@
+-        ret = co_await coro_io::async_write(
+-            socket, asio::buffer(buffer.data(), buffer.size()));
++        ret = co_await mooncake_submit_write(
++            socket, asio::buffer(buffer.data(), buffer.size()), trace);
+@@ -2047 +2105 @@
+-          ret = co_await coro_io::async_write(socket, iov);
++          ret = co_await mooncake_submit_write(socket, iov, trace);
+@@ -2053,2 +2111,8 @@
+-          ret = co_await coro_io::async_write(socket, iov);
+-        }
++          ret = co_await mooncake_submit_write(socket, iov, trace);
++        }
++      }
++      if (trace) {
++        trace->Mark(Trace::WriteDone);
++        trace->write_resume_tid = Trace::Tid();
++        trace->written_bytes = ret.second;
++        trace->write_error = ret.first.value();

@@ -894,3 +894,5 @@ if(USE_HYLINK)
   add_compile_definitions(USE_HYLINK)
   message(STATUS "Hylink transport is enabled")
 endif()
+
+include(${CMAKE_CURRENT_LIST_DIR}/rpc_submit_diag.cmake)

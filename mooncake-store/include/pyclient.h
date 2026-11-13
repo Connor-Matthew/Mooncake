@@ -7,9 +7,11 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "client_service.h"
@@ -142,6 +144,14 @@ struct ShmFdResponse {
 
 class ClientRequester {
    public:
+    struct RpcTiming {
+        uint64_t pool_lookup_us{0};
+        uint64_t rpc_call_us{0};
+        uint64_t result_get_us{0};
+        uint64_t result_parse_us{0};
+        uint64_t total_us{0};
+    };
+
     ClientRequester();
 
     // Drains in-flight offload RPCs before the pools member is released
@@ -157,7 +167,8 @@ class ClientRequester {
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     batch_get_offload_object(const std::string &client_addr,
                              const std::vector<std::string> &keys,
-                             const std::vector<int64_t> &sizes);
+                             const std::vector<int64_t> &sizes,
+                             RpcTiming *timing = nullptr);
 
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     batch_get_offload_object_ranges(const std::string &client_addr,
@@ -167,14 +178,29 @@ class ClientRequester {
                                     const std::vector<int64_t> &object_sizes);
 
     /**
-     * @brief Notifies remote FileStorage to release buffer after transfer
-     * completion. This is a fire-and-forget call - errors are logged but not
-     * propagated.
+     * @brief Push-mode offload: invoke the owner's push handler, which WRITEs
+     * the data straight into our destination slices. A single RPC replaces the
+     * pull path's get-pointers + READ + release_offload_buffer sequence.
+     * @param client_addr Network address of the remote FileStorage owner.
+     * @param req keys/sizes plus our TE endpoint and destination slices.
+     */
+    tl::expected<BatchGetOffloadObjectPushResponse, ErrorCode>
+    batch_get_offload_object_push(
+        const std::string &client_addr,
+        const BatchGetOffloadObjectPushRequest &req,
+        RpcTiming *timing = nullptr);
+
+    /**
+     * @brief Synchronously notifies remote FileStorage to release its buffer
+     * after transfer completion. Errors are logged but not propagated because
+     * the owner's lease-based GC provides a fallback.
      * @param client_addr Network address of the remote FileStorage service.
      * @param batch_id The batch_id returned from batch_get_offload_object.
      */
     void release_offload_buffer(const std::string &client_addr,
-                                uint64_t batch_id);
+                                uint64_t batch_id, RpcTiming *timing = nullptr);
+
+    void WarmupRpcPool(const std::string &client_addr);
 
     /**
      * @brief Asks a remote holder node to prefetch (promote SSD->DRAM) the
@@ -239,6 +265,8 @@ class ClientRequester {
     };
 
     mutable std::shared_mutex client_pool_mutex_;
+    mutable std::shared_mutex warmed_rpc_pool_mutex_;
+    std::unordered_set<std::string> warmed_rpc_pools_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
     RpcDrainGuard rpc_drain_;
@@ -253,7 +281,7 @@ class ClientRequester {
      */
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
-        const std::string &client_addr, Args &&...args);
+        const std::string &client_addr, RpcTiming *timing, Args &&...args);
 };
 
 // Python-specific wrapper class for client interface
@@ -695,6 +723,9 @@ inline CachedQueryResultResponse to_cached_query_result_response(
     if (query_result->resolved_tenant_id) {
         value.resolved_tenant_id = *query_result->resolved_tenant_id;
     }
+    if (query_result->vsegment_layouts) {
+        value.vsegment_layouts = *query_result->vsegment_layouts;
+    }
     return CachedQueryResultResponse(std::move(value));
 }
 
@@ -704,13 +735,18 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
     if (!cached_result.success) {
         return tl::make_unexpected(cached_result.error);
     }
-    return tl::expected<QueryResult, ErrorCode>(
-        tl::in_place,
+    QueryResult query(
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
         now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
         cached_result.value.object_checksum,
         cached_result.value.resolved_tenant_id);
+    if (cached_result.value.vsegment_layouts.has_value()) {
+        query.vsegment_layouts =
+            std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+                *cached_result.value.vsegment_layouts);
+    }
+    return query;
 }
 
 inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(

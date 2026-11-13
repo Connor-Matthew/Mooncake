@@ -462,20 +462,25 @@ static std::vector<UBDevice> listUBDevices(
     std::vector<UBDevice> devices;
 
     urma_init_attr_t init_attr = {};
-    if (urma_init(&init_attr) != URMA_SUCCESS) {
-        LOG(WARNING) << "Failed to urma init";
+    auto ret = urma_init(&init_attr);
+    if (ret != URMA_SUCCESS && ret != URMA_EEXIST) {
+        LOG(WARNING) << "Failed to urma init, ret=" << ret;
         return {};
     }
-    LOG(INFO) << "URMA module init success";
+    const bool need_uninit = (ret == URMA_SUCCESS);
+    LOG(INFO) << "URMA module init success, ret=" << ret
+              << ", need_uninit=" << need_uninit;
+
     urma_device_t **device_list = urma_get_device_list(&num_devices);
     if (!device_list) {
         LOG(WARNING) << "No UB devices found, check your device installation";
-        urma_uninit();
+        if (need_uninit) urma_uninit();
         return {};
     }
-    if (device_list && num_devices <= 0) {
+    if (num_devices <= 0) {
         LOG(WARNING) << "No UB devices found, check your device installation";
         urma_free_device_list(device_list);
+        if (need_uninit) urma_uninit();
         return {};
     }
 
@@ -502,7 +507,19 @@ static std::vector<UBDevice> listUBDevices(
         snprintf(path, sizeof(path), "%s/numa",
                  dirname(dirname(resolved_path)));
         LOG(INFO) << "listUBDevices: numanodepath " << path;
-        std::ifstream(path) >> numa_node;
+        // The ubcore "numa" attribute is written in hex (e.g. "0x01"), unlike
+        // the infiniband "numa_node" which is decimal. A plain `>> int` parses
+        // "0x01" as 0 (stops at 'x'), so read as string and pick the base by
+        // the 0x prefix.
+        std::string numa_str;
+        std::ifstream(path) >> numa_str;
+        if (!numa_str.empty()) {
+            int base = (numa_str.rfind("0x", 0) == 0 ||
+                        numa_str.rfind("0X", 0) == 0)
+                           ? 16
+                           : 10;
+            numa_node = static_cast<int>(strtol(numa_str.c_str(), nullptr, base));
+        }
         LOG(INFO) << "UBDevices : performation node ----"
                   << device_list[i]->name << " : " << numa_node;
 
@@ -511,7 +528,7 @@ static std::vector<UBDevice> listUBDevices(
                                    .numa_node = numa_node});
     }
     urma_free_device_list(device_list);
-    urma_uninit();
+    if (need_uninit) urma_uninit();
     return devices;
 }
 
