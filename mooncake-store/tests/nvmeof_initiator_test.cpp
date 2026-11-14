@@ -85,6 +85,76 @@ class MockInitiator : public NVMeoFInitiator {
     std::array<uint64_t, 16> sentinels_{};
 };
 
+TEST(NofInitiatorDefaultContractTest, LaneDefaults) {
+    MockInitiator mock;
+    auto* segment = mock.OpenSegment("trtype:TCP traddr:127.0.0.1 ns:1");
+
+    EXPECT_EQ(mock.GetLaneCount(nullptr), 0u);
+    EXPECT_EQ(mock.GetLaneCount(segment), 1u);
+    EXPECT_EQ(mock.GetLane(segment, 0), segment);
+    EXPECT_EQ(mock.GetLane(segment, 1), nullptr);
+}
+
+TEST(NofInitiatorDefaultContractTest, FaultIsolationDefaultsAreNoOps) {
+    MockInitiator mock;
+    auto* segment = mock.OpenSegment("trtype:TCP traddr:127.0.0.1 ns:1");
+
+    EXPECT_TRUE(mock.IsLaneHealthy(segment));
+    EXPECT_NO_THROW(mock.MarkLaneFailed(segment));
+    EXPECT_NO_THROW(mock.ReleaseFailedLane(segment));
+    EXPECT_TRUE(mock.IsLaneHealthy(segment));
+}
+
+TEST(NofInitiatorDefaultContractTest, BufferDefaultsAndSubmitDispatch) {
+    MockInitiator mock;
+    auto* segment = mock.OpenSegment("trtype:TCP traddr:127.0.0.1 ns:1");
+    int callback_count = 0;
+    NofIOAdaptor adaptor{
+        [](void* ctx, const NofIOCompletion&) { ++*static_cast<int*>(ctx); },
+        &callback_count};
+    uint8_t buffer[4096]{};
+
+    const auto resolved = mock.ResolveBuffer(buffer, sizeof(buffer));
+    EXPECT_EQ(resolved.type, NofMemoryType::kHost);
+    EXPECT_EQ(resolved.device_id, -1);
+
+    EXPECT_EQ(mock.SubmitIOWithBuffer(segment, buffer, 0, sizeof(buffer),
+                                      NofIOOp::kRead, &adaptor, resolved),
+              0);
+    ASSERT_EQ(mock.pending_.size(), 1u);
+    EXPECT_EQ(mock.PollCompletion(segment, 0), 1);
+    EXPECT_EQ(callback_count, 1);
+
+    for (const auto type : {NofMemoryType::kCuda, NofMemoryType::kError,
+                            NofMemoryType::kNotSupported}) {
+        const auto pending_before = mock.pending_.size();
+        const auto callback_count_before = callback_count;
+        EXPECT_EQ(mock.SubmitIOWithBuffer(segment, buffer, 0, sizeof(buffer),
+                                          NofIOOp::kRead, &adaptor,
+                                          NofBufferInfo{type, 0}),
+                  -ENOTSUP);
+        EXPECT_EQ(mock.pending_.size(), pending_before);
+        EXPECT_EQ(callback_count, callback_count_before);
+    }
+}
+
+TEST(NofInitiatorDefaultContractTest, EndpointRegistrationIsUnsupported) {
+    MockInitiator mock;
+    uint8_t buffer[16]{};
+    EXPECT_EQ(
+        mock.RegisterMemoryForEndpoint("trtype:TCP", buffer, sizeof(buffer)),
+        nullptr);
+}
+
+static_assert(sizeof(NofIOAdaptor::backend_scratch) ==
+              kNofIOAdaptorScratchBytes);
+TEST(NofInitiatorDefaultContractTest, AdaptorAggregateZeroInitializesScratch) {
+    NofIOAdaptor adaptor{nullptr, nullptr};
+    for (const auto byte : adaptor.backend_scratch) {
+        EXPECT_EQ(byte, 0);
+    }
+}
+
 TEST(NofWorkerPoolTest, SubmitAndComplete) {
     auto mock = std::make_shared<MockInitiator>();
     NofWorkerPool pool(mock, 0);

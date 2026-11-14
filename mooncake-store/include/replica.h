@@ -42,6 +42,7 @@ inline std::ostream& operator<<(std::ostream& os,
                              {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
                              {ReplicaType::NOF_SSD, "NOF_SSD"},
                              {ReplicaType::ALL, "ALL"},
+                             {ReplicaType::VSEGMENT, "VSEGMENT"},
                              {ReplicaType::DFS, "DFS"}};
 
     os << (replica_type_strings.count(replicaType)
@@ -123,6 +124,8 @@ struct ReplicateConfig {
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     std::string host_id{};
+    // Layout policy for vsegment-backed writes; empty selects the default.
+    std::string vsegment_profile_name{};
     // Optional per-key group IDs. Empty string keeps that key
     // ungrouped. Group IDs tie keys into a lifecycle group: the background
     // eviction treats the group as a unit (all-or-none). Object routing is
@@ -241,6 +244,8 @@ struct ReplicateConfig {
             os << "default";
         }
         os << ", with_hard_pin: " << config.with_hard_pin
+
+           << ", vsegment_profile_name: " << config.vsegment_profile_name
            << ", preferred_segments: [";
         for (size_t i = 0; i < config.preferred_segments.size(); ++i) {
             os << config.preferred_segments[i];
@@ -385,6 +390,22 @@ struct LocalDiskDescriptor {
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
 };
 
+// Logical location of one object replica inside an immutable vsegment view.
+// Physical endpoints remain resolved through SegmentRegistry at transfer time.
+struct VSegmentDescriptor {
+    std::string partition_id;
+    std::string vsegment_id;
+    uint64_t logical_offset{0};
+    uint64_t length{0};
+    std::string operation_id;
+    YLT_REFL(VSegmentDescriptor, partition_id, vsegment_id, logical_offset,
+             length, operation_id);
+};
+
+struct VSegmentReplicaData {
+    VSegmentDescriptor descriptor;
+};
+
 class Replica {
    public:
     struct Descriptor;
@@ -415,6 +436,12 @@ class Replica {
     // dfs replica constructor
     Replica(DistributedFSDescriptor descriptor, ReplicaStatus status)
         : Replica(next_id_.fetch_add(1), std::move(descriptor), status) {}
+
+    Replica(VSegmentDescriptor descriptor, ReplicaStatus status)
+        : id_(next_id_.fetch_add(1)),
+          data_(VSegmentReplicaData{std::move(descriptor)}),
+          status_(status),
+          refcnt_(0) {}
 
     ~Replica() {
         if (status_ == ReplicaStatus::UNDEFINED) return;
@@ -562,6 +589,21 @@ class Replica {
             data_);
     }
 
+    [[nodiscard]] bool is_vsegment_replica() const {
+        return std::holds_alternative<VSegmentReplicaData>(data_);
+    }
+
+    [[nodiscard]] static bool fn_is_vsegment_replica(
+        const Replica& replica) {
+        return replica.is_vsegment_replica();
+    }
+
+    [[nodiscard]] const VSegmentDescriptor& get_vsegment_descriptor() const {
+        const auto* data = std::get_if<VSegmentReplicaData>(&data_);
+        if (!data) throw std::runtime_error("Expected VSegmentReplicaData");
+        return data->descriptor;
+    }
+
     [[nodiscard]] static bool fn_is_local_disk_replica(const Replica& replica) {
         return replica.is_local_disk_replica();
     }
@@ -664,6 +706,22 @@ class Replica {
         return owner_session != nullptr && getClientSession() == owner_session;
     }
 
+    /**
+     * @brief Update a LOCAL_DISK replica's transport endpoint and object size
+     * in place. No-op for non-local_disk replicas. Used when the same owning
+     * client re-offloads / re-registers a key (e.g. after restart the endpoint
+     * changes). Mutates the internal replica data directly; note that
+     * get_descriptor() returns a by-value copy and cannot be used to mutate.
+     */
+    void update_local_disk_location(std::string transport_endpoint,
+                                    uint64_t object_size) {
+        if (is_local_disk_replica()) {
+            auto& disk_data = LocalDiskData(data_);
+            disk_data.transport_endpoint = std::move(transport_endpoint);
+            disk_data.object_size = object_size;
+        }
+    }
+
     [[nodiscard]] size_t get_memory_buffer_size() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
@@ -739,12 +797,15 @@ class Replica {
         ReplicaType operator()(const std::unique_ptr<DfsReplicaData>&) const {
             return ReplicaType::DFS;
         }
+        ReplicaType operator()(const VSegmentReplicaData&) const {
+            return ReplicaType::VSEGMENT;
+        }
     };
 
     struct Descriptor {
         ReplicaID id{0};
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                     LocalDiskDescriptor, DistributedFSDescriptor>
+                     LocalDiskDescriptor, DistributedFSDescriptor, VSegmentDescriptor>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
@@ -791,6 +852,16 @@ class Replica {
 
         bool is_dfs_replica() const noexcept {
             return std::holds_alternative<DistributedFSDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_vsegment_replica() noexcept {
+            return std::holds_alternative<VSegmentDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_vsegment_replica() const noexcept {
+            return std::holds_alternative<VSegmentDescriptor>(
                 descriptor_variant);
         }
 
@@ -869,6 +940,22 @@ class Replica {
             }
             throw std::runtime_error("Expected DistributedFSDescriptor");
         }
+
+        VSegmentDescriptor& get_vsegment_descriptor() {
+            if (auto* desc =
+                    std::get_if<VSegmentDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected VSegmentDescriptor");
+        }
+
+        const VSegmentDescriptor& get_vsegment_descriptor() const {
+            if (auto* desc =
+                    std::get_if<VSegmentDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected VSegmentDescriptor");
+        }
     };
 
    private:
@@ -878,7 +965,8 @@ class Replica {
     // DFS 64 B) for the replicas that never use them.
     using Data = std::variant<
         MemoryReplicaData, NoFReplicaData, std::unique_ptr<DiskReplicaData>,
-        std::unique_ptr<LocalDiskReplicaData>, std::unique_ptr<DfsReplicaData>>;
+        std::unique_ptr<LocalDiskReplicaData>, std::unique_ptr<DfsReplicaData>,
+        VSegmentReplicaData>;
 
     static Data MakeBufferedData(std::unique_ptr<AllocatedBuffer> buffer,
                                  ReplicaType replica_type) {
@@ -1015,6 +1103,9 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         desc.descriptor_variant = std::move(local_disk_desc);
     } else if (is_dfs_replica()) {
         desc.descriptor_variant = DfsData(data_).descriptor;
+    } else if (is_vsegment_replica()) {
+        desc.descriptor_variant =
+            std::get<VSegmentReplicaData>(data_).descriptor;
     }
 
     return desc;
@@ -1094,6 +1185,13 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
            << ", object_size: " << dfs_data.descriptor.object_size
            << ", aligned_size: " << dfs_data.descriptor.aligned_size
            << ", shard_idx: " << dfs_data.descriptor.shard_idx;
+    } else if (replica.is_vsegment_replica()) {
+        const auto& data =
+            std::get<VSegmentReplicaData>(replica.data_).descriptor;
+        os << "type: VSEGMENT, partition_id: " << data.partition_id
+           << ", vsegment_id: " << data.vsegment_id
+           << ", logical_offset: " << data.logical_offset
+           << ", length: " << data.length;
     }
 
     os << ", refcnt: " << replica.refcnt_.load() << " }";

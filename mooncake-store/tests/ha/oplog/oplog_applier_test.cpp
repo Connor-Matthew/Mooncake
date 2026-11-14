@@ -1012,6 +1012,19 @@ TEST_F(OpLogApplierTest, TestApplyPutRevoke) {
     EXPECT_FALSE(mock_metadata_store_->Exists("key1"));
 }
 
+TEST_F(OpLogApplierTest, AppliesVSegmentStateThroughInstalledHandler) {
+    int calls = 0;
+    applier_->SetVSegmentStateHandler([&](const OpLogEntry& entry) {
+        ++calls;
+        return entry.object_key == "partition-1";
+    });
+    auto entry =
+        MakeEntry(1, OpType::VSEGMENT_STATE, "partition-1", "state");
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(applier_->GetExpectedSequenceId(), 2);
+}
+
 TEST_F(OpLogApplierTest, TestApplyRemove) {
     // First add a key
     std::string payload = MakeValidPayload();

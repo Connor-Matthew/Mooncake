@@ -1,6 +1,7 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <string_view>
 #include <unordered_set>
@@ -17,6 +18,7 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 
 #include "ha_metric_manager.h"
+#include "vsegment/vsegment_ha.h"
 
 namespace mooncake {
 namespace {
@@ -120,6 +122,46 @@ bool ValidateSegments(const std::vector<StandbySegmentInfo>& segments) {
         }
     }
     return true;
+}
+
+using VSegmentStates =
+    std::unordered_map<std::string, vsegment::PartitionVSegmentSnapshot>;
+
+// Applies VSEGMENT oplog records to `states` while a restore replays the
+// suffix. The handler is removed on scope exit: a caller-supplied applier
+// outlives this function's local state.
+class ScopedVSegmentReplay {
+   public:
+    ScopedVSegmentReplay(OpLogApplier& applier, VSegmentStates& states)
+        : applier_(applier) {
+        applier_.SetVSegmentStateHandler([&states](const OpLogEntry& entry) {
+            std::string detail;
+            const ErrorCode error =
+                vsegment::ApplyVSegmentStateEntry(entry, states, &detail);
+            if (error != ErrorCode::OK) {
+                LOG(ERROR) << "Snapshot restore rejected vsegment record seq="
+                           << entry.sequence_id << ": " << detail;
+            }
+            return error == ErrorCode::OK;
+        });
+    }
+    ~ScopedVSegmentReplay() { applier_.SetVSegmentStateHandler({}); }
+    ScopedVSegmentReplay(const ScopedVSegmentReplay&) = delete;
+    ScopedVSegmentReplay& operator=(const ScopedVSegmentReplay&) = delete;
+
+   private:
+    OpLogApplier& applier_;
+};
+
+// Deterministic (partition-id ordered) export.
+std::vector<vsegment::PartitionVSegmentSnapshot> ExportVSegmentStates(
+    VSegmentStates& states) {
+    std::map<std::string, vsegment::PartitionVSegmentSnapshot> ordered;
+    for (auto& [id, state] : states) ordered.emplace(id, std::move(state));
+    std::vector<vsegment::PartitionVSegmentSnapshot> out;
+    out.reserve(ordered.size());
+    for (auto& [_, state] : ordered) out.push_back(std::move(state));
+    return out;
 }
 
 void CopyRegistry(const StandbySegmentRegistry& source,
@@ -285,6 +327,35 @@ AttemptResult RestorePointer(
         }
     }
 
+    VSegmentStates vsegment_states;
+    if (manifest.vsegment_partitions) {
+        const auto& section = *manifest.vsegment_partitions;
+        if (section.key != ha::BuildBatchOpLogSnapshotVSegmentPartitionsKey(
+                               snapshot_root, descriptor.snapshot_id)) {
+            return Invalid();
+        }
+        std::vector<uint8_t> section_bytes;
+        auto read_section =
+            ReadVerifiedObject(object_store, section.key, section.stored_size,
+                               section.crc32c, section_bytes);
+        if (read_section.disposition != AttemptDisposition::kSuccess) {
+            return read_section;
+        }
+        auto decoded_partitions =
+            DecodeBatchOpLogSnapshotVSegmentPartitions(section_bytes);
+        if (!decoded_partitions) {
+            return Invalid(ErrorCode::DESERIALIZE_FAIL);
+        }
+        for (auto& partition : *decoded_partitions) {
+            if (partition.partition_id.empty() ||
+                !vsegment_states
+                     .emplace(partition.partition_id, std::move(partition))
+                     .second) {
+                return Invalid(ErrorCode::DESERIALIZE_FAIL);
+            }
+        }
+    }
+
     std::unique_ptr<OpLogApplier> owned_applier;
     OpLogApplier* applier = supplied_applier;
     if (applier == nullptr) {
@@ -339,8 +410,12 @@ AttemptResult RestorePointer(
         }
     }
 
-    auto suffix =
-        ReplaySuffix(cluster_id, backend, *applier, &baseline, cancelled);
+    AttemptResult suffix;
+    {
+        ScopedVSegmentReplay vsegment_replay(*applier, vsegment_states);
+        suffix =
+            ReplaySuffix(cluster_id, backend, *applier, &baseline, cancelled);
+    }
     if (suffix.disposition != AttemptDisposition::kSuccess) {
         return suffix;
     }
@@ -361,6 +436,9 @@ AttemptResult RestorePointer(
                                       : 0) +
             (manifest.object_storage ? manifest.object_storage->stored_size
                                      : 0) +
+            (manifest.vsegment_partitions
+                 ? manifest.vsegment_partitions->stored_size
+                 : 0) +
             descriptor.manifest_size + pointer_bytes.size();
     });
     return {AttemptDisposition::kSuccess,
@@ -370,7 +448,8 @@ AttemptResult RestorePointer(
              .last_applied_seq = suffix.value.last_included_seq,
              .last_applied_batch_id = suffix.value.last_included_batch_id,
              .producer_view_version = descriptor.producer_view_version,
-             .max_replica_id = live_max_replica_id}};
+             .max_replica_id = live_max_replica_id,
+             .vsegment_partitions = ExportVSegmentStates(vsegment_states)}};
 }
 
 AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
@@ -395,11 +474,16 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
         return IsRetryableBackendError(init_error) ? Infrastructure(init_error)
                                                    : Invalid(init_error);
     }
-    auto replay =
-        ReplaySuffix(cluster_id, backend, *applier, nullptr, cancelled);
+    VSegmentStates vsegment_states;
+    AttemptResult replay;
+    {
+        ScopedVSegmentReplay vsegment_replay(*applier, vsegment_states);
+        replay = ReplaySuffix(cluster_id, backend, *applier, nullptr, cancelled);
+    }
     if (replay.disposition != AttemptDisposition::kSuccess) {
         return replay;
     }
+    replay.value.vsegment_partitions = ExportVSegmentStates(vsegment_states);
     ReplicaID max_replica_id = 0;
     if (!metadata.ValidateReplicaIds(max_replica_id)) {
         return Invalid(ErrorCode::DESERIALIZE_FAIL);

@@ -397,6 +397,31 @@ bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
     return true;
 }
 
+bool SegmentManager::GetSegmentLocations(
+    const std::vector<UUID>& segment_ids,
+    std::vector<std::string>* endpoints,
+    std::vector<uint64_t>* bases) const {
+    if (!endpoints || !bases) return false;
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    endpoints->clear();
+    bases->clear();
+    endpoints->reserve(segment_ids.size());
+    bases->reserve(segment_ids.size());
+    for (const auto& segment_id : segment_ids) {
+        auto mounted = mounted_segments_.find(segment_id);
+        if (mounted == mounted_segments_.end()) {
+            return false;
+        }
+        const auto& segment = mounted->second.segment;
+        if (segment.te_endpoint.empty()) {
+            return false;
+        }
+        endpoints->push_back(segment.te_endpoint);
+        bases->push_back(static_cast<uint64_t>(segment.base));
+    }
+    return true;
+}
+
 bool ScopedSegmentAccess::ReplaceAllocators(
     const std::vector<AllocatorReplacement>& replacements) {
     std::vector<AllocatorManager::RegistrationReplacement> manager_replacements;
@@ -678,6 +703,33 @@ ErrorCode ScopedSegmentAccess::GetAllSegments(
             }
         }
 
+        all_segments.emplace_back(segment_pair.second.segment, client_id);
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::GetAllSegmentsWithOwner(
+    std::vector<std::pair<Segment, UUID>>& all_segments) {
+    all_segments.clear();
+
+    // segment_id -> true owner client_id, built from the authoritative
+    // client_segments_ forward map (client_by_name_ is name-granular and
+    // would attribute old-generation segments of a restarted same-named
+    // worker to the new client).
+    std::unordered_map<UUID, UUID, boost::hash<UUID>> owner_by_segment;
+    for (const auto& [client_id, segment_ids] :
+         segment_manager_->client_segments_) {
+        for (const auto& segment_id : segment_ids) {
+            owner_by_segment.emplace(segment_id, client_id);
+        }
+    }
+
+    for (auto& segment_pair : segment_manager_->mounted_segments_) {
+        UUID client_id{0, 0};
+        auto owner_it = owner_by_segment.find(segment_pair.first);
+        if (owner_it != owner_by_segment.end()) {
+            client_id = owner_it->second;
+        }
         all_segments.emplace_back(segment_pair.second.segment, client_id);
     }
     return ErrorCode::OK;
@@ -1179,5 +1231,15 @@ bool SegmentManager::GetSegmentBasicInfo(const UUID& segment_id,
     segment_name = seg.name;
     te_endpoint = seg.te_endpoint;
     return true;
+}
+
+std::optional<UUID> SegmentManager::getClientIdBySegmentName(
+    const std::string& segment_name) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    auto it = client_by_name_.find(segment_name);
+    if (it == client_by_name_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
 }
 }  // namespace mooncake

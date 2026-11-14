@@ -14,8 +14,15 @@
 
 #ifndef UB_TRANSPORT_H
 #define UB_TRANSPORT_H
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <mutex>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 #include "topology.h"
 #include "transfer_metadata.h"
@@ -24,6 +31,7 @@
 namespace mooncake {
 class UbContext;
 class UbEndPoint;
+class UrmaContext;
 class TransferMetadata;
 class UbWorkerpool;
 
@@ -36,12 +44,22 @@ enum UB_ENDPOINT_TYPE { URMA_ENDPOINT = 0, OBMM_ENDPOINT = 1 };
 class UbTransport : public Transport {
     friend class UbContext;
     friend class UbEndPoint;
+    friend class UrmaContext;
     friend class UbWorkerPool;
 
    public:
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
+
+    // GPU memory access path selected per-process via MC_UB_GPU_MODE.
+    enum class UbGpuMode {
+        kHost,        // host (default): CPU memory only, no GPU involvement
+        kStaging,     // staging: GPU buffer + host staging buffer (NIC only
+                      //         sees host memory, cudaMemcpy does H2D/D2H)
+        kGdrPeermem,  // gdr-peermem: NIC directly DMA GPU HBM via peermem
+                      //              (seg_cfg.is_gpu_seg = 1)
+    };
 
    public:
     UbTransport(UB_ENDPOINT_TYPE endpoint_type = URMA_ENDPOINT);
@@ -74,6 +92,10 @@ class UbTransport : public Transport {
     Status submitTransferTask(
         const std::vector<TransferTask*>& task_list) override;
 
+    Status scheduledTransferLength(const TransferRequest& request,
+                                   uint32_t max_slices,
+                                   size_t& length) override;
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) override;
 
@@ -81,6 +103,57 @@ class UbTransport : public Transport {
 
    private:
     int allocateLocalSegmentID();
+
+    struct StagingLease {
+        void* host_ptr = nullptr;
+        size_t size = 0;
+    };
+
+    struct DeviceRegion {
+        uint64_t addr = 0;
+        size_t length = 0;
+        std::string location;
+        bool remote_accessible = true;
+    };
+
+    struct StagingState {
+        void* original_device_ptr = nullptr;
+        void* staging_ptr = nullptr;
+        size_t size = 0;
+        size_t lease_size = 0;
+        TransferRequest::OpCode opcode = TransferRequest::WRITE;
+        std::atomic<uint64_t> completed_slices{0};
+        uint64_t total_slices = 0;
+        std::atomic<bool> failed{false};
+        std::mutex deferred_mutex;
+        std::vector<Slice*> deferred_success_slices;
+    };
+
+    bool stagingEnabled() const;
+    UbGpuMode gpuMode() const;
+    const char* gpuModeName() const;
+    bool isDevicePointer(const void* ptr) const;
+    bool isLogicalDeviceRange(const void* ptr, size_t length) const;
+    int registerLogicalDeviceRegion(void* addr, size_t length,
+                                    const std::string& location,
+                                    bool remote_accessible);
+    int unregisterLogicalDeviceRegion(void* addr);
+    bool copyDeviceToHost(void* dst, const void* src, size_t size) const;
+    bool copyHostToDevice(void* dst, const void* src, size_t size) const;
+    Status acquireStaging(size_t size, StagingLease& lease);
+    void releaseStaging(const StagingLease& lease);
+    bool isStagedSlice(Slice* slice);
+    bool shouldDeferSuccess(Slice* slice);
+    void attachStaging(TransferTask* task,
+                       std::shared_ptr<StagingState> state);
+    void attachStagingSlice(Slice* slice,
+                            const std::shared_ptr<StagingState>& state);
+    void detachStagingSlice(Slice* slice);
+    std::shared_ptr<StagingState> stagingStateForSlice(Slice* slice);
+    void cleanupStagingForTask(TransferTask* task,
+                               bool detach_all_slices = false);
+    void onStagedSliceSuccess(Slice* slice);
+    void onStagedSliceFinalFailure(Slice* slice);
 
    public:
     int onSetupConnections(const HandShakeDesc& peer_desc,
@@ -118,6 +191,24 @@ class UbTransport : public Transport {
     std::shared_ptr<Topology> local_topology_;
     UB_ENDPOINT_TYPE endpoint_type_;
     bool urma_initialized_ = false;
+    bool runtime_initialized_ = false;
+
+    mutable std::once_flag staging_config_once_;
+    mutable bool staging_enabled_ = false;
+    mutable std::once_flag gpu_mode_once_;
+    mutable UbGpuMode gpu_mode_ = UbGpuMode::kStaging;
+    mutable std::mutex device_region_mutex_;
+    std::vector<DeviceRegion> device_regions_;
+    std::mutex staging_pool_mutex_;
+    void* staging_pool_base_ = nullptr;
+    size_t staging_pool_size_ = 0;
+    size_t staging_pool_offset_ = 0;
+    std::deque<std::pair<void*, size_t>> staging_free_list_;
+    std::mutex staging_state_mutex_;
+    std::unordered_map<TransferTask*, std::shared_ptr<StagingState>>
+        task_staging_map_;
+    std::unordered_map<Slice*, std::shared_ptr<StagingState>>
+        slice_staging_map_;
 };
 }  // namespace mooncake
 

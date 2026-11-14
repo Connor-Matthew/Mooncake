@@ -42,7 +42,13 @@ ClientBufferAllocator::ClientBufferAllocator(
         return;
     }
     // Align to 64 bytes(cache line size) for better cache performance
+    // Modified By Yida (v3): USE_NOF_URMA 下 base 至少 4K 对齐（UMMU Table
+    // mode 页粒度注册；4K 对齐同时命中 SPDK 注册缓存的不重叠快路径）
+#ifdef USE_NOF_URMA
+    constexpr size_t alignment = kNofBufferAlignment;
+#else
     constexpr size_t alignment = 64;
+#endif
     if (use_hugepage_) {
         buffer_ = allocate_buffer_mmap_memory(size, alignment);
     } else {
@@ -88,10 +94,27 @@ std::optional<BufferHandle> ClientBufferAllocator::allocate(size_t size) {
     if (allocator_ == nullptr) {
         return std::nullopt;
     }
+#ifdef USE_NOF_URMA
+    // Modified By Yida (v3): 子分配尺寸向上取整到 4K。base 已 4K 对齐、每个
+    // 分配消耗 4K 的整数倍空间，分配出的 buffer_address_ 与 size 均满足
+    // NoF 提交的块对齐校验（512B/4K sector 均被覆盖）。
+    const size_t rounded = (size + kNofBufferAlignment - 1) &
+                           ~(kNofBufferAlignment - 1);
+    if (rounded != size) {
+        VLOG(1) << "NoF aligned allocation: requested=" << size
+                << ", rounded=" << rounded;
+    }
+    size = rounded;
+#endif
     auto handle = allocator_->allocate(size);
     if (!handle) {
         return std::nullopt;
     }
+
+    VLOG(1) << "NoF buffer allocated: ptr=" << handle->ptr()
+            << ", size=" << handle->size()
+            << ", offset=" << reinterpret_cast<uintptr_t>(handle->ptr()) -
+                   reinterpret_cast<uintptr_t>(buffer_);
 
     return std::make_optional<BufferHandle>(shared_from_this(),
                                             std::move(*handle));
@@ -152,6 +175,8 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
         total_length = replica.get_dfs_descriptor().object_size;
     } else if (replica.is_nof_replica()) {
         total_length = replica.get_nof_descriptor().buffer_descriptor.size_;
+    } else if (replica.is_vsegment_replica()) {
+        total_length = replica.get_vsegment_descriptor().length;
     } else {
         total_length = replica.get_memory_descriptor().buffer_descriptor.size_;
     }
@@ -180,6 +205,9 @@ int allocateSlices(std::vector<Slice>& slices,
         auto& handle = replica.get_nof_descriptor().buffer_descriptor;
         void* chunk_ptr = buffer_ptr;
         slices.emplace_back(Slice{chunk_ptr, handle.size_});
+    } else if (replica.is_vsegment_replica()) {
+        slices.emplace_back(
+            Slice{buffer_ptr, replica.get_vsegment_descriptor().length});
     } else {
         // For memory-based replica, split into slices based on buffer
         // descriptors

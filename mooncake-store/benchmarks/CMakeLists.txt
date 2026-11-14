@@ -39,11 +39,53 @@ target_link_libraries(
   allocation_strategy_bench PRIVATE mooncake_store cachelib_memory_allocator
                                     gflags::gflags glog::glog pthread)
 
+add_executable(stress_cluster_bench stress_cluster_bench.cpp)
+target_link_libraries(
+  stress_cluster_bench PRIVATE mooncake_store transfer_engine asio_shared
+                               gflags::gflags glog::glog pthread)
+
+# CFM client benchmark. Simulates vLLM inference requests as KV-cache block
+# accesses and reports both client performance and IO Pattern observability.
+add_executable(cfm_client_bench cfm_client_bench.cpp)
+target_link_libraries(
+  cfm_client_bench PRIVATE mooncake_store transfer_engine asio_shared
+                          gflags::gflags glog::glog pthread)
+if(STORE_USE_ETCD)
+  target_link_libraries(cfm_client_bench PRIVATE ${ETCD_WRAPPER_LIB})
+endif()
+
+# Benchmark for vLLM Store Connector path
+# Triggers: batch_put_from_multi_buffers / batchIsExist /
+# batch_get_into_multi_buffers (and setup/register_buffer/tearDownAll).
+# Used to verify SpDiag perf points and MC_LOG logging.
+add_executable(store_connector_bench store_connector_bench.cpp)
+target_link_libraries(
+  store_connector_bench PRIVATE mooncake_store transfer_engine asio_shared
+                                 gflags::gflags glog::glog pthread)
+
+
+# Benchmark for RealClient::get_into_ranges with configurable value size,
+# fragments per key and keys per query.
+add_executable(stress_cluster_ranges_bench stress_cluster_ranges_bench.cpp)
+target_link_libraries(
+  stress_cluster_ranges_bench PRIVATE mooncake_store transfer_engine
+                                       asio_shared gflags::gflags glog::glog
+                                       pthread)
+
 # Add NoF worker pool benchmark executable
 if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
   target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
                                                        gflags::gflags)
+  # Modified By Yida (v3): --memory=cuda GPU Direct 验证需要 CUDA 驱动 API
+  # （dmabuf provider 经 mooncake_store 链接；这里补 cuda.h 与运行时 API）
+  if(USE_NOF_GPU_DIRECT)
+    find_package(CUDAToolkit REQUIRED)
+    target_include_directories(nof_worker_pool_bench
+                               PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(nof_worker_pool_bench PRIVATE CUDA::cuda_driver
+                                                        CUDA::cudart)
+  endif()
 endif()
 
 # Add BatchEvict benchmark executable

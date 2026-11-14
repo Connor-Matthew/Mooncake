@@ -16,6 +16,7 @@
 #define URMA_ENDPOINT_H
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -23,8 +24,10 @@
 #include "common.h"
 #include "config.h"
 #include "urma_api.h"
+#include "urma_ubagg.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
+#include "transport/kunpeng_transport/urma/urma_compat.h"
 
 namespace mooncake {
 struct UrmaJFC {
@@ -55,11 +58,14 @@ class UrmaContext : public UbContext {
     UrmaContext(UbTransport& engine, std::string device_name,
                 int max_endpoints);
     ~UrmaContext();
-    int registerMemoryRegion(uint64_t va, size_t length) override;
+    int registerMemoryRegion(
+        uint64_t va, size_t length,
+        UbMemoryRegionType type = UbMemoryRegionType::kHost) override;
     int unregisterMemoryRegion(uint64_t va) override;
     int doProcessContextEvents() override;
     void* retrieveRemoteSeg(const std::string& value) override;
     int poll(int num_entries, Transport::Slice** failed_slices, int& num_failed,
+             std::vector<Transport::Slice*>& deferred_success_slices,
              std::unordered_map<volatile int*, int>& jetty_depth_set,
              int jfc_index) override;
     volatile int* outstandingCount(int jfc_index) override;
@@ -79,13 +85,17 @@ class UrmaContext : public UbContext {
     urma_jfc_t* jfc();
     urma_jfr_t* jfr();
     urma_jfce_t* JFCE();
+    urma_transport_mode_t transMode() const { return trans_mode_; }
+    uint64_t pendingSliceCount() const {
+        return worker_pool_ ? worker_pool_->pendingSliceCount() : 0;
+    }
     static bool uninit();
     static bool init();
 
    private:
     int construct(GlobalConfig& config) override;
     int deconstruct() override;
-    int openDevice(const std::string& device_name, uint8_t port,
+    int openDevice(const std::string& device_name, int8_t port,
                    int& eid_index) override;
 
     urma_target_seg_t* seg(uint64_t addr);
@@ -130,6 +140,7 @@ class UrmaContext : public UbContext {
     std::vector<urma_target_seg_t*> local_tseg_list_;
     std::vector<urma_seg_t*> remote_seg_list_;
     std::vector<urma_target_seg_t*> imported_seg_list_;
+    std::shared_mutex import_tseg_mutex_;
 
     std::vector<UrmaJFR> jfr_list_;
 
@@ -147,10 +158,8 @@ class UrmaContext : public UbContext {
 
     urma_import_seg_flag_t import_flag_ = mooncake::import_flag;
     std::unordered_map<std::string, urma_target_seg_t*> import_tseg_map;
-    // retrieveRemoteSeg() is called from every submitting thread; without
-    // this lock two threads can both miss the cache and push into
-    // remote_seg_list_, racing on the vector reallocation.
-    mutable std::shared_mutex remote_seg_mutex_;
+
+    urma_transport_mode_t trans_mode_ = URMA_TM_RM;
 };
 
 // define the UrmaEndpoint class
@@ -184,13 +193,27 @@ class UrmaEndpoint : public UbEndPoint {
    private:
     std::vector<uint32_t> JettyNum() const;
 
-    int doSetupConnection(const std::string& peer_eid,
-                          std::vector<uint32_t> peer_jetty_num_list,
-                          std::string* reply_msg = nullptr);
+    // Export per-jetty peer info for the handshake: driver-delegated rjetty
+    // blob (hex) when urma_get_rjetty is available, plus id/uasid/trans_mode
+    // used by the receiver's hand-fill fallback. Blobs are exported fresh on
+    // every handshake: they are transient per-peer-pair data and jetty list
+    // may have been rebuilt since the previous handshake.
+    void exportJettyInfos(TransferMetadata::HandShakeDesc& desc) const;
 
-    int doSetupConnection(int qp_index, const std::string& peer_eid,
-                          uint32_t peer_jetty_num,
-                          std::string* reply_msg = nullptr);
+    int doSetupConnection(
+        const std::string& peer_eid,
+        std::vector<uint32_t> peer_jetty_num_list,
+        std::string* reply_msg = nullptr,
+        const std::vector<TransferMetadata::HandShakeDesc::PeerJettyInfo>*
+            peer_jetty_infos = nullptr,
+        int peer_trans_mode = -1);
+
+    int doSetupConnection(
+        int qp_index, const std::string& peer_eid, uint32_t peer_jetty_num,
+        std::string* reply_msg = nullptr,
+        const TransferMetadata::HandShakeDesc::PeerJettyInfo* peer_jetty_info =
+            nullptr,
+        int peer_trans_mode = -1);
 
    private:
     UrmaContext* context_;

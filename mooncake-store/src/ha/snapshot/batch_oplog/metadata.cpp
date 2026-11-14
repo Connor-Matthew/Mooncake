@@ -131,7 +131,10 @@ bool ValidateIdentity(const SnapshotMetadata& metadata, std::string* reason) {
     const bool with_objects =
         metadata.schema_version == kBatchOpLogObjectSnapshotSchemaVersion &&
         metadata.snapshot_format == kBatchOpLogObjectSnapshotFormat;
-    if (!legacy && !with_weights && !with_objects) {
+    const bool with_vsegments =
+        metadata.schema_version == kBatchOpLogVSegmentSnapshotSchemaVersion &&
+        metadata.snapshot_format == kBatchOpLogVSegmentSnapshotFormat;
+    if (!legacy && !with_weights && !with_objects && !with_vsegments) {
         SetReason(reason, "unsupported snapshot version and format");
         return false;
     }
@@ -325,6 +328,10 @@ std::string EncodeBatchOpLogSnapshotManifest(
         root["weight_metadata"] =
             EncodeObjectDescriptor(*manifest.weight_metadata);
     }
+    if (manifest.vsegment_partitions) {
+        root["vsegment_partitions"] =
+            EncodeObjectDescriptor(*manifest.vsegment_partitions);
+    }
     Json::Value chunks(Json::arrayValue);
     for (const auto& descriptor : manifest.object_chunks) {
         chunks.append(EncodeChunkDescriptor(descriptor));
@@ -349,7 +356,20 @@ DecodeBatchOpLogSnapshotManifest(std::string_view value) {
     if (!DecodeObjectDescriptor(root["segments"], decoded.segments, &reason)) {
         return tl::make_unexpected(std::move(reason));
     }
-    if (decoded.schema_version >= kBatchOpLogWeightSnapshotSchemaVersion) {
+    if (decoded.schema_version == kBatchOpLogVSegmentSnapshotSchemaVersion) {
+        // v4 is a superset of v3: the weight section stays optional.
+        if (root.isMember("weight_metadata")) {
+            BatchOpLogSnapshotObjectDescriptor weights;
+            if (!DecodeObjectDescriptor(root["weight_metadata"], weights,
+                                        &reason)) {
+                return tl::make_unexpected(
+                    std::string("Invalid weight_metadata descriptor: ") +
+                    reason);
+            }
+            decoded.weight_metadata = std::move(weights);
+        }
+    } else if (decoded.schema_version >=
+               kBatchOpLogWeightSnapshotSchemaVersion) {
         BatchOpLogSnapshotObjectDescriptor weights;
         if (!root.isMember("weight_metadata") ||
             !DecodeObjectDescriptor(root["weight_metadata"], weights,
@@ -370,9 +390,39 @@ DecodeBatchOpLogSnapshotManifest(std::string_view value) {
                 std::string("Invalid object_storage descriptor: ") + reason);
         }
         decoded.object_storage = std::move(objects);
+    } else if (decoded.schema_version ==
+               kBatchOpLogVSegmentSnapshotSchemaVersion) {
+        // v4 is a superset of v3: the object_storage section stays optional.
+        if (root.isMember("object_storage")) {
+            BatchOpLogSnapshotObjectDescriptor objects;
+            if (!DecodeObjectDescriptor(root["object_storage"], objects,
+                                        &reason)) {
+                return tl::make_unexpected(
+                    std::string("Invalid object_storage descriptor: ") +
+                    reason);
+            }
+            decoded.object_storage = std::move(objects);
+        }
     } else if (root.isMember("object_storage")) {
         return tl::make_unexpected(
             std::string("Object storage requires snapshot v3"));
+    }
+    // The vsegment_partitions section requires v4 and is mandatory there,
+    // mirroring the v2 weight_metadata contract: the writer only produces a
+    // v4 manifest when there is vsegment state to store.
+    if (decoded.schema_version == kBatchOpLogVSegmentSnapshotSchemaVersion) {
+        BatchOpLogSnapshotObjectDescriptor vsegments;
+        if (!root.isMember("vsegment_partitions") ||
+            !DecodeObjectDescriptor(root["vsegment_partitions"], vsegments,
+                                    &reason)) {
+            return tl::make_unexpected(
+                std::string("Invalid vsegment_partitions descriptor: ") +
+                reason);
+        }
+        decoded.vsegment_partitions = std::move(vsegments);
+    } else if (root.isMember("vsegment_partitions")) {
+        return tl::make_unexpected(
+            std::string("VSegment partitions require snapshot v4"));
     }
     if (!root.isMember("object_chunks") || !root["object_chunks"].isArray()) {
         SetReason(&reason, "object_chunks must be a JSON array");
@@ -468,6 +518,12 @@ std::string BuildBatchOpLogSnapshotObjectStorageKey(
     const auto prefix =
         BuildBatchOpLogSnapshotArtifactPrefix(snapshot_root, snapshot_id);
     return prefix.empty() ? std::string() : prefix + "object_storage.bin";
+}
+
+std::string BuildBatchOpLogSnapshotVSegmentPartitionsKey(
+    const std::string& snapshot_root, std::string_view snapshot_id) {
+    const std::string prefix = BuildArtifactPrefix(snapshot_root, snapshot_id);
+    return prefix.empty() ? std::string() : prefix + "vsegment_partitions.bin";
 }
 
 }  // namespace mooncake::ha

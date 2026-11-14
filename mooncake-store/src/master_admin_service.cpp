@@ -26,6 +26,7 @@
 #include "allocator.h"
 #include "ha_metric_manager.h"
 #include "master_metric_manager.h"
+#include "vsegment/vsegment_metrics.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "version.h"
@@ -263,10 +264,15 @@ tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
 
 MasterAdminServer::MasterAdminServer(uint16_t http_port,
                                      bool enable_metric_reporting,
-                                     std::string http_host)
+                                     std::string http_host,
+                                     uint32_t metrics_log_interval_sec)
     : http_port_(http_port),
       http_host_(std::move(http_host)),
       enable_metric_reporting_(enable_metric_reporting),
+      metrics_log_interval_sec_(
+          metrics_log_interval_sec == 0
+              ? kMetricReportIntervalSeconds
+              : std::max<uint64_t>(1, metrics_log_interval_sec)),
       http_server_(4, http_port, http_host_) {}
 
 MasterAdminServer::~MasterAdminServer() { Stop(); }
@@ -312,9 +318,26 @@ bool MasterAdminServer::Start() {
                         << ", view_version="
                         << snapshot.leader_view->view_version;
                 }
+                // standby 覆盖率（§16.18.2 满配缺口可观测化）：provider
+                // 拷贝于锁内、调用在锁外（live etcd 读不持 state_mutex_）；
+                // 行尾 owned_slots 槽位约定不变。
+                log_stream << ", standby_coverage={"
+                           << (snapshot.standby_coverage_provider
+                                   ? snapshot.standby_coverage_provider()
+                                   : std::string("n/a"))
+                           << "}";
+                log_stream << ", owned_slots="
+                           << (snapshot.service
+                                   ? snapshot.service->GetOwnedSlotCount()
+                                   : 0u);
                 LOG(INFO) << log_stream.str();
+                // vsegment/psegment 术语的周期状态行（独立于 Master Admin
+                // Metrics 巨行；enabled=0 时同样输出以显式表达"未启用"）。
+                if (snapshot.service) {
+                    LOG(INFO) << snapshot.service->GetVSegmentStatusLogLine();
+                }
                 if (metric_report_stop_sem_.try_acquire_for(
-                        std::chrono::seconds(kMetricReportIntervalSeconds))) {
+                        std::chrono::seconds(metrics_log_interval_sec_))) {
                     break;
                 }
             }
@@ -377,6 +400,12 @@ void MasterAdminServer::SetServiceAvailable(bool available) {
     }
 }
 
+void MasterAdminServer::SetStandbyCoverageProvider(
+    std::function<std::string()> provider) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    standby_coverage_provider_ = std::move(provider);
+}
+
 MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
     return RuntimeSnapshot{
@@ -384,6 +413,7 @@ MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
         .leader_view = leader_view_,
         .service = service_,
         .service_available = service_available_,
+        .standby_coverage_provider = standby_coverage_provider_,
     };
 }
 
@@ -392,6 +422,8 @@ std::string MasterAdminServer::BuildMetricsText() const {
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
+    metrics = AppendMetricSections(
+        std::move(metrics), vsegment::VSegmentMetrics::Instance().Serialize());
     auto tenant_metrics = BuildTenantQuotaMetricsText();
     if (tenant_metrics.empty()) {
         return metrics;

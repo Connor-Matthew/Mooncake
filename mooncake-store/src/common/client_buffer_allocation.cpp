@@ -1,11 +1,14 @@
 #include "common/client_buffer_allocation.h"
 
+#include "ascii_string.h"
 #include "config.h"
 #include "config/hugepage_config.h"
+#include "integer_parser.h"
 #include "ub_allocator.h"
 
 #include <cstdlib>
 #include <glog/logging.h>
+#include <unordered_set>
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -180,6 +183,26 @@ void free_memory(const std::string &protocol, void *ptr,
     return;
 #endif
     free(ptr);
+}
+
+std::optional<std::vector<int>> try_parse_numa_nodes(
+    const std::string &node_list) {
+    const auto tokens = SplitAsciiList(node_list, ',', /*keep_empty=*/true);
+    if (tokens.empty()) return std::nullopt;
+
+    std::vector<int> nodes;
+    nodes.reserve(tokens.size());
+    std::unordered_set<int> seen;
+    for (const auto &token : tokens) {
+        if (token.empty()) return std::nullopt;
+
+        const auto node = TryParseInteger<int>(token);
+        if (!node || *node < 0 || !seen.insert(*node).second) {
+            return std::nullopt;
+        }
+        nodes.push_back(*node);
+    }
+    return nodes;
 }
 
 }  // namespace mooncake

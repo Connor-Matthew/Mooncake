@@ -125,6 +125,15 @@ ErrorCode BatchOpLogSnapshotGc::Run(
                               weights.crc32c))
                 return ErrorCode::INTERNAL_ERROR;
         }
+        if (manifest->vsegment_partitions) {
+            const auto& vsegments = *manifest->vsegment_partitions;
+            if (vsegments.key !=
+                    ha::BuildBatchOpLogSnapshotVSegmentPartitionsKey(
+                        root_, descriptor->snapshot_id) ||
+                !VerifyObject(store_, vsegments.key, vsegments.stored_size,
+                              vsegments.crc32c))
+                return ErrorCode::INTERNAL_ERROR;
+        }
         protected_prefixes.insert(prefix);
     }
 

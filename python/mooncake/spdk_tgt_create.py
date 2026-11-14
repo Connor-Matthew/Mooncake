@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 # Tool to remotely create SPDK targets on multiple nodes
 # Usage: python3 -m mooncake.spdk_tgt_create --spdk_target_info="ip:192.168.65.56 path:/home/spdk pci:0000:01:00.0,0000:02:00.0" --spdk_target_info="ip:192.168.65.57 path:/home/spdk"
+#
+# Modified By Yida (v6): URMA 大 I/O 部署（ADR-0017，对照 SPDK fork 的
+# target_nvme_takeover.sh）。URMA 数据路径要求单 buffer（iovcnt==1），
+# --max-io-size 超过默认 large_bufsize（135168）时必须重配 iobuf 池：
+#   python3 -m mooncake.spdk_tgt_create --transport-type URMA \
+#     --spdk_target_info="ip:10.0.0.2 path:/home/x/spdk" \
+#     --urma-env SPDK_URMA_DEV_NAME=udmac0d1e2 \
+#     --max-io-size 2097152 --iobuf-options "16384,8192,320,2097152"
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import shlex
 import time
@@ -17,50 +26,182 @@ if TYPE_CHECKING:
     import paramiko
 
 
+def _core_mask_popcount(core_mask: str) -> int:
+    """Modified By Yida (v6): core mask（0x 十六进制或十进制）的置位数。
+
+    解析失败（如 '0-3' 核列表形式）返回 0，调用方据此跳过槽位告警。
+    """
+    try:
+        value = int(str(core_mask), 0)
+        return bin(value).count('1') if value > 0 else 0
+    except ValueError:
+        return 0
+
+
 class SPDKTgtCreator:
     """
     Remotely creates SPDK targets on multiple nodes via SSH.
     """
 
+    # Modified By Yida (v3): 修正 max_io_size / in_capsule_data_size 的默认值
+    # 与 RPC flag 映射。SPDK CLI 中 -c = in_capsule_data_size、-i = max_io_size；
+    # 旧代码 flag 与默认值同时反置（数值上恰好抵消），只改一处都会让实际行为
+    # 变化，因此两处必须一起改：max_io_size=131072(-i)、
+    # in_capsule_data_size=4096(-c)。
     DEFAULT_TRANSPORT_OPTIONS = {
-        "trtype": "RDMA",
-        "max_queue_depth": 128,
-        "max_io_qpairs_per_ctrlr": 127,
-        "max_io_size": 4096,
-        "in_capsule_data_size": 131072,
-        "io_unit_size": 131072,
-        "max_aq_depth": 128,
-        "num_shared_buffers": 4096,
-        "buf_cache_size": 32,
+        'trtype': 'RDMA',
+        'max_queue_depth': 128,
+        'max_io_qpairs_per_ctrlr': 127,
+        'max_io_size': 131072,
+        'in_capsule_data_size': 4096,
+        'io_unit_size': 131072,
+        'max_aq_depth': 128,
+        'num_shared_buffers': 4096,
+        'buf_cache_size': 32,
     }
 
     TRANSPORT_RPC_FLAGS = {
-        "trtype": "-t",
-        "max_queue_depth": "-q",
-        "max_io_qpairs_per_ctrlr": "-m",
-        "max_io_size": "-c",
-        "in_capsule_data_size": "-i",
-        "io_unit_size": "-u",
-        "max_aq_depth": "-a",
-        "num_shared_buffers": "-n",
-        "buf_cache_size": "-b",
+        'trtype': '-t',
+        'max_queue_depth': '-q',
+        'max_io_qpairs_per_ctrlr': '-m',
+        'max_io_size': '-i',
+        'in_capsule_data_size': '-c',
+        'io_unit_size': '-u',
+        'max_aq_depth': '-a',
+        'num_shared_buffers': '-n',
+        'buf_cache_size': '-b',
     }
 
-    def __init__(
-        self,
-        spdk_targets: List[str],
-        transport_options: Dict[str, Any] = None,
-        core_mask: str = "0xff",
-        port: int = 22,
-    ):
+    # Modified By Yida (v3): nvmf_tgt 进程必须携带的 URMA 环境变量。
+    # 注意这些变量必须出现在 nvmf_tgt 进程环境中——只在调用 rpc.py 的
+    # shell 中设置没有作用。包含 JETTY_COUNT（SPDK nvme/nvmf 侧都会读取，
+    # 旧列表遗漏）。MC_URMA_* 为兼容别名，同样转发。
+    URMA_ENV_VARS = (
+        'SPDK_URMA_DEV_NAME',
+        'SPDK_URMA_EID_INDEX',
+        'SPDK_URMA_TRANS_MODE',
+        'SPDK_URMA_ACTIVE_PORT',
+        'SPDK_URMA_BONDING_BALANCE',
+        'SPDK_URMA_BONDING_MULTIPATH_ENABLE',
+        'SPDK_URMA_JFC_COUNT',
+        'SPDK_URMA_JFC_DEPTH',
+        'SPDK_URMA_JETTY_COUNT',
+        'SPDK_URMA_JETTY_DEPTH',
+        'SPDK_URMA_MAX_IO_SIZE',
+    )
+
+    # Modified By Yida (v6): ADR-0017 大 I/O 部署经验。URMA 数据路径要求单
+    # buffer（iovcnt==1），max_io_size 超过默认 large_bufsize 后必须重配
+    # iobuf 池：nvmf_tgt 以 --wait-for-rpc 启动，startup 窗口内
+    # iobuf_set_options 配好池子再 framework_start_init（iobuf_set_options
+    # 仅 SPDK_RPC_STARTUP 可调）。
+    DEFAULT_LARGE_BUFSIZE = 135168  # lib/thread/iobuf.c 默认 large bufsize
+    IOBUF_MIN = {
+        'small_count': 64,      # IOBUF_MIN_SMALL_POOL_SIZE
+        'large_count': 8,       # IOBUF_MIN_LARGE_POOL_SIZE
+        'small_bufsize': 4096,  # IOBUF_MIN_SMALL_BUFSIZE
+        'large_bufsize': 8192,  # IOBUF_MIN_LARGE_BUFSIZE
+    }
+    # 自定义 iobuf 池时 nvmf_create_transport 的每 PG 缓存压制值。默认"自动
+    # 吃大池一半再按已有 PG 数均分"（transport.c:640），首个 PG 独吞 pool/2，
+    # 叠加每核 bdev(16)+accel(16) 个 large 预占后，add_ns 建通道时池子必被
+    # 抽干（populate 0/16，ADR-0017 问题 1）。large 缓存下限：必须 >= 每 PG
+    # 峰值并发，否则 target 注册缓存（128 个、只进不出）命中率崩塌。
+    IOBUF_LARGE_CACHE_DEFAULT = 32
+    IOBUF_SMALL_CACHE_DEFAULT = 1024
+
+    def __init__(self, spdk_targets: List[str], transport_options: Dict[str, Any] = None, core_mask: str = '0xff', port: int = 22, urma_env: Dict[str, str] = None, iobuf_options: Optional[str] = None, iobuf_large_cache_size: Optional[int] = None):
         self.spdk_targets = spdk_targets
         self.core_mask = core_mask
         self.port = port
         self.transport_options = dict(self.DEFAULT_TRANSPORT_OPTIONS)
         if transport_options:
             self.transport_options.update(transport_options)
+        self.urma_env = self._collect_urma_env(urma_env)
+        # Modified By Yida (v6): iobuf 池四元组（小池数量,小池buf,大池数量,大池buf）
+        self.iobuf = self._parse_iobuf_options(iobuf_options)
+        self.iobuf_large_cache_size = iobuf_large_cache_size
+        if self.iobuf and self.iobuf_large_cache_size is None:
+            self.iobuf_large_cache_size = self.IOBUF_LARGE_CACHE_DEFAULT
         self._setup_logging()
         self.target_configs = self._parse_spdk_targets()
+        self._validate_large_io_config()
+
+    def _collect_urma_env(self, explicit: Optional[Dict[str, str]]) -> Dict[str, str]:
+        """收集要注入 nvmf_tgt 进程的 URMA 环境变量。
+
+        来源优先级（后者覆盖前者）：
+        1. 调用 shell 中已设置的 SPDK_URMA_* / MC_URMA_* 变量（自动转发）
+        2. --urma-env NAME=VALUE 显式指定
+        """
+        env: Dict[str, str] = {}
+        for name, value in os.environ.items():
+            if name.startswith('SPDK_URMA_') or name.startswith('MC_URMA_'):
+                env[name] = value
+        if explicit:
+            env.update(explicit)
+        return env
+
+    def _parse_iobuf_options(self, spec: Optional[str]) -> Optional[Dict[str, int]]:
+        """Modified By Yida (v6): 解析 iobuf 池四元组并校验 iobuf.c 下限。"""
+        if not spec:
+            return None
+        parts = [p.strip() for p in spec.split(',')]
+        if len(parts) != 4:
+            raise ValueError(
+                f"Invalid --iobuf-options: {spec!r} (expected "
+                "'small_count,small_bufsize,large_count,large_bufsize')")
+        try:
+            keys = ('small_count', 'small_bufsize', 'large_count', 'large_bufsize')
+            iobuf = {k: int(v) for k, v in zip(keys, parts)}
+        except ValueError:
+            raise ValueError(
+                f"Invalid --iobuf-options: {spec!r} (values must be integers)")
+        for key, minimum in self.IOBUF_MIN.items():
+            if iobuf[key] < minimum:
+                raise ValueError(
+                    f"iobuf {key}={iobuf[key]} below minimum {minimum} "
+                    "(lib/thread/iobuf.c)")
+        return iobuf
+
+    def _validate_large_io_config(self) -> None:
+        """Modified By Yida (v6): 大 I/O 与 iobuf 池的配置校验（ADR-0017）。"""
+        if self.iobuf is None:
+            if (str(self.transport_options.get('trtype', '')).upper() == 'URMA'
+                    and self.transport_options.get('max_io_size', 0) > self.DEFAULT_LARGE_BUFSIZE):
+                raise ValueError(
+                    f"URMA max_io_size={self.transport_options['max_io_size']} exceeds "
+                    f"the default large_bufsize ({self.DEFAULT_LARGE_BUFSIZE}); URMA "
+                    "requires a single data buffer (iovcnt==1). Pass --iobuf-options, "
+                    f"e.g. \"16384,8192,320,{self.transport_options['max_io_size']}\"")
+            return
+        if self.iobuf['large_bufsize'] < self.transport_options.get('max_io_size', 0):
+            raise ValueError(
+                f"iobuf large_bufsize={self.iobuf['large_bufsize']} < max_io_size="
+                f"{self.transport_options['max_io_size']}: URMA data path requires a "
+                "single buffer (iovcnt==1); raise the 4th field of --iobuf-options")
+
+        # 槽位账按"每核固定预占"算，不是字节账（ADR-0017 问题 5）
+        ncore = _core_mask_popcount(self.core_mask)
+        if ncore <= 0:
+            return
+        large_eager = ncore * (32 + (self.iobuf_large_cache_size
+                                     or self.IOBUF_LARGE_CACHE_DEFAULT))
+        if self.iobuf['large_count'] <= large_eager:
+            self.logger.warning(
+                "large pool %d cannot cover per-core fixed reservation: cores=%d x "
+                "(32 bdev/accel + %d PG cache) = %d; startup/add_ns will fail with "
+                "'populate 0/16'. Lower --iobuf-large-cache-size or raise the 3rd "
+                "field of --iobuf-options",
+                self.iobuf['large_count'], ncore, self.iobuf_large_cache_size,
+                large_eager)
+        small_eager = ncore * 1280
+        if self.iobuf['small_count'] <= small_eager:
+            self.logger.warning(
+                "small pool %d cannot cover per-core fixed reservation: cores=%d x "
+                "1280 (bdev 128 + accel 128 + PG 1024); raise the 1st field of "
+                "--iobuf-options (e.g. 16384)",
+                self.iobuf['small_count'], ncore)
 
     def _setup_logging(self):
         logging.basicConfig(
@@ -333,7 +474,7 @@ done""",
         self.logger.info(f"PCI devices available to SPDK: {', '.join(ready_devices)}")
         return ready_devices
 
-    def _start_spdk_tgt(self, ssh: paramiko.SSHClient, spdk_path: str) -> None:
+    def _start_spdk_tgt(self, ssh: paramiko.SSHClient, spdk_path: str, wait_for_rpc: bool = False) -> None:
         """
         Start the SPDK NVMF target service in the background.
         """
@@ -350,16 +491,68 @@ done""",
         self.logger.info(f"Starting SPDK tgt service with core mask {self.core_mask}")
         tgt_binary = f"{spdk_path}/build/bin/nvmf_tgt"
         log_file = f"{spdk_path}/tgt.log"
+        # Modified By Yida (v3): URMA 环境变量必须出现在 nvmf_tgt 进程环境中。
+        # 通过 `env KEY=VALUE` 前缀注入 nohup 启动的进程；未设置任何 URMA
+        # 变量时不改变原有启动方式。
+        env_prefix = ''
+        if self.urma_env:
+            env_kv = ' '.join(
+                f'{shlex.quote(name)}={shlex.quote(str(value))}'
+                for name, value in sorted(self.urma_env.items()))
+            env_prefix = f'env {env_kv} '
+            self.logger.info(
+                "Passing URMA env to nvmf_tgt: %s",
+                ', '.join(sorted(self.urma_env)))
+        # Modified By Yida (v6): 配 iobuf 池需要 startup 窗口
+        # （iobuf_set_options 仅 SPDK_RPC_STARTUP 可调），以 --wait-for-rpc
+        # 启动，RPC 配完池子后由 _configure_iobuf 调 framework_start_init。
+        wait_flag = '--wait-for-rpc ' if wait_for_rpc else ''
         self._execute_command(
             ssh,
-            f"nohup {tgt_binary} -m {shlex.quote(self.core_mask)} > {log_file} 2>&1 &",
-            timeout=None,
+            f"nohup {env_prefix}{tgt_binary} {wait_flag}-m {shlex.quote(self.core_mask)} > {log_file} 2>&1 &",
+            timeout=None
         )
         time.sleep(3)  # Give it time to start
 
-    def _setup_spdk(
-        self, ssh: paramiko.SSHClient, spdk_path: str, pci_devices: List[str]
-    ) -> None:
+    def _wait_for_rpc_ready(self, ssh: paramiko.SSHClient, spdk_path: str, timeout_sec: int = 30) -> None:
+        """Modified By Yida (v6): 轮询 rpc_get_methods 直到 RPC 就绪。
+
+        对照 target_nvme_takeover.sh 的就绪判定；替代原来盲目 sleep(3)
+        后直接下发 RPC 的方式（--wait-for-rpc 启动时 RPC 就绪更晚）。
+        """
+        rpc_script = f"{spdk_path}/scripts/rpc.py"
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            try:
+                self._execute_command(ssh, f"{rpc_script} rpc_get_methods",
+                                      log_errors=False, timeout=10)
+                return
+            except RuntimeError:
+                time.sleep(0.5)
+        raise RuntimeError(f"SPDK RPC not ready within {timeout_sec}s")
+
+    def _configure_iobuf(self, ssh: paramiko.SSHClient, spdk_path: str) -> None:
+        """Modified By Yida (v6): startup 窗口内配置 iobuf 池并启动 framework。
+
+        仅在 nvmf_tgt 以 --wait-for-rpc 启动后可用；framework_start_init
+        之后其余 RPC（bdev/transport/subsystem）按原顺序下发。
+        """
+        rpc_script = f"{spdk_path}/scripts/rpc.py"
+        ib = self.iobuf
+        self.logger.info(
+            "Configuring iobuf pools: small %dx%d B, large %dx%d B",
+            ib['small_count'], ib['small_bufsize'],
+            ib['large_count'], ib['large_bufsize'])
+        self._execute_command(
+            ssh,
+            f"{rpc_script} iobuf_set_options "
+            f"--small-pool-count {ib['small_count']} "
+            f"--small-bufsize {ib['small_bufsize']} "
+            f"--large-pool-count {ib['large_count']} "
+            f"--large-bufsize {ib['large_bufsize']}")
+        self._execute_command(ssh, f"{rpc_script} framework_start_init")
+
+    def _setup_spdk(self, ssh: paramiko.SSHClient, spdk_path: str, pci_devices: List[str]) -> None:
         """
         Setup SPDK with the specified PCI devices.
         """
@@ -387,9 +580,14 @@ done""",
         self.logger.info(f"Creating {self.transport_options['trtype']} transport")
         rpc_script = f"{spdk_path}/scripts/rpc.py"
         transport_options = self._format_transport_options()
-        self._execute_command(
-            ssh, f"{rpc_script} nvmf_create_transport {transport_options}"
-        )
+        if self.iobuf:
+            # Modified By Yida (v6): 自定义 iobuf 池时显式压小每 PG 缓存——
+            # 默认自动策略会让首个 PG 独吞大池一半，add_ns 报 populate 0/16
+            # （ADR-0017 问题 1）。large 缓存必须 >= 每 PG 峰值并发。
+            transport_options += (
+                f" --iobuf-large-cache-size {self.iobuf_large_cache_size}"
+                f" --iobuf-small-cache-size {self.IOBUF_SMALL_CACHE_DEFAULT}")
+        self._execute_command(ssh, f"{rpc_script} nvmf_create_transport {transport_options}")
 
     def _create_bdevs(
         self, ssh: paramiko.SSHClient, spdk_path: str, pci_devices: List[str]
@@ -487,7 +685,12 @@ done""",
                 )
 
                 # Start tgt service
-                self._start_spdk_tgt(ssh, spdk_path)
+                # Modified By Yida (v6): 需要配 iobuf 池时以 --wait-for-rpc
+                # 启动，在 startup 窗口内先配池子再 framework_start_init
+                self._start_spdk_tgt(ssh, spdk_path, wait_for_rpc=bool(self.iobuf))
+                self._wait_for_rpc_ready(ssh, spdk_path)
+                if self.iobuf:
+                    self._configure_iobuf(ssh, spdk_path)
 
                 # Create transport
                 self._create_transport(ssh, spdk_path)
@@ -544,77 +747,59 @@ def parse_arguments():
         ),
         required=True,
     )
-    parser.add_argument(
-        "--core-mask",
-        type=str,
-        default="0xff",
-        help="CPU core mask used to start nvmf_tgt with -m (default: 0xff)",
-    )
-    parser.add_argument(
-        "--transport-type",
-        type=str,
-        default="RDMA",
-        help="NVMe-oF transport type for nvmf_create_transport (default: RDMA)",
-    )
-    parser.add_argument(
-        "--max-queue-depth",
-        type=int,
-        default=128,
-        help="Max number of outstanding I/O per queue (default: 128)",
-    )
-    parser.add_argument(
-        "--max-io-qpairs-per-ctrlr",
-        type=int,
-        default=127,
-        help="Max number of I/O qpairs per controller (default: 127)",
-    )
-    parser.add_argument(
-        "--max-io-size",
-        type=int,
-        default=4096,
-        help="Max I/O size in bytes (default: 4096)",
-    )
-    parser.add_argument(
-        "--in-capsule-data-size",
-        type=int,
-        default=131072,
-        help="Max in-capsule data size in bytes (default: 131072)",
-    )
-    parser.add_argument(
-        "--io-unit-size",
-        type=int,
-        default=131072,
-        help="I/O unit size in bytes (default: 131072)",
-    )
-    parser.add_argument(
-        "--max-aq-depth",
-        type=int,
-        default=128,
-        help="Max number of admin commands per admin queue (default: 128)",
-    )
-    parser.add_argument(
-        "--num-shared-buffers",
-        type=int,
-        default=4096,
-        help="Number of pooled data buffers available to the transport (default: 4096)",
-    )
-    parser.add_argument(
-        "--buf-cache-size",
-        type=int,
-        default=32,
-        help="Number of shared buffers reserved for each poll group (default: 32)",
-    )
-    parser.add_argument(
-        "--username",
-        type=str,
-        default="root",
-        help="SSH username for target nodes (default: root)",
-    )
-    parser.add_argument(
-        "--port", type=int, default=22, help="SSH port for target nodes (default: 22)"
-    )
-    parser.add_argument("--password", type=str, help="SSH password for target nodes")
-    parser.add_argument("--key-file", type=str, help="SSH private key file path")
+    parser.add_argument('--core-mask', type=str, default='0xff',
+                        help='CPU core mask used to start nvmf_tgt with -m (default: 0xff)')
+    parser.add_argument('--transport-type', type=str, default='RDMA',
+                        choices=['RDMA', 'TCP', 'URMA'],
+                        help='NVMe-oF transport type for nvmf_create_transport (default: RDMA)')
+    parser.add_argument('--max-queue-depth', type=int, default=128,
+                        help='Max number of outstanding I/O per queue (default: 128)')
+    parser.add_argument('--max-io-qpairs-per-ctrlr', type=int, default=127,
+                        help='Max number of I/O qpairs per controller (default: 127)')
+    # Modified By Yida (v3): 默认值与 SPDK 语义对齐（max_io_size=131072，
+    # in_capsule_data_size=4096），与 DEFAULT_TRANSPORT_OPTIONS 保持一致
+    parser.add_argument('--max-io-size', type=int, default=131072,
+                        help='Max I/O size in bytes (default: 131072)')
+    parser.add_argument('--in-capsule-data-size', type=int, default=4096,
+                        help='Max in-capsule data size in bytes (default: 4096)')
+    parser.add_argument('--io-unit-size', type=int, default=131072,
+                        help='I/O unit size in bytes (default: 131072)')
+    parser.add_argument('--max-aq-depth', type=int, default=128,
+                        help='Max number of admin commands per admin queue (default: 128)')
+    parser.add_argument('--num-shared-buffers', type=int, default=4096,
+                        help='Number of pooled data buffers available to the transport (default: 4096)')
+    parser.add_argument('--buf-cache-size', type=int, default=32,
+                        help='Number of shared buffers reserved for each poll group (default: 32)')
+    parser.add_argument('--username', type=str, default='root',
+                        help='SSH username for target nodes (default: root)')
+    parser.add_argument('--password', type=str,
+                        help='SSH password for target nodes')
+    parser.add_argument('--key-file', type=str,
+                        help='SSH private key file path')
+    # Modified By Yida (v3): 显式传入 nvmf_tgt 的 URMA 环境变量（可重复）。
+    # 调用 shell 中已设置的 SPDK_URMA_* / MC_URMA_* 变量也会自动转发。
+    parser.add_argument('--urma-env', action='append', default=None,
+                        metavar='NAME=VALUE',
+                        help='URMA environment variable to pass to nvmf_tgt, '
+                             'e.g. --urma-env SPDK_URMA_DEV_NAME=udmac0d1e2 '
+                             '(repeatable; SPDK_URMA_*/MC_URMA_* vars from the '
+                             'invoking shell are forwarded automatically)')
+    # Modified By Yida (v6): 大 I/O 部署（ADR-0017）。URMA 数据路径要求单
+    # buffer（iovcnt==1），--max-io-size 超过默认 large_bufsize（135168）时
+    # 必须重配 iobuf 池（nvmf_tgt 以 --wait-for-rpc 启动）
+    parser.add_argument('--iobuf-options', type=str, default=None,
+                        metavar='SMALL_COUNT,SMALL_BUF,LARGE_COUNT,LARGE_BUF',
+                        help='iobuf pool four-tuple passed to iobuf_set_options '
+                             'in the STARTUP window (starts nvmf_tgt with '
+                             '--wait-for-rpc). Required for URMA max-io-size > '
+                             '135168, e.g. "16384,8192,320,2097152"')
+    parser.add_argument('--iobuf-large-cache-size', type=int, default=None,
+                        help='Per-poll-group large iobuf cache for '
+                             'nvmf_create_transport (default: 32 when '
+                             '--iobuf-options is set). Must stay >= per-PG peak '
+                             'concurrency, or the target-side URMA registration '
+                             'cache hit rate collapses (ADR-0017 problem 3)')
+    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
     return parser.parse_args()
 
 
@@ -632,13 +817,20 @@ def main():
         "buf_cache_size": args.buf_cache_size,
     }
 
+    # Modified By Yida (v3): 收集显式指定的 URMA 环境变量
+    urma_env = {}
+    for item in (args.urma_env or []):
+        if '=' in item:
+            name, value = item.split('=', 1)
+            urma_env[name.strip()] = value.strip()
+        else:
+            logging.warning(f"Ignoring invalid --urma-env entry (expected NAME=VALUE): {item}")
+
     try:
-        creator = SPDKTgtCreator(
-            args.spdk_target_info,
-            transport_options,
-            args.core_mask,
-            args.port,
-        )
+        creator = SPDKTgtCreator(args.spdk_target_info, transport_options, args.core_mask,
+                                 port=args.port, urma_env=urma_env,
+                                 iobuf_options=args.iobuf_options,
+                                 iobuf_large_cache_size=args.iobuf_large_cache_size)
         success = creator.deploy_all_targets()
         exit(0 if success else 1)
     except Exception as e:

@@ -32,6 +32,25 @@ class SpdkInitiator : public NVMeoFInitiator {
     ErrorCode UnregisterMemory(void* ptr) override;
     NofCapabilities GetCapabilities() const override;
 
+    // Multi-qpair lanes (MC_NOF_QPAIRS_PER_SEGMENT). Lanes beyond lane 0 are
+    // allocated on the first GetLaneCount/GetLane call for a segment, so
+    // probe-only users (master heartbeat) never pay for them.
+    size_t GetLaneCount(const NofSegmentHandle* segment) const override;
+    NofSegmentHandle* GetLane(NofSegmentHandle* segment,
+                              size_t index) override;
+    bool IsLaneHealthy(const NofSegmentHandle* lane) const override;
+    void MarkLaneFailed(NofSegmentHandle* lane) override;
+    void ReleaseFailedLane(NofSegmentHandle* lane) override;
+
+    // GPU Direct; device memory is only supported in USE_NOF_URMA builds.
+    NofBufferInfo ResolveBuffer(void* ptr, size_t length) override;
+    int SubmitIOWithBuffer(NofSegmentHandle* handle, void* buffer,
+                           uint64_t byte_offset, uint64_t byte_length,
+                           NofIOOp op, NofIOAdaptor* adaptor,
+                           const NofBufferInfo& buffer_info) override;
+    std::shared_ptr<void> RegisterMemoryForEndpoint(
+        const std::string& transport_str, void* ptr, size_t size) override;
+
    private:
     class Impl;
     std::unique_ptr<Impl> impl_;

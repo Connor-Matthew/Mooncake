@@ -106,6 +106,7 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     const bool has_weight_state =
         capture.weight_metadata != WeightMetadataSnapshot{} ||
         capture.object_storage.target.has_value();
+    const bool has_vsegment_state = !capture.vsegment_partitions.empty();
     if (has_weight_state) {
         manifest.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
         manifest.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
@@ -113,6 +114,11 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     if (capture.object_storage.target) {
         manifest.schema_version = ha::kBatchOpLogObjectSnapshotSchemaVersion;
         manifest.snapshot_format = ha::kBatchOpLogObjectSnapshotFormat;
+    }
+    if (has_vsegment_state) {
+        // v4 is a superset of v3: weight and object sections stay optional.
+        manifest.schema_version = ha::kBatchOpLogVSegmentSnapshotSchemaVersion;
+        manifest.snapshot_format = ha::kBatchOpLogVSegmentSnapshotFormat;
     }
     manifest.snapshot_id = snapshot_id;
     manifest.last_included_seq = capture.last_included_seq;
@@ -167,6 +173,26 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
             return fail("Failed to upload object storage state: " +
                         upload.error());
     }
+
+    if (has_vsegment_state) {
+        const std::string vsegments_key =
+            ha::BuildBatchOpLogSnapshotVSegmentPartitionsKey(snapshot_root,
+                                                             snapshot_id);
+        auto vsegments = EncodeBatchOpLogSnapshotVSegmentPartitions(
+            capture.vsegment_partitions);
+        manifest.vsegment_partitions = ha::BatchOpLogSnapshotObjectDescriptor{
+            .key = vsegments_key,
+            .stored_size = vsegments.size(),
+            .crc32c = Crc32cValue(vsegments.data(), vsegments.size()),
+        };
+        upload = object_store_.UploadBuffer(vsegments_key, vsegments);
+        if (!upload) {
+            return fail("Failed to upload snapshot vsegment partitions: " +
+                        upload.error());
+        }
+        std::vector<uint8_t>().swap(vsegments);
+    }
+
     uint64_t chunk_index = 0;
     while (!capture.done()) {
         std::vector<StandbyObjectEntry> objects;
@@ -216,6 +242,15 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
         verify = VerifyObject(object_store_, manifest.weight_metadata->key,
                               manifest.weight_metadata->stored_size,
                               manifest.weight_metadata->crc32c);
+        if (!verify) {
+            return fail(std::move(verify.error()));
+        }
+    }
+    if (manifest.vsegment_partitions) {
+        verify = VerifyObject(object_store_,
+                              manifest.vsegment_partitions->key,
+                              manifest.vsegment_partitions->stored_size,
+                              manifest.vsegment_partitions->crc32c);
         if (!verify) {
             return fail(std::move(verify.error()));
         }
@@ -282,6 +317,9 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
                                       : 0) +
             (manifest.object_storage ? manifest.object_storage->stored_size
                                      : 0) +
+            (manifest.vsegment_partitions
+                 ? manifest.vsegment_partitions->stored_size
+                 : 0) +
             manifest_json.size() + descriptor_json.size();
     });
     return metric_timer.Success(descriptor_json);

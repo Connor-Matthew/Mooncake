@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
+#include <set>
 #include <thread>
 
 #include "ha/kv/ha_kv_backend_factory.h"
@@ -13,8 +15,23 @@
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
+#include "vsegment/vsegment_ha.h"
 
 namespace mooncake {
+
+namespace {
+
+HotStandbyService::VSegmentStateMap ToVSegmentStateMap(
+    std::vector<vsegment::PartitionVSegmentSnapshot> partitions) {
+    HotStandbyService::VSegmentStateMap states;
+    for (auto& partition : partitions) {
+        std::string id = partition.partition_id;
+        states[std::move(id)] = std::move(partition);
+    }
+    return states;
+}
+
+}  // namespace
 
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     : config_(config) {
@@ -64,6 +81,15 @@ HotStandbyService::~HotStandbyService() {
 ErrorCode HotStandbyService::Start(const std::string& primary_address,
                                    const std::string& oplog_endpoints,
                                    const std::string& cluster_id) {
+    // Single-leader standby: one unpartitioned source (main's layout).
+    return Start(ha::MasterSources{ha::MasterSource{std::string(),
+                                                    primary_address}},
+                 oplog_endpoints, cluster_id);
+}
+
+ErrorCode HotStandbyService::Start(const std::vector<ha::MasterSource>& sources,
+                                   const std::string& oplog_endpoints,
+                                   const std::string& cluster_id) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // Use state machine to check if already running
@@ -87,6 +113,7 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     }
     const bool preserve_baseline = preserve_promotion_baseline_;
     batch_standby_reader_.reset();
+    sources_.clear();
     if (!preserve_baseline) {
         batch_standby_kv_backend_.reset();
         batch_snapshot_baseline_.reset();
@@ -114,7 +141,12 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
             config_.enable_snapshot_bootstrap &&
             batch_oplog_snapshot_provider_ != nullptr);
     }
-    config_.primary_address = primary_address;
+    config_.sources = sources;
+    config_.primary_address =
+        sources.empty() ? std::string() : sources.front().address;
+    // Partitioned (per-master) streams exist only in multi-submaster
+    // clusters; see ha::OpLogSourceId.
+    multi_source_ = !sources.empty() && !ha::IsUnpartitionedSingleSource(sources);
     oplog_endpoints_ = oplog_endpoints;
     cluster_id_ = cluster_id;
 
@@ -161,6 +193,17 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
 }
 
 uint64_t HotStandbyService::GetLocalLastAppliedSequenceIdLocked() const {
+    if (multi_source_) {
+        // Sources have independent sequence spaces; report the furthest.
+        uint64_t max_applied = 0;
+        for (const auto& [source_id, replica] : sources_) {
+            const uint64_t expected = replica.applier->GetExpectedSequenceId();
+            max_applied =
+                std::max<uint64_t>(max_applied, expected > 0 ? expected - 1 : 0);
+        }
+        return max_applied > 0 ? max_applied
+                               : applied_seq_id_.load(std::memory_order_acquire);
+    }
     if (oplog_applier_) {
         uint64_t expected = oplog_applier_->GetExpectedSequenceId();
         return expected > 0 ? expected - 1 : 0;
@@ -170,6 +213,15 @@ uint64_t HotStandbyService::GetLocalLastAppliedSequenceIdLocked() const {
 
 ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
     uint64_t& baseline_seq_id) {
+    if (multi_source_) {
+        // No batch snapshot or compaction for partitioned streams: every
+        // source replays from its beginning onto the (possibly already
+        // populated) shared store, as in SP930. Replays are idempotent for
+        // object puts/removes and VSegment full checkpoints.
+        preserve_promotion_baseline_ = false;
+        baseline_seq_id = 0;
+        return ErrorCode::OK;
+    }
     const uint64_t local_last_seq_id = GetLocalLastAppliedSequenceIdLocked();
     const bool has_local_metadata =
         metadata_store_ && metadata_store_->GetKeyCount() > 0;
@@ -237,6 +289,7 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     uint64_t& baseline_seq_id) {
     baseline_seq_id = 0;
     metadata_store_->Clear();
+    ResetVSegmentPartitions({});
     oplog_applier_->Recover(0);
     return ErrorCode::OK;
 }
@@ -261,6 +314,7 @@ ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
     // running reader/applier starts from that proven final sequence.
     metadata_store_ = std::move(temporary_metadata);
     oplog_applier_ = std::move(temporary_applier);
+    ResetVSegmentPartitions(std::move(restored->vsegment_partitions));
     baseline_seq_id = oplog_applier_->GetExpectedSequenceId() - 1;
     batch_snapshot_baseline_ =
         DurablePrefix{.batch_id = restored->last_applied_batch_id,
@@ -286,6 +340,31 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
         LOG(ERROR) << "Batch-record OpLog backend was not opened";
         return ErrorCode::INTERNAL_ERROR;
     }
+    if (multi_source_) {
+        for (const auto& source : config_.sources) {
+            auto applier = std::make_unique<OpLogApplier>(metadata_store_.get(),
+                                                          cluster_id_);
+            InstallVSegmentHandler(*applier);
+            auto reader = std::make_unique<OpLogBatchStandbyReader>(
+                cluster_id_, *batch_standby_kv_backend_, *applier,
+                source.master_id);
+            sources_.emplace(source.master_id,
+                             SourceReplica{std::move(applier), std::move(reader)});
+        }
+        state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
+        replication_loop_running_.store(true, std::memory_order_release);
+        replication_thread_ =
+            std::thread(&HotStandbyService::ReplicationLoop, this);
+        if (config_.enable_verification) {
+            verification_thread_ =
+                std::thread(&HotStandbyService::VerificationLoop, this);
+        }
+        LOG(INFO) << "HotStandbyService started (multi-source), cluster="
+                  << cluster_id_ << ", sources=" << sources_.size()
+                  << ", state=" << StandbyStateToString(GetState());
+        return ErrorCode::OK;
+    }
+    InstallVSegmentHandler(*oplog_applier_);
     batch_standby_reader_ = std::make_unique<OpLogBatchStandbyReader>(
         cluster_id_, *batch_standby_kv_backend_, *oplog_applier_);
     if (batch_snapshot_baseline_) {
@@ -530,11 +609,39 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
 
 ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
     HaKvBackend& backend, PromotionCatchUpPolicy policy) {
+    if (!multi_source_) {
+        return CatchUpSourceLocked(backend, *oplog_applier_,
+                                   batch_standby_reader_.get(), std::string(),
+                                   policy);
+    }
+    // Each partitioned stream must be fully caught up; main's policy (and
+    // its deadline) applies per source.
+    for (auto& [source_id, replica] : sources_) {
+        const ErrorCode error =
+            CatchUpSourceLocked(backend, *replica.applier,
+                                replica.reader.get(), source_id, policy);
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "Final OpLog catch-up failed for source="
+                       << source_id << ", err=" << toString(error);
+            return error;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode HotStandbyService::CatchUpSourceLocked(
+    HaKvBackend& backend, OpLogApplier& applier,
+    OpLogBatchStandbyReader* source_reader, const std::string& source_id,
+    PromotionCatchUpPolicy policy) {
+    auto applied_seq = [&applier] {
+        const uint64_t expected = applier.GetExpectedSequenceId();
+        return expected > 0 ? expected - 1 : 0;
+    };
     std::unique_ptr<OpLogBatchStandbyReader> local_reader;
-    OpLogBatchStandbyReader* reader = batch_standby_reader_.get();
+    OpLogBatchStandbyReader* reader = source_reader;
     if (reader == nullptr) {
         local_reader = std::make_unique<OpLogBatchStandbyReader>(
-            cluster_id_, backend, *oplog_applier_);
+            cluster_id_, backend, applier, source_id);
         reader = local_reader.get();
     }
     const auto initial_retry_delay =
@@ -568,10 +675,10 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
             return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         }
         const uint64_t expected_before =
-            oplog_applier_->GetExpectedSequenceId();
+            applier.GetExpectedSequenceId();
         const auto cursor_before = reader->GetLastAppliedDurablePrefix();
         auto result = reader->PollOnce();
-        const uint64_t expected_after = oplog_applier_->GetExpectedSequenceId();
+        const uint64_t expected_after = applier.GetExpectedSequenceId();
         const auto cursor_after = reader->GetLastAppliedDurablePrefix();
         const bool made_progress =
             expected_after > expected_before || cursor_after != cursor_before;
@@ -591,11 +698,11 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
             continue;
         }
         if (!result.durable_prefix_present) {
-            return GetLocalLastAppliedSequenceIdLocked() == 0
+            return applied_seq() == 0
                        ? ErrorCode::OK
                        : ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         }
-        if (GetLocalLastAppliedSequenceIdLocked() >=
+        if (applied_seq() >=
             result.durable_prefix.last_seq) {
             return ErrorCode::OK;
         }
@@ -785,11 +892,8 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
         out.weight_metadata = WeightMetadataSnapshot{};
         out.object_storage = ObjectReplicaSnapshot{};
     }
-    if (oplog_applier_) {
-        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
-    } else {
-        out.segments.clear();
-    }
+    out.segments = CollectSegmentsLocked();
+    CollectVSegmentPartitions(out.vsegment_partitions);
 
     lock.unlock();
     Stop();
@@ -875,6 +979,7 @@ HotStandbyService::PromoteAndDetachBatchOpLogStore() {
         .producer_view_version = producer_view_version,
         .max_replica_id = max_replica_id,
     };
+    CollectVSegmentPartitions(handoff.vsegment_partitions);
     batch_standby_reader_.reset();
     oplog_applier_.reset();
 
@@ -917,12 +1022,7 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
     }
 
     // Get applied sequence ID (inline to avoid recursive mutex lock)
-    if (oplog_applier_) {
-        uint64_t expected_seq = oplog_applier_->GetExpectedSequenceId();
-        out.oplog_sequence_id = expected_seq > 0 ? expected_seq - 1 : 0;
-    } else {
-        out.oplog_sequence_id = applied_seq_id_.load();
-    }
+    out.oplog_sequence_id = GetLocalLastAppliedSequenceIdLocked();
 
     // Export object metadata
     if (metadata_store_) {
@@ -935,12 +1035,9 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
         out.object_storage = ObjectReplicaSnapshot{};
     }
 
-    // Export segments from OpLogApplier's registry (Patch B)
-    if (oplog_applier_) {
-        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
-    } else {
-        out.segments.clear();
-    }
+    // Export segments from the applier registries (Patch B)
+    out.segments = CollectSegmentsLocked();
+    CollectVSegmentPartitions(out.vsegment_partitions);
 
     return true;
 }
@@ -1028,6 +1125,9 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
             state);
         capture.weight_metadata = metadata_store_->SnapshotWeightMetadata();
         capture.object_storage = metadata_store_->SnapshotObjectReplicas();
+        // Same consistent point: the replication loop is parked here, so no
+        // VSegment record is applied concurrently.
+        CollectVSegmentPartitions(capture.vsegment_partitions);
         ready_snapshot_capture_ = std::move(capture);
         state->active = true;
     }
@@ -1109,6 +1209,21 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
             return !replication_loop_running_.load(std::memory_order_acquire);
         });
     if (!restored) return restored.error();
+    // VSegment state is rebuilt alongside the candidate store and swapped in
+    // atomically with it; the live map is untouched if this attempt fails.
+    VSegmentStateMap rebootstrap_vsegments =
+        ToVSegmentStateMap(std::move(restored->vsegment_partitions));
+    applier->SetVSegmentStateHandler([&rebootstrap_vsegments](
+                                         const OpLogEntry& entry) {
+        std::string detail;
+        const ErrorCode error = vsegment::ApplyVSegmentStateEntry(
+            entry, rebootstrap_vsegments, &detail);
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "Rebootstrap rejected vsegment record seq="
+                       << entry.sequence_id << ": " << detail;
+        }
+        return error == ErrorCode::OK;
+    });
     auto reader = std::make_unique<OpLogBatchStandbyReader>(
         cluster_id_, *batch_standby_kv_backend_, *applier);
     const DurablePrefix baseline{.batch_id = restored->last_applied_batch_id,
@@ -1157,6 +1272,12 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     metadata_store_.swap(metadata);
     oplog_applier_.swap(applier);
     batch_standby_reader_.swap(reader);
+    {
+        std::lock_guard<std::mutex> vsegment_lock(vsegment_mutex_);
+        vsegment_partitions_ = std::move(rebootstrap_vsegments);
+    }
+    // The swapped-in applier still points at the local map; rebind it.
+    InstallVSegmentHandler(*oplog_applier_);
     batch_snapshot_baseline_ = *cursor;
     batch_snapshot_producer_view_version_ = restored->producer_view_version;
     HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
@@ -1308,10 +1429,79 @@ void HotStandbyService::ReplicationLoop() {
             retry_started.reset();
             retry_delay = retry_base;
             last_error_.store(ErrorCode::OK, std::memory_order_release);
+        } else if (multi_source_) {
+            // Partitioned streams (SP930 multi-submaster): poll every source
+            // independently; sources own disjoint slots and independent
+            // sequence spaces, so applied/primary report the maximum.
+            bool retry_backoff = false;
+            bool fatal = false;
+            for (auto& [source_id, replica] : sources_) {
+                const uint64_t expected_before =
+                    replica.applier->GetExpectedSequenceId();
+                auto result = replica.reader->PollOnce();
+                if (result.durable_prefix_present &&
+                    result.durable_prefix.last_seq > primary_seq_id_.load()) {
+                    primary_seq_id_.store(result.durable_prefix.last_seq);
+                }
+                const uint64_t expected_after =
+                    replica.applier->GetExpectedSequenceId();
+                if (expected_after > 0 &&
+                    expected_after - 1 > applied_seq_id_.load()) {
+                    applied_seq_id_.store(expected_after - 1);
+                }
+                if (result.error == ErrorCode::OK) {
+                    continue;
+                }
+                last_error_.store(result.error, std::memory_order_release);
+                const bool made_progress = expected_after > expected_before;
+                if (result.disposition ==
+                    OpLogBatchStandbyPollDisposition::RETRYABLE) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!retry_started || made_progress) {
+                        retry_started = now;
+                        retry_delay = retry_base;
+                    }
+                    if (now - *retry_started < retry_limit) {
+                        LOG(WARNING)
+                            << "Transient batch-record standby poll failure "
+                            << "for source=" << source_id << ", retrying in "
+                            << retry_delay.count()
+                            << " ms, err=" << static_cast<int>(result.error);
+                        retry_backoff = true;
+                        break;
+                    }
+                    LOG(ERROR) << "Batch-record standby retry timeout after "
+                               << config_.batch_oplog_retry_timeout_sec
+                               << " seconds for source=" << source_id
+                               << ", err=" << static_cast<int>(result.error);
+                } else {
+                    // No snapshots/compaction for partitioned streams, so a
+                    // rebootstrap request is fatal here as well.
+                    LOG(ERROR) << "Fatal batch-record standby poll failure "
+                               << "for source=" << source_id
+                               << ", err=" << static_cast<int>(result.error);
+                }
+                fatal = true;
+                break;
+            }
+            if (retry_backoff) {
+                NotifySyncStatus();
+                wait_for_next_poll(retry_delay);
+                retry_delay = std::min(retry_delay * 2, max_retry_delay);
+                continue;
+            }
+            if (fatal) {
+                state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+                replication_loop_cv_.notify_all();
+                break;
+            }
+            retry_started.reset();
+            retry_delay = retry_base;
+            last_error_.store(ErrorCode::OK, std::memory_order_release);
         }
 
         // Update applied_seq_id from OpLogApplier
-        if (oplog_applier_) {
+        if (oplog_applier_ && !multi_source_) {
             uint64_t expected = oplog_applier_->GetExpectedSequenceId();
             uint64_t current_applied = (expected > 0) ? (expected - 1) : 0;
             if (current_applied > 0) {
@@ -1373,6 +1563,105 @@ void HotStandbyService::VerificationLoop() {
     }
 
     LOG(INFO) << "Verification loop stopped";
+}
+
+
+ErrorCode HotStandbyService::UpdateSources(
+    const std::vector<ha::MasterSource>& sources,
+    const std::string& oplog_endpoints, const std::string& cluster_id) {
+    // Rebind only when the set of source master_ids changes.
+    bool running = false;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        running = IsRunning();
+        if (running) {
+            std::set<std::string> old_ids;
+            std::set<std::string> new_ids;
+            for (const auto& source : config_.sources) {
+                old_ids.insert(source.master_id);
+            }
+            for (const auto& source : sources) {
+                new_ids.insert(source.master_id);
+            }
+            changed = config_.sources.size() != sources.size() ||
+                      old_ids != new_ids;
+        }
+    }
+    if (!running) {
+        return Start(sources, oplog_endpoints, cluster_id);
+    }
+    if (!changed) {
+        return ErrorCode::OK;
+    }
+    // metadata_store_ survives Stop(); the restarted run replays on top of
+    // the already materialized metadata.
+    LOG(INFO) << "HotStandbyService rebinding replay sources: "
+              << config_.sources.size() << " -> " << sources.size();
+    Stop();
+    return Start(sources, oplog_endpoints, cluster_id);
+}
+
+void HotStandbyService::InstallVSegmentHandler(OpLogApplier& applier) {
+    applier.SetVSegmentStateHandler(
+        [this](const OpLogEntry& entry) { return ApplyVSegmentState(entry); });
+}
+
+bool HotStandbyService::ApplyVSegmentState(const OpLogEntry& entry) {
+    std::lock_guard<std::mutex> lock(vsegment_mutex_);
+    std::string detail;
+    const ErrorCode error =
+        vsegment::ApplyVSegmentStateEntry(entry, vsegment_partitions_, &detail);
+    if (error != ErrorCode::OK) {
+        LOG(ERROR) << "Standby rejected vsegment record seq="
+                   << entry.sequence_id << ": " << detail;
+    }
+    return error == ErrorCode::OK;
+}
+
+void HotStandbyService::ResetVSegmentPartitions(
+    std::vector<vsegment::PartitionVSegmentSnapshot> partitions) {
+    auto states = ToVSegmentStateMap(std::move(partitions));
+    std::lock_guard<std::mutex> lock(vsegment_mutex_);
+    vsegment_partitions_ = std::move(states);
+}
+
+void HotStandbyService::CollectVSegmentPartitions(
+    std::vector<vsegment::PartitionVSegmentSnapshot>& out) const {
+    std::lock_guard<std::mutex> lock(vsegment_mutex_);
+    std::map<std::string, const vsegment::PartitionVSegmentSnapshot*> ordered;
+    for (const auto& [id, state] : vsegment_partitions_) {
+        ordered.emplace(id, &state);
+    }
+    out.clear();
+    out.reserve(ordered.size());
+    for (const auto& [id, state] : ordered) {
+        out.push_back(*state);
+    }
+}
+
+std::vector<StandbySegmentInfo> HotStandbyService::CollectSegmentsLocked()
+    const {
+    if (!multi_source_) {
+        return oplog_applier_
+                   ? oplog_applier_->GetSegmentRegistry().GetAllSegments()
+                   : std::vector<StandbySegmentInfo>{};
+    }
+    // Merge per-source registries, deduplicating by transport_endpoint
+    // (segment identity in StandbySegmentRegistry).
+    std::map<std::string, StandbySegmentInfo> by_endpoint;
+    for (const auto& [source_id, replica] : sources_) {
+        for (const auto& segment :
+             replica.applier->GetSegmentRegistry().GetAllSegments()) {
+            by_endpoint[segment.transport_endpoint] = segment;
+        }
+    }
+    std::vector<StandbySegmentInfo> out;
+    out.reserve(by_endpoint.size());
+    for (auto& [endpoint, segment] : by_endpoint) {
+        out.push_back(std::move(segment));
+    }
+    return out;
 }
 
 }  // namespace mooncake

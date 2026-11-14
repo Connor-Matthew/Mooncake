@@ -4,6 +4,41 @@
 
 namespace mooncake {
 
+namespace {
+
+// Modified By Yida (v3): trtype 解析规则——
+//   显式传入空串  -> 读 MC_NOF_TRTYPE，缺省 RDMA（旧行为，向后兼容）；
+//   显式传入值    -> 仅接受 RDMA/TCP/URMA，非法值直接报错，绝不静默回退。
+// te_endpoint 是 master 上 segment 的唯一身份（含 trtype），静默改写 trtype
+// 会让 register/unregister 两端产生两个不同的 segment 名，故障难以排查。
+bool NormalizeTrType(const std::string &raw_trtype, std::string &trtype) {
+    if (raw_trtype.empty()) {
+        const char *trtype_env = std::getenv("MC_NOF_TRTYPE");
+        trtype = trtype_env ? trtype_env : "RDMA";
+    } else {
+        trtype = raw_trtype;
+    }
+    std::transform(
+        trtype.begin(), trtype.end(), trtype.begin(),
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    if (trtype != "RDMA" && trtype != "TCP" && trtype != "URMA") {
+        LOG(ERROR) << "Unsupported NoF trtype=" << trtype
+                   << " (allowed: RDMA, TCP, URMA)";
+        return false;
+    }
+    return true;
+}
+
+std::string BuildTeEndpoint(const std::string &traddr, size_t trsvcid,
+                            const std::string &nqn,
+                            const std::string &trtype, size_t nsid) {
+    return "traddr:" + traddr + " trsvcid:" + std::to_string(trsvcid) +
+           " subnqn:" + nqn + " trtype:" + trtype + " adrfam:IPv4 ns:" +
+           std::to_string(nsid);
+}
+
+}  // namespace
+
 NoFRegisterClient::NoFRegisterClient()
     : master_client_(generate_uuid(), nullptr) {}
 
@@ -11,10 +46,16 @@ NoFRegisterClient::~NoFRegisterClient() = default;
 
 int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
                                     const std::string &traddr, size_t trsvcid,
-                                    uintptr_t base, size_t size,
+                                    const std::string &trtype, uintptr_t base,
+                                    size_t size,
                                     const std::string &master_server_addr) {
+    std::string normalized_trtype;
+    if (!NormalizeTrType(trtype, normalized_trtype)) {
+        return OPERATION_FAILED;
+    }
     LOG(INFO) << "Registering SSD: nqn=" << nqn << ",nsid=" << nsid
               << ",traddr=" << traddr << ",trsvcid=" << trsvcid
+              << ",trtype=" << normalized_trtype
               << ",master=" << master_server_addr << ",base=" << base
               << ",size=" << size;
 
@@ -24,12 +65,8 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
         return OPERATION_FAILED;
     }
 
-    const auto config = NoFRegisterConfig::FromEnvironment();
-
-    std::string te_endpoint =
-        "traddr:" + traddr + " trsvcid:" + std::to_string(trsvcid) +
-        " subnqn:" + nqn + " trtype:" + config.transport_type +
-        " adrfam:IPv4 ns:" + std::to_string(nsid);
+    std::string te_endpoint = BuildTeEndpoint(traddr, trsvcid, nqn,
+                                              normalized_trtype, nsid);
 
     NoFSegment segment;
     segment.base = base;
@@ -48,10 +85,16 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
 
 int NoFRegisterClient::set_unregister_by_endpoint(
     const std::string &nqn, size_t nsid, const std::string &traddr,
-    size_t trsvcid, const std::string &master_server_addr) {
+    size_t trsvcid, const std::string &trtype,
+    const std::string &master_server_addr) {
+    std::string normalized_trtype;
+    if (!NormalizeTrType(trtype, normalized_trtype)) {
+        return OPERATION_FAILED;
+    }
     LOG(INFO) << "Unregistering SSD by endpoint: nqn=" << nqn
               << ",nsid=" << nsid << ",traddr=" << traddr
-              << ",trsvcid=" << trsvcid << ",master=" << master_server_addr;
+              << ",trsvcid=" << trsvcid << ",trtype=" << normalized_trtype
+              << ",master=" << master_server_addr;
 
     // Connect to master server
     auto err = master_client_.Connect(master_server_addr);
@@ -60,13 +103,9 @@ int NoFRegisterClient::set_unregister_by_endpoint(
         return OPERATION_FAILED;
     }
 
-    const auto config = NoFRegisterConfig::FromEnvironment();
-
     // Build the te_endpoint string to match registered segments
-    std::string te_endpoint =
-        "traddr:" + traddr + " trsvcid:" + std::to_string(trsvcid) +
-        " subnqn:" + nqn + " trtype:" + config.transport_type +
-        " adrfam:IPv4 ns:" + std::to_string(nsid);
+    std::string te_endpoint = BuildTeEndpoint(traddr, trsvcid, nqn,
+                                              normalized_trtype, nsid);
 
     LOG(INFO) << "Built te_endpoint: " << te_endpoint;
 

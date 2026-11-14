@@ -12,6 +12,12 @@
 
 namespace mooncake {
 
+// Modified By Yida (v3): NoF/URMA 下的 buffer 对齐要求。UMMU Table mode 注册
+// 区间按 4K 页粒度处理（SPDK v3 已兼容子页偏移的 buffer，但 4K 对齐的分配
+// 可走 SPDK 注册缓存的不重叠快路径，并满足 NoF 块对齐校验）。仅当
+// USE_NOF_URMA 打开时生效，见 client_buffer.cpp。
+constexpr size_t kNofBufferAlignment = 4096;
+
 class BufferHandle;
 
 /**

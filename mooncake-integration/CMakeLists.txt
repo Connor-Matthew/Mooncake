@@ -174,6 +174,10 @@ if(WITH_STORE)
   if(USE_TENT)
     target_link_libraries(store PRIVATE tent)
   endif()
+
+  include(${CMAKE_SOURCE_DIR}/mooncake-common/FindSpDiag.cmake)
+  target_include_directories(store PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/store)
+  target_link_libraries(store PRIVATE SpDiag::spdiag_lib)
   if(USE_ASCEND_DIRECT)
     target_link_libraries(
       store PUBLIC ascendcl transfer_engine glog::glog gflags::gflags

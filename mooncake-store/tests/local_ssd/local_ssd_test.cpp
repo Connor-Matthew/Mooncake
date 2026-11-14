@@ -65,6 +65,47 @@ TEST(LocalSsdTaskMailboxTest, PromotionsAreBatchedAndRemoveAllIsConsumed) {
     EXPECT_FALSE(mailbox.ConsumeRemoveAll());
 }
 
+TEST(LocalSsdTaskMailboxTest, RemovedKeysStayPendingUntilAcknowledged) {
+    LocalSsdTaskMailbox mailbox(false);
+    const RemoveTaskItem first{"tenant-a", "key"};
+    const RemoveTaskItem second{"tenant-b", "key"};
+    EXPECT_TRUE(mailbox.EnqueueRemoved(first) == ErrorCode::OK);
+    EXPECT_TRUE(mailbox.EnqueueRemoved(second) == ErrorCode::OK);
+    EXPECT_TRUE(mailbox.EnqueueRemoved(first) == ErrorCode::OBJECT_ALREADY_EXISTS);
+    EXPECT_EQ(mailbox.TakeRemovedKeys(), (std::vector{first, second}));
+    EXPECT_EQ(mailbox.TakeRemovedKeys(), (std::vector{first, second}));
+    EXPECT_EQ(mailbox.AckRemovedKeys({first}), 1);
+    EXPECT_EQ(mailbox.TakeRemovedKeys(), (std::vector{second}));
+    EXPECT_EQ(mailbox.AckRemovedKeys({first, second}), 1);
+    EXPECT_TRUE(mailbox.TakeRemovedKeys().empty());
+}
+
+TEST(LocalSsdManagerTest, RemovedKeysAndSegmentNamesAreClientScoped) {
+    LocalSsdManager manager;
+    const UUID first{101, 102};
+    const UUID second{103, 104};
+    ASSERT_TRUE(manager.RegisterClient(first, true) == ErrorCode::OK);
+    ASSERT_TRUE(manager.RegisterClient(second, true) == ErrorCode::OK);
+    manager.SetClientSegmentName(first, "segment-a");
+    manager.SetClientSegmentName(first, "segment-b");
+    EXPECT_EQ(manager.GetClientSegmentName(first), "segment-a");
+    EXPECT_EQ(manager.GetClientSegmentName(second), "");
+
+    const RemoveTaskItem task{"tenant", "key"};
+    ASSERT_TRUE(manager.EnqueueRemoved(first, task) == ErrorCode::OK);
+    const auto pending = manager.TakeRemovedKeys(first);
+    ASSERT_TRUE(pending);
+    EXPECT_EQ(*pending, (std::vector{task}));
+    const auto other_pending = manager.TakeRemovedKeys(second);
+    ASSERT_TRUE(other_pending);
+    EXPECT_TRUE(other_pending->empty());
+    EXPECT_TRUE(manager.AckRemovedKeys(first, {task}));
+    ASSERT_TRUE(manager.UnregisterClient(first));
+    EXPECT_FALSE(manager.TakeRemovedKeys(first));
+    EXPECT_TRUE(manager.EnqueueRemoved(first, task) ==
+                ErrorCode::SEGMENT_NOT_FOUND);
+}
+
 TEST(LocalSsdTaskMailboxTest, PromotionsAreDeliveredByRecency) {
     LocalSsdTaskMailbox mailbox(false);
     ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "a", 1)) ==

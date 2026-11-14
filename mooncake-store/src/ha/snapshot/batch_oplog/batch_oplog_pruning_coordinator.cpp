@@ -87,6 +87,14 @@ bool ValidateSnapshot(SnapshotObjectStore& store, const std::string& root,
                              weights.crc32c))
             return false;
     }
+    if (manifest->vsegment_partitions) {
+        const auto& vsegments = *manifest->vsegment_partitions;
+        if (vsegments.key != ha::BuildBatchOpLogSnapshotVSegmentPartitionsKey(
+                                 root, descriptor.snapshot_id) ||
+            !InspectArtifact(store, vsegments.key, vsegments.stored_size,
+                             vsegments.crc32c))
+            return false;
+    }
     return true;
 }
 

@@ -124,7 +124,7 @@ inline const Replica::Descriptor *PickBestRemoteMemory(
 }
 
 // Select the best replica from a list: prefer local MEMORY, local NOF_SSD,
-// remote MEMORY, remote NOF_SSD, LOCAL_DISK, DFS, then DISK. Master may return
+// remote MEMORY, remote NOF_SSD, VSEGMENT, LOCAL_DISK, DFS, then DISK. Master may return
 // replicas in any order, so we always scan all replicas before deciding — this
 // ensures local MEMORY is always preferred over local NOF regardless of the
 // order replicas appear in the list. When scoring is enabled and there are
@@ -138,6 +138,7 @@ inline const Replica::Descriptor *SelectBestReplica(
     const Replica::Descriptor *local_nof = nullptr;
     const Replica::Descriptor *first_memory = nullptr;
     const Replica::Descriptor *first_nof = nullptr;
+    const Replica::Descriptor *first_vsegment = nullptr;
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_memory_replica()) {
@@ -162,6 +163,8 @@ inline const Replica::Descriptor *SelectBestReplica(
             } else {
                 if (!first_nof) first_nof = &r;
             }
+        } else if (r.is_vsegment_replica()) {
+            if (!first_vsegment) first_vsegment = &r;
         }
     }
     // Local MEMORY always beats local NOF regardless of list order.
@@ -178,6 +181,7 @@ inline const Replica::Descriptor *SelectBestReplica(
     }
     if (first_memory) return first_memory;
     if (first_nof) return first_nof;
+    if (first_vsegment) return first_vsegment;
 
     const Replica::Descriptor *best = nullptr;
     for (const auto &r : replicas) {

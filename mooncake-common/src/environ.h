@@ -3,6 +3,7 @@
 // Internal to Mooncake: this header lives under src/ and is only exported to
 // in-tree targets through mooncake_common's build interface.
 
+#include <cstdint>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
@@ -59,6 +60,36 @@ class Environ {
 
     // Environ over the process environment.
     static const Environ& Process();
+
+    // Compatibility entry point for the 930 RPC pool configuration.
+    static const Environ& Get() { return Process(); }
+
+    size_t GetOffloadRpcThreadNum(size_t fallback = 8) const {
+        const auto value = GetTypedOr(EnvironmentVariable<size_t>{"MC_OFFLOAD_RPC_THREAD_NUM"}, fallback);
+        return value == 0 ? fallback : value;
+    }
+    uint32_t GetYltRpcPoolMaxConnection(uint32_t fallback = 100) const {
+        const auto value = GetTypedOr(EnvironmentVariable<uint32_t>{"MC_YLT_RPC_POOL_MAX_CONNECTION"}, fallback);
+        return value == 0 ? fallback : value;
+    }
+    size_t GetYltRpcPoolIdleTimeoutMs(size_t fallback) const {
+        return GetTypedOr(EnvironmentVariable<size_t>{"MC_YLT_RPC_POOL_IDLE_TIMEOUT_MS"}, fallback);
+    }
+    size_t GetYltRpcPoolShortIdleTimeoutMs(size_t fallback) const {
+        return GetTypedOr(EnvironmentVariable<size_t>{"MC_YLT_RPC_POOL_SHORT_IDLE_TIMEOUT_MS"}, fallback);
+    }
+    bool GetYltRpcPoolWarmupEnabled(bool fallback = true) const {
+        return GetTypedOr(EnvironmentVariable<bool>{"MC_YLT_RPC_POOL_WARMUP"}, fallback);
+    }
+    size_t GetYltRpcPoolWarmupConnections(size_t fallback) const {
+        return GetTypedOr(EnvironmentVariable<size_t>{"MC_YLT_RPC_POOL_WARMUP_CONNECTIONS"}, fallback);
+    }
+    bool GetStoreWarmupEnabled(bool fallback = false) const {
+        return GetTypedOr(EnvironmentVariable<bool>{"MC_STORE_WARMUP"}, fallback);
+    }
+    static bool GetBool(const char* name, bool fallback) {
+        return ReadOr(EnvironmentVariable<bool>{name}, fallback);
+    }
 
     // Raw value, or nullopt when the variable is unset.
     std::optional<std::string> Get(std::string_view name) const {

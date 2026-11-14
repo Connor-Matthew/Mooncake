@@ -18,11 +18,17 @@ class MooncakeNoFRegister:
     Registers SSDs from remote SPDK targets to Mooncake master server.
     """
 
-    def __init__(self, cli_config: dict = None, spdk_targets: List[str] = None):
+    def __init__(self, cli_config: dict = None, spdk_targets: List[str] = None,
+                 transport_type: str = "RDMA"):
         self.register = None
         self.config_list: List[Dict[str, Any]] = []
         self.cli_config = cli_config or {}
         self.spdk_targets = spdk_targets or []
+        # Modified By Yida (v3): transport 显式指定（RDMA/TCP/URMA），
+        # 用于按 trtype 选择 listener 并传入注册 API
+        self.transport_type = (transport_type or "RDMA").upper()
+        if self.transport_type not in ("RDMA", "TCP", "URMA"):
+            raise ValueError(f"Unsupported transport type: {transport_type}")
         self._setup_logging()
 
         try:
@@ -68,7 +74,10 @@ class MooncakeNoFRegister:
 
         for config in self.config_list:
             # Generate unique key directly without calling _get_ssd_unique_key
-            key = (config["nqn"], config["nsid"], config["traddr"], config["trsvcid"])
+            # Modified By Yida (v3): key 加入 trtype——同一 target 可能同时
+            # 开放 RDMA/TCP/URMA listener，trtype 是 segment 身份的一部分
+            key = (config['nqn'], config['nsid'], config['traddr'],
+                   config['trsvcid'], config.get('trtype', 'RDMA'))
             if key not in seen_keys:
                 seen_keys.add(key)
                 unique_configs.append(config)
@@ -169,9 +178,22 @@ class MooncakeNoFRegister:
                     if not nqn or not listen_addresses:
                         continue
 
-                    # Get transport info from first listen address
-                    traddr = listen_addresses[0].get("traddr")
-                    trsvcid = listen_addresses[0].get("trsvcid")
+                    # Modified By Yida (v3): 按 transport 类型选择 listener，
+                    # 不再固定取 listen_addresses[0]。target 可能同时开放
+                    # RDMA/TCP/URMA listener，选错会导致连接失败或选到错误
+                    # transport 的地址。
+                    listener = next(
+                        (item for item in listen_addresses
+                         if item.get('trtype', '').upper() == self.transport_type),
+                        None)
+                    if listener is None:
+                        logging.warning(
+                            "No %s listener found on nqn=%s (available: %s), skipping",
+                            self.transport_type, nqn,
+                            [item.get('trtype') for item in listen_addresses])
+                        continue
+                    traddr = listener.get('traddr')
+                    trsvcid = listener.get('trsvcid')
 
                     if not traddr or not trsvcid:
                         continue
@@ -200,20 +222,20 @@ class MooncakeNoFRegister:
 
                         # Create SSD config
                         ssd_config = {
-                            "nqn": nqn,
-                            "nsid": nsid,
-                            "traddr": traddr,
-                            "trsvcid": int(trsvcid),  # Ensure trsvcid is integer
-                            "base": 0,
-                            "size": size,
-                            "master_server_address": master_server_address,
-                            "metadata_server": "",
+                            'nqn': nqn,
+                            'nsid': nsid,
+                            'traddr': traddr,
+                            'trsvcid': int(trsvcid),  # Ensure trsvcid is integer
+                            'trtype': self.transport_type,
+                            'base': 0,
+                            'size': size,
+                            'master_server_address': master_server_address,
+                            'metadata_server': ''
                         }
 
                         ssd_configs.append(ssd_config)
-                        logging.info(
-                            f"Found SSD: nqn={nqn}, nsid={nsid}, traddr={traddr}, size={size}"
-                        )
+                        logging.info(f"Found SSD: nqn={nqn}, nsid={nsid}, traddr={traddr}, "
+                                     f"trtype={self.transport_type}, size={size}")
 
             except Exception as e:
                 logging.error(f"Failed to get SSD info from {ip}: {e}")
@@ -248,11 +270,13 @@ class MooncakeNoFRegister:
 
                 # Create register instance and register SSD
                 self.register = MooncakeDistributedNoFRegister()
+                # Modified By Yida (v3): trtype 作为显式参数传入
                 ret = self.register.real_register(
                     cfg["nqn"],
                     cfg["nsid"],
                     cfg["traddr"],
                     cfg["trsvcid"],
+                    cfg.get("trtype", self.transport_type),
                     cfg["base"],
                     cfg["size"],
                     cfg["master_server_address"],
@@ -324,6 +348,9 @@ def parse_arguments():
         help="Override configuration fields globally (e.g., -Dtrsvcid=4420)",
         default=[],
     )
+    parser.add_argument('--transport-type', type=str, default='RDMA',
+                        choices=['RDMA', 'TCP', 'URMA'],
+                        help='Transport type for NoF listeners (default: RDMA)')
     return parser.parse_args()
 
 
@@ -348,7 +375,8 @@ def main():
     if args.key_file:
         cli_config["key_file"] = args.key_file
 
-    register = MooncakeNoFRegister(cli_config, args.spdk_target_info)
+    register = MooncakeNoFRegister(cli_config, args.spdk_target_info,
+                                   transport_type=args.transport_type)
     success = register.start_ssd_service()
     if not success:
         exit(1)

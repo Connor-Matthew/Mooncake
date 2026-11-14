@@ -87,6 +87,18 @@ class EtcdHelper {
     static ErrorCode BatchCreate(const std::vector<std::string>& keys,
                                  const std::vector<std::string>& values);
 
+    /*
+     * @brief Atomically put a batch of key-value pairs in a single txn, all
+     *        bound to the given lease. Returns OK if all writes committed,
+     *        ETCD_OPERATION_ERROR otherwise. Caller is responsible for fencing
+     *        (the keys must already be absent / owned by self) before calling;
+     *        it never checks existence, so it can also be reused to reaffirm
+     *        existing lease-bound keys.
+     */
+    static ErrorCode BatchPutWithLease(const std::vector<std::string>& keys,
+                                       const std::vector<std::string>& values,
+                                       EtcdLeaseId lease_id);
+
     enum class TxnCompareKind {
         kValueEquals = 0,
         kKeyNotExists = 1,
@@ -115,7 +127,9 @@ class EtcdHelper {
      * fail.
      */
     static ErrorCode TxnCompareAndPut(const std::vector<TxnCompare>& compares,
-                                      const std::vector<TxnPut>& puts);
+                                      const std::vector<TxnPut>& puts,
+                                      const std::vector<std::string>&
+                                          delete_keys = {});
 
     /*
      * @brief Grant a lease from the etcd.
@@ -182,6 +196,20 @@ class EtcdHelper {
      */
     static ErrorCode Put(const char* key, const size_t key_size,
                          const char* value, const size_t value_size);
+
+    /*
+     * @brief Put a key-value pair to etcd with a lease.
+     *        The key will be automatically deleted when the lease expires.
+     * @param key: The key to put.
+     * @param key_size: The size of the key in bytes.
+     * @param value: The value to put.
+     * @param value_size: The size of the value in bytes.
+     * @param lease_id: The lease id to bind to the key.
+     * @return: Error code.
+     */
+    static ErrorCode PutWithLease(const char* key, const size_t key_size,
+                                  const char* value, const size_t value_size,
+                                  EtcdLeaseId lease_id);
 
     /*
      * @brief Create a key-value pair in etcd if the key does not already exist.

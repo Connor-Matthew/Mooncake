@@ -88,6 +88,11 @@ class TransferMetadata {
         uint64_t offset;       // for cxl
         std::vector<std::string> tseg;      // for ub/urma
         std::vector<uint32_t> l_seg_index;  // for ub/urma
+        // for ub: NUMA->chip id of this buffer, computed once by the owner at
+        // registration and published. -1 = not provided (consumer falls back
+        // to resolving from `name`). Only meaningful for single-NUMA ("cpu:N")
+        // buffers; multi-NUMA "segments:..." buffers leave it -1.
+        int chip_id = -1;
 
         bool operator==(const BufferDesc &other) const = default;
     };
@@ -200,8 +205,22 @@ class TransferMetadata {
         uint32_t local_lid = 0;
         std::string local_gid;
         std::string peer_nic_path;
+        uint64_t trace_id = 0;
 #ifdef USE_UB
         std::vector<uint32_t> jetty_num;  // for ub/urma
+        // Peer jetty descriptors for ub/urma dual-mode import. Preferred
+        // mode: rjetty blob exported by urma_get_rjetty (driver context,
+        // hex-encoded, may be longer than sizeof(urma_rjetty_t) on bonding
+        // devices). Fallback mode: empty rjetty, receiver hand-fills from
+        // id/uasid/trans_mode below (legacy path, kept for old peers and
+        // old liburma without urma_get_rjetty).
+        struct PeerJettyInfo {
+            uint32_t id = 0;      // peer jetty id
+            uint32_t uasid = 0;   // peer jetty uasid (0 = kernel)
+            std::string rjetty;   // hex blob from urma_get_rjetty, empty = N/A
+        };
+        std::vector<PeerJettyInfo> jetty_infos;
+        int trans_mode = -1;  // sender's actual urma transport mode, -1 = N/A
 #endif
 #ifdef USE_BAREX
         uint16_t barex_port;

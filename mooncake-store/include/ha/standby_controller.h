@@ -41,6 +41,9 @@ struct PromotionContext {
         return metadata_store ? metadata_store->HasObjectReplicaState()
                               : object_storage.target.has_value();
     }
+
+    // VSegment partition state for the new primary's reconcile (SP930).
+    std::vector<vsegment::PartitionVSegmentSnapshot> vsegment_partitions;
 };
 
 class StandbyController {
@@ -52,8 +55,14 @@ class StandbyController {
 
     virtual ~StandbyController() = default;
 
+    // Replay sources: one unpartitioned source for a single leader, one
+    // partitioned source per submaster under CVM (see ha::OpLogSourceId).
+    virtual ErrorCode StartStandby(const MasterSources& sources) = 0;
+    // Single-leader convenience: the observed leader as the only source.
     virtual ErrorCode StartStandby(
-        const std::optional<MasterView>& observed_leader) = 0;
+        const std::optional<MasterView>& observed_leader) {
+        return StartStandby(SingleLeaderSources(observed_leader));
+    }
 
     virtual void StopStandby() = 0;
 
@@ -68,8 +77,11 @@ class StandbyController {
     virtual tl::expected<PromotionContext, ErrorCode>
     PromoteStandbyAndExport() = 0;
 
+    virtual void UpdateObservedLeader(const MasterSources& sources) = 0;
     virtual void UpdateObservedLeader(
-        const std::optional<MasterView>& observed_leader) = 0;
+        const std::optional<MasterView>& observed_leader) {
+        UpdateObservedLeader(SingleLeaderSources(observed_leader));
+    }
 
     virtual MasterRuntimeState GetStandbyRuntimeState() const = 0;
 

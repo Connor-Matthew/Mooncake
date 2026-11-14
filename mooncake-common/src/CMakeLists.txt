@@ -7,7 +7,8 @@ if(NOT ASIO_INCLUDE_DIR)
 endif()
 
 set(MOONCAKE_COMMON_SOURCES crc_checksum.cpp default_config.cpp environ.cpp
-                            rpc_client_io_context.cpp)
+                            rpc_client_io_context.cpp    mooncake_logging.cpp
+)
 
 add_library(asio_shared SHARED asio_impl.cpp)
 
@@ -52,7 +53,7 @@ target_include_directories(
 
 target_link_libraries(
   mooncake_common PUBLIC asio_shared yaml-cpp JsonCpp::JsonCpp
-                         yalantinglibs::yalantinglibs)
+                         yalantinglibs::yalantinglibs glog::glog gflags::gflags)
 
 if(BUILD_SHARED_LIBS)
   set_target_properties(mooncake_common PROPERTIES INSTALL_RPATH "$ORIGIN")

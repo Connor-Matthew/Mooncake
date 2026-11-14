@@ -155,6 +155,21 @@ class ScopedSegmentAccess {
     ErrorCode GetAllSegments(
         std::vector<std::pair<Segment, UUID>>& all_segments);
 
+    /**
+     * @brief Get all segments with their exact owner client ids.
+     *
+     * Unlike the pair-version GetAllSegments() above, which resolves the
+     * owner via client_by_name_ (name-granular and therefore ambiguous when
+     * an old and a new generation of the same-named worker coexist during a
+     * restart window), this variant builds the reverse map from
+     * client_segments_ so each segment is attributed to its true mounting
+     * client. Required by generation-replacement eviction
+     * (MasterService::EvictStaleGenerationForHost) to unmount stale segments
+     * without leaving dead ids in client_segments_.
+     */
+    ErrorCode GetAllSegmentsWithOwner(
+        std::vector<std::pair<Segment, UUID>>& all_segments);
+
     std::vector<std::string> GetHostOrderedSegments(
         const std::string& writer_host_id, const std::string& key) const;
 
@@ -359,6 +374,14 @@ class SegmentManager {
         return ScopedSegmentAccess(this, segment_mutex_);
     }
 
+    // Bulk read of segment runtime locations under a shared lock. Returns false
+    // if any segment is missing or has no transport endpoint. Unlike
+    // getSegmentAccess()/GetSegment(), this does not take the segment mutex
+    // exclusively.
+    bool GetSegmentLocations(const std::vector<UUID>& segment_ids,
+                             std::vector<std::string>* endpoints,
+                             std::vector<uint64_t>* bases) const;
+
     /**
      * @brief Get RAII-style access to use allocators
      * @return ScopedAllocatorAccess object that holds the lock
@@ -395,6 +418,13 @@ class SegmentManager {
     bool HasSegmentByEndpoint(const std::string& endpoint) const;
     bool GetSegmentBasicInfo(const UUID& segment_id, std::string& segment_name,
                              std::string& te_endpoint) const;
+
+    // Returns the client_id that owns the segment with the given name,
+    // or nullopt if the segment is not registered.
+    // Used by post-promotion cleanup to determine whether a memory
+    // replica's owning client has reconnected.
+    std::optional<UUID> getClientIdBySegmentName(
+        const std::string& segment_name) const;
 
    private:
     void AttachMountedUsageTrackers();

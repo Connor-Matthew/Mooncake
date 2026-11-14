@@ -6,6 +6,8 @@
 #include <utility>
 #include <vector>
 
+#include "vsegment/vsegment_manager.h"
+
 namespace mooncake::test {
 
 namespace {
@@ -117,6 +119,86 @@ TEST(BatchOpLogSnapshotCodecTest, RejectsTruncatedArtifacts) {
 
     EXPECT_FALSE(DecodeBatchOpLogSnapshotSegments(segments));
     EXPECT_FALSE(DecodeBatchOpLogSnapshotObjectChunk(objects, 0, 1));
+}
+
+TEST(BatchOpLogSnapshotCodecTest, VSegmentPartitionsRoundTrip) {
+    // The empty partition set is the "no vsegment state" baseline.
+    auto decoded_empty = DecodeBatchOpLogSnapshotVSegmentPartitions(
+        EncodeBatchOpLogSnapshotVSegmentPartitions(
+            std::vector<vsegment::PartitionVSegmentSnapshot>{}));
+    ASSERT_TRUE(decoded_empty) << decoded_empty.error();
+    EXPECT_TRUE(decoded_empty->empty());
+
+    vsegment::VSegmentStateSnapshot vsegment_state;
+    vsegment_state.profile_name = "profile-a";
+    vsegment_state.lifecycle = vsegment::Lifecycle::DRAINING;
+    vsegment_state.view.vsegment_id = "vsegment-1";
+    vsegment_state.view.partition_id = "partition-1";
+    vsegment_state.view.stripe_size = 4096;
+    vsegment_state.view.logical_capacity = 1 << 20;
+    vsegment_state.view.members = {{.segment_id = "psegment-1",
+                                    .base_offset = 0,
+                                    .length = 1 << 20}};
+    vsegment_state.view.checksum = 7;
+    vsegment_state.logical_allocation.logical_capacity = 1 << 20;
+    vsegment_state.logical_allocation.free_ranges = {
+        {.offset = 1 << 20, .length = 1 << 20}};
+
+    vsegment::PartitionVSegmentSnapshot partition;
+    partition.partition_id = "partition-1";
+    partition.config_generation = 3;
+    partition.route_epoch = 11;
+    partition.metadata_revision = 7;
+    partition.vsegments = {vsegment_state};
+    partition.operation_vsegments = {{"put-1", "vsegment-1"}};
+
+    vsegment::PartitionVSegmentSnapshot second;
+    second.partition_id = "partition-2";
+    second.route_epoch = 2;
+    second.metadata_revision = 1;
+    second.operation_vsegments = {{"put-2", "vsegment-2"}};
+
+    auto decoded = DecodeBatchOpLogSnapshotVSegmentPartitions(
+        EncodeBatchOpLogSnapshotVSegmentPartitions({partition, second}));
+
+    ASSERT_TRUE(decoded) << decoded.error();
+    ASSERT_EQ(2u, decoded->size());
+
+    const auto& first_decoded = (*decoded)[0];
+    EXPECT_EQ("partition-1", first_decoded.partition_id);
+    EXPECT_EQ(3u, first_decoded.config_generation);
+    EXPECT_EQ(11u, first_decoded.route_epoch);
+    EXPECT_EQ(7u, first_decoded.metadata_revision);
+    ASSERT_EQ(1u, first_decoded.vsegments.size());
+    const auto& state_decoded = first_decoded.vsegments[0];
+    EXPECT_EQ("profile-a", state_decoded.profile_name);
+    EXPECT_EQ(vsegment::Lifecycle::DRAINING, state_decoded.lifecycle);
+    EXPECT_EQ("vsegment-1", state_decoded.view.vsegment_id);
+    EXPECT_EQ("partition-1", state_decoded.view.partition_id);
+    EXPECT_EQ(4096u, state_decoded.view.stripe_size);
+    EXPECT_EQ(1u << 20, state_decoded.view.logical_capacity);
+    ASSERT_EQ(1u, state_decoded.view.members.size());
+    EXPECT_EQ("psegment-1", state_decoded.view.members[0].segment_id);
+    EXPECT_EQ(1u << 20, state_decoded.view.members[0].length);
+    EXPECT_EQ(7u, state_decoded.view.checksum);
+    EXPECT_EQ(1u << 20, state_decoded.logical_allocation.logical_capacity);
+    ASSERT_EQ(1u, state_decoded.logical_allocation.free_ranges.size());
+    EXPECT_EQ(1u << 20,
+              state_decoded.logical_allocation.free_ranges[0].offset);
+    EXPECT_EQ(1u, first_decoded.operation_vsegments.size());
+    EXPECT_EQ("vsegment-1",
+              first_decoded.operation_vsegments.at("put-1"));
+
+    EXPECT_EQ("partition-2", (*decoded)[1].partition_id);
+    EXPECT_EQ(2u, (*decoded)[1].route_epoch);
+    EXPECT_EQ(1u, (*decoded)[1].metadata_revision);
+    EXPECT_TRUE((*decoded)[1].vsegments.empty());
+    EXPECT_EQ("vsegment-2", (*decoded)[1].operation_vsegments.at("put-2"));
+
+    auto truncated =
+        EncodeBatchOpLogSnapshotVSegmentPartitions({partition, second});
+    truncated.pop_back();
+    EXPECT_FALSE(DecodeBatchOpLogSnapshotVSegmentPartitions(truncated));
 }
 
 }  // namespace mooncake::test

@@ -18,10 +18,12 @@
 #include <atomic>
 #include <climits>
 #include <cstdlib>
+#include <condition_variable>
 #include <fcntl.h>
 #include <fstream>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -30,6 +32,7 @@
 
 #include "config.h"
 #include "ub_transport.h"
+#include "ub_worker_signal.h"
 
 namespace mooncake {
 class UbContext;
@@ -44,6 +47,14 @@ class UbWorkerPool {
     // Add slices to queue, called by Transport
     int submitPostSend(const std::vector<Transport::Slice*>& slice_list);
 
+    uint64_t pendingSliceCount() const {
+        const uint64_t submitted =
+            submitted_slice_count_.load(std::memory_order_relaxed);
+        const uint64_t processed =
+            processed_slice_count_.load(std::memory_order_relaxed);
+        return submitted >= processed ? submitted - processed : 0;
+    }
+
    private:
     void performPostSend(int thread_id);
 
@@ -52,6 +63,10 @@ class UbWorkerPool {
     void redispatch(std::vector<Transport::Slice*>& slice_list, int thread_id);
 
     void transferWorker(int thread_id);
+
+    bool hasWorkerWork(int thread_id);
+
+    void wakePollingWorkers(int posting_thread_id);
 
     void monitorWorker();
 
@@ -62,10 +77,8 @@ class UbWorkerPool {
     const int numa_socket_id_;
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;
-    std::atomic<int> suspended_flag_;
     std::atomic<int> redispatch_counter_;
-    std::mutex cond_mutex_;
-    std::condition_variable cond_var_;
+    std::unique_ptr<UbWorkerSignal[]> worker_signals_;
     using SliceList = std::vector<Transport::Slice*>;
     const static int kShardCount = 8;
     std::unordered_map<std::string, SliceList> slice_queue_[kShardCount];
@@ -131,6 +144,13 @@ class UbSIEVEEndpointStore : public UbEndpointStore {
     size_t max_size_;
 };
 
+// Type of a locally registered memory region. kGpu marks a GPU segment
+// (seg_cfg.is_gpu_seg = 1) so URMA uses the peermem path on the receiver.
+enum class UbMemoryRegionType {
+    kHost,  // ordinary host memory, is_gpu_seg = 0
+    kGpu,   // GPU segment, is_gpu_seg = 1 (gdr-peermem)
+};
+
 // UbContext class
 class UbContext {
    public:
@@ -140,7 +160,9 @@ class UbContext {
           max_endpoints_(max_endpoints),
           worker_pool_(nullptr),
           active_(true),
-          show_work_request_flushed_error_(false) {}
+          show_work_request_flushed_error_(false),
+          multipath_(globalConfig().urma_bonding_multipath),
+          numa_affinity_(globalConfig().ub_numa_affinity) {}
 
     virtual ~UbContext() = default;
 
@@ -174,7 +196,9 @@ class UbContext {
     virtual int deconstruct() = 0;
 
    public:
-    virtual int registerMemoryRegion(uint64_t va, size_t length) = 0;
+    virtual int registerMemoryRegion(
+        uint64_t va, size_t length,
+        UbMemoryRegionType type = UbMemoryRegionType::kHost) = 0;
 
     virtual int unregisterMemoryRegion(uint64_t va) = 0;
 
@@ -182,20 +206,23 @@ class UbContext {
 
     virtual void* retrieveRemoteSeg(const std::string& value) = 0;
 
-    virtual int openDevice(const std::string& device_name, uint8_t port,
+    virtual int openDevice(const std::string& device_name, int8_t port,
                            int& eid_index) = 0;
 
     // Polls one JFC and processes the slices internally:
     //   * Aggregates each completion's jetty depth into jetty_depth_set.
-    //   * Successful slices have markSuccess() called in place and are NOT
-    //     returned (they may be recycled by the submitting thread the
+    //   * Successful normal slices have markSuccess() called in place and are
+    //     NOT returned (they may be recycled by the submitting thread the
     //     moment markSuccess() runs).
+    //   * Successful slices that need post-URMA staging work are returned in
+    //     deferred_success_slices and are NOT marked successful yet.
     //   * Failed slices are returned in failed_slices[0..num_failed-1] for
     //     the caller to apply retry / markFailed.
     // Returns the total number of completions polled (>= 0), or a negative
     // error code.
     virtual int poll(int num_entries, Transport::Slice** failed_slices,
                      int& num_failed,
+                     std::vector<Transport::Slice*>& deferred_success_slices,
                      std::unordered_map<volatile int*, int>& jetty_depth_set,
                      int jfc_index = 0) = 0;
 
@@ -215,6 +242,10 @@ class UbContext {
     bool active() const { return active_; }
 
     void set_active(bool flag) { active_ = flag; }
+
+    bool multipath() const { return multipath_; }
+
+    bool numa_affinity() const { return numa_affinity_; }
 
     // EndPoint Management
     std::shared_ptr<UbEndPoint> endpoint() {
@@ -380,6 +411,10 @@ class UbContext {
     volatile bool active_;
 
     bool show_work_request_flushed_error_;
+
+    bool multipath_ = false;
+
+    bool numa_affinity_ = false;
 };
 }  // namespace mooncake
 

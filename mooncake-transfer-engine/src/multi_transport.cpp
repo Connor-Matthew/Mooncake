@@ -94,6 +94,7 @@ MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
     : metadata_(metadata), local_server_name_(local_server_name) {}
 
 MultiTransport::~MultiTransport() {
+    scheduler_.reset();
     {
         std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
         stop_deferred_cleanup_ = true;
@@ -102,6 +103,46 @@ MultiTransport::~MultiTransport() {
     if (deferred_cleanup_thread_.joinable()) {
         deferred_cleanup_thread_.join();
     }
+}
+
+Status MultiTransport::configureScheduling(
+    const scheduling::SchedulerConfig& config) {
+    if (scheduler_) return Status::InvalidArgument("Scheduler already configured");
+    auto status = scheduling::SchedulerCore::validate(config);
+    if (!status.ok()) return status;
+    scheduler_ = std::make_unique<scheduling::SchedulerCore>(
+        config, [this](const TransferRequest& request, Transport*& transport) {
+            auto status = selectTransport(request, transport);
+            if (!status.ok()) return status;
+            // These transports support byte-addressed ranges and publish slice
+            // completion from their workers. Other protocols need an adapter
+            // capability implementation before enabling range scheduling.
+            for (const char* proto : {"rdma", "tcp", "ub"}) {
+                auto it = transport_map_.find(proto);
+                if (it != transport_map_.end() && it->second.get() == transport)
+                    return Status::OK();
+            }
+            return Status::NotSupportedTransport(
+                "Transport does not support scheduled byte ranges");
+        });
+    return Status::OK();
+}
+
+Status MultiTransport::submitScheduledTransfer(
+    BatchID batch_id, const std::vector<ScheduledTransferRequest>& entries) {
+    if (!scheduler_) {
+        std::vector<TransferRequest> requests;
+        requests.reserve(entries.size());
+        for (const auto& entry : entries) requests.push_back(entry.request);
+        return submitTransfer(batch_id, requests);
+    }
+    return scheduler_->submit(batch_id, entries);
+}
+
+Status MultiTransport::cancelTransfer(BatchID batch_id, size_t task_id) {
+    if (!scheduler_)
+        return Status::InvalidArgument("Scheduling is not enabled");
+    return scheduler_->cancel(batch_id, task_id);
 }
 
 MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
@@ -153,6 +194,10 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
 
 Status MultiTransport::tryFreeBatchID(
     BatchID batch_id, const std::function<void()>& before_delete) {
+    if (scheduler_) {
+        auto status = scheduler_->release(batch_id);
+        if (!status.ok()) return status;
+    }
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     bool busy = false;
@@ -362,6 +407,12 @@ Status MultiTransport::submitTransfer(
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     std::vector<size_t>* task_sizes) {
+    if (scheduler_) {
+        std::vector<ScheduledTransferRequest> scheduled;
+        scheduled.reserve(entries.size());
+        for (const auto& entry : entries) scheduled.push_back({entry, {}});
+        return scheduler_->submit(batch_id, scheduled);
+    }
     auto& batch_desc = *((BatchDesc*)(batch_id));
     if (!task_sizes &&
         batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
@@ -441,6 +492,8 @@ Status MultiTransport::submitScatter(
     const std::vector<TransferRequest>& entries,
     ScatterSubmission& submission) {
     submission = {};
+    if (scheduler_)
+        return Status::NotImplemented("Scatter with scheduling is not supported");
     if (entries.empty())
         return Status::InvalidArgument("scatter transfer is empty");
     submission.batch_id = allocateBatchID(0);
@@ -454,6 +507,9 @@ Status MultiTransport::submitScatter(
 Status MultiTransport::mp_submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     std::string& proto) {
+    if (scheduler_)
+        return Status::NotImplemented(
+            "Explicit multi-protocol scheduling is not supported");
     auto& batch_desc = *((BatchDesc*)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         return Status::TooManyRequests(
@@ -510,6 +566,8 @@ Status MultiTransport::mp_submitTransfer(
 
 Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus& status) {
+    if (scheduler_ && scheduler_->owns(batch_id))
+        return scheduler_->status(batch_id, task_id, status);
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {
@@ -696,9 +754,40 @@ Status MultiTransport::getScatterRequestStatuses(
     return Status::OK();
 }
 
+Status MultiTransport::getSliceTimings(
+    BatchID batch_id, size_t task_id,
+    std::vector<Transport::SliceTiming>& timings) {
+    timings.clear();
+    if (scheduler_ && scheduler_->owns(batch_id)) {
+        return Status::InvalidArgument(
+            "getSliceTimings is not supported for scheduler-owned batches");
+    }
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    const size_t task_count = batch_desc.task_list.size();
+    if (task_id >= task_count) {
+        return Status::InvalidArgument("Task ID out of range");
+    }
+    // Read-only snapshot of the slice list. The caller must only invoke this
+    // after the task reached a terminal state (all slices terminal), so no
+    // concurrent mutation of slice_list can occur.
+    auto& task = batch_desc.task_list[task_id];
+    timings.reserve(task.slice_list.size());
+    for (const auto* slice : task.slice_list) {
+        Transport::SliceTiming timing;
+        timing.peer_nic_path = slice->peer_nic_path;
+        timing.length = slice->length;
+        timing.post_ts = slice->ts;
+        timing.done_ts = slice->done_ts;
+        timings.push_back(std::move(timing));
+    }
+    return Status::OK();
+}
+
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status,
                                               bool walk_tasks) {
+    if (scheduler_ && scheduler_->owns(batch_id))
+        return scheduler_->batchStatus(batch_id, status);
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;

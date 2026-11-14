@@ -30,6 +30,7 @@ enum class ReplicaType {
     LOCAL_DISK = 2,  // Local disk replica
     NOF_SSD = 3,     // Nvme-oF SSD replica
     ALL = 4,         // All synchronous replicas in put finalize path
+    VSEGMENT = 5,    // Logical replica allocated inside a vsegment
     DFS = 100,       // Distributed filesystem page-offset replica
 };
 
@@ -434,6 +435,8 @@ class OffsetBufferAllocator
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
+
+    friend struct RestoredOffsetBufferAllocator;
 };
 
 struct RestoredOffsetBufferAllocator {

@@ -29,7 +29,11 @@
 #include "common.h"
 #include "config.h"
 #include "error.h"
+#include "mooncake_logging.h"
 #include "transfer_metadata_plugin.h"
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
 
 namespace mooncake {
 // Process-lifetime intern pool for RDMA NIC paths. Entries are never erased
@@ -224,6 +228,7 @@ struct TransferHandshakeUtil {
             root["ctrl_channel"] = desc.ctrl_channel;
         }
         root["reply_msg"] = desc.reply_msg;
+        root["trace_id"] = static_cast<Json::UInt64>(desc.trace_id);
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
 #endif
@@ -232,12 +237,30 @@ struct TransferHandshakeUtil {
 #endif
 
 #ifdef USE_UB
+        SpDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_ENCODE,
+                             SpDiag::PerfLevel::DEBUG);
+        pt.Start();
         Json::Value jettyNums(Json::arrayValue);
         for (const auto &jetty : desc.jetty_num) jettyNums.append(jetty);
         root["jetty_num"] = jettyNums;
-        LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
-                  << " peer_nic_path is " << desc.peer_nic_path
-                  << " jetty_num size is " << desc.jetty_num.size();
+        if (desc.trans_mode >= 0) root["trans_mode"] = desc.trans_mode;
+        if (!desc.jetty_infos.empty()) {
+            Json::Value jettyInfos(Json::arrayValue);
+            for (const auto &info : desc.jetty_infos) {
+                Json::Value item;
+                item["id"] = info.id;
+                item["uasid"] = info.uasid;
+                item["rjetty"] = info.rjetty;
+                jettyInfos.append(item);
+            }
+            root["jetty_infos"] = jettyInfos;
+        }
+        MC_LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
+                     << " peer_nic_path is " << desc.peer_nic_path
+                     << " jetty_num size is " << desc.jetty_num.size()
+                     << " jetty_infos size is " << desc.jetty_infos.size()
+                     << " trans_mode is " << desc.trans_mode;
+        pt.End(0);
 #endif
         return root;
     }
@@ -290,6 +313,11 @@ struct TransferHandshakeUtil {
             desc.ctrl_channel = root["ctrl_channel"].asBool();
         }
         desc.reply_msg = root["reply_msg"].asString();
+        if (root.isMember("trace_id") && root["trace_id"].isUInt64()) {
+            desc.trace_id = root["trace_id"].asUInt64();
+        } else {
+            desc.trace_id = 0;
+        }
 #ifdef USE_EFA
         desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
 #endif
@@ -299,12 +327,32 @@ struct TransferHandshakeUtil {
 #endif
 
 #ifdef USE_UB
+        SpDiag::PerfPoint pt(PerfKey::UB_HANDSHAKE_DECODE,
+                             SpDiag::PerfLevel::DEBUG);
+        pt.Start();
         for (const auto &jetty : root["jetty_num"]) {
             desc.jetty_num.push_back(jetty.asUInt());
         }
-        LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
-                  << " peer_nic_path is " << desc.peer_nic_path
-                  << " jetty_num size is " << desc.jetty_num.size();
+        if (root.isMember("trans_mode") && root["trans_mode"].isInt()) {
+            desc.trans_mode = root["trans_mode"].asInt();
+        } else {
+            desc.trans_mode = -1;
+        }
+        if (root.isMember("jetty_infos") && root["jetty_infos"].isArray()) {
+            for (const auto &item : root["jetty_infos"]) {
+                TransferMetadata::HandShakeDesc::PeerJettyInfo info;
+                info.id = item["id"].asUInt();
+                info.uasid = item["uasid"].asUInt();
+                info.rjetty = item["rjetty"].asString();
+                desc.jetty_infos.push_back(std::move(info));
+            }
+        }
+        MC_LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
+                     << " peer_nic_path is " << desc.peer_nic_path
+                     << " jetty_num size is " << desc.jetty_num.size()
+                     << " jetty_infos size is " << desc.jetty_infos.size()
+                     << " trans_mode is " << desc.trans_mode;
+        pt.End(0);
 #endif
         return 0;
     }
@@ -662,6 +710,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             Json::Value tsegJSON(Json::arrayValue);
             for (auto &entry : buffer.tseg) tsegJSON.append(entry);
             bufferJSON["tseg"] = tsegJSON;
+            bufferJSON["chip_id"] = buffer.chip_id;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -1159,6 +1208,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &tsegJSON : bufferJSON["tseg"]) {
                 buffer.tseg.push_back(tsegJSON.asString());
             }
+            // Backward compatible: old peers don't publish chip_id -> keep -1.
+            buffer.chip_id = bufferJSON.isMember("chip_id")
+                                 ? bufferJSON["chip_id"].asInt()
+                                 : -1;
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.tseg.empty()) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
@@ -2051,6 +2104,7 @@ int TransferMetadata::startHandshakeDaemon(
                 local = TransferHandshakeUtil::encode(local_desc);
                 return 0;
             }
+            mooncake::logging::ScopedTraceId trace(peer_desc.trace_id);
             if (on_receive_handshake) {
                 int ret = on_receive_handshake(peer_desc, local_desc);
                 if (ret) {
@@ -2066,6 +2120,7 @@ int TransferMetadata::startHandshakeDaemon(
                     return 0;
                 }
             }
+            local_desc.trace_id = peer_desc.trace_id;
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;
         });

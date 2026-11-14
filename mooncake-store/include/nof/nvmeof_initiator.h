@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "types.h"  // ErrorCode
@@ -33,6 +35,23 @@ struct NofIOCompletion {
     std::string error_string;  // empty on success
 };
 
+// Memory kind of a data buffer, used to pick zero-copy (GPU Direct)
+// submission. Resolved by the initiator; the backend-specific DMA domain
+// stays inside the implementation.
+enum class NofMemoryType : int {
+    kHost = 0,      // ordinary CPU memory: classic submission
+    kCuda,          // NVIDIA device memory: GPU Direct submission
+    kRocm,          // reserved
+    kNpu,           // reserved
+    kNotSupported,  // managed device memory without a provider in this build
+    kError,         // classification failed; never fall back silently
+};
+
+struct NofBufferInfo {
+    NofMemoryType type = NofMemoryType::kHost;
+    int32_t device_id = -1;  // -1 for host memory
+};
+
 // Raw function pointer + void* so the callback itself carries no hidden
 // allocation.
 using NofIOCallback = void (*)(void* ctx, const NofIOCompletion& completion);
@@ -40,9 +59,18 @@ using NofIOCallback = void (*)(void* ctx, const NofIOCompletion& completion);
 // Two-slot callback adaptor. Callers embed one in their own (typically
 // pooled) sub-task storage and pass its address to SubmitIO; this keeps the
 // steady-state submit/completion path free of per-sub-IO heap allocation.
+//
+// backend_scratch is per-I/O storage owned by the initiator implementation
+// for the adaptor's lifetime (until its callback runs), e.g. SPDK ext-I/O
+// options that a queued request reads after SubmitIOWithBuffer returns.
+// Callers never read or write it.
+inline constexpr size_t kNofIOAdaptorScratchBytes = 128;
 struct NofIOAdaptor {
     NofIOCallback cb;
     void* ctx;
+    // Default-initialized so `{cb, ctx}` stays warning-free
+    // (-Wmissing-field-initializers).
+    alignas(8) unsigned char backend_scratch[kNofIOAdaptorScratchBytes] = {};
 };
 
 struct NofCapabilities {
@@ -135,6 +163,67 @@ class NVMeoFInitiator {
     virtual ErrorCode UnregisterMemory(void* ptr) = 0;
 
     virtual NofCapabilities GetCapabilities() const = 0;
+
+    // ---- I/O lanes -------------------------------------------------------
+    // A segment may be backed by several independent queue pairs ("lanes").
+    // Each lane is itself a NofSegmentHandle accepted by SubmitIO,
+    // PollCompletion and GetBlockSize, with the same single-polling-thread
+    // constraint per lane. Lane 0 is the handle returned by OpenSegment.
+    // Lane pointers are stable for the lifetime of the initiator and serve
+    // as worker-affinity / QoS keys. Defaults describe a single-lane backend.
+    virtual size_t GetLaneCount(const NofSegmentHandle* segment) const {
+        return segment != nullptr ? 1 : 0;
+    }
+    virtual NofSegmentHandle* GetLane(NofSegmentHandle* segment, size_t index) {
+        return index == 0 ? segment : nullptr;
+    }
+
+    // ---- Lane fault isolation ---------------------------------------------
+    // Error-code contract for SubmitIO / PollCompletion:
+    //   -EAGAIN / -ENOMEM : queue pressure, retry after polling completions;
+    //   -ENXIO / -ENODEV  : the lane is unusable, isolate it (below);
+    //   -EINVAL           : precondition violated;
+    //   other negatives   : this I/O failed, the lane is not implied dead.
+    virtual bool IsLaneHealthy(const NofSegmentHandle* /*lane*/) const {
+        return true;
+    }
+    // Thread-safe. After this returns, SubmitIO on the lane fails with
+    // -ENXIO; already-submitted I/O may still complete.
+    virtual void MarkLaneFailed(NofSegmentHandle* /*lane*/) {}
+    // @pre called on the lane's polling thread, after MarkLaneFailed, once
+    //      the caller has stopped submitting on the lane.
+    // Releases the lane's queue pair. I/O still outstanding is aborted; any
+    // callback for it runs synchronously inside this call with
+    // success=false. No callback for this lane runs after return, so the
+    // caller must treat every I/O without a callback as failed and never
+    // touch its adaptor again. The handle pointer stays valid (dead) for the
+    // initiator's lifetime: SubmitIO/PollCompletion return -ENXIO.
+    virtual void ReleaseFailedLane(NofSegmentHandle* /*lane*/) {}
+
+    // ---- Zero-copy device memory (GPU Direct) -------------------------------
+    // Classify a buffer. kError / kNotSupported mean the I/O must not be
+    // submitted (no silent host-staging fallback).
+    virtual NofBufferInfo ResolveBuffer(void* /*ptr*/, size_t /*length*/) {
+        return NofBufferInfo{};
+    }
+    // SubmitIO for a classified buffer. Same preconditions and callback
+    // contract as SubmitIO. Backends without device-memory support accept
+    // host buffers only.
+    virtual int SubmitIOWithBuffer(NofSegmentHandle* handle, void* buffer,
+                                   uint64_t byte_offset, uint64_t byte_length,
+                                   NofIOOp op, NofIOAdaptor* adaptor,
+                                   const NofBufferInfo& buffer_info) {
+        if (buffer_info.type != NofMemoryType::kHost) return -ENOTSUP;
+        return SubmitIO(handle, buffer, byte_offset, byte_length, op, adaptor);
+    }
+    // Register a whole buffer pool with one endpoint's transport (e.g. URMA
+    // memory regions). The returned token unregisters on destruction.
+    // nullptr means unsupported or failed; callers fall back to per-I/O
+    // registration by the transport.
+    virtual std::shared_ptr<void> RegisterMemoryForEndpoint(
+        const std::string& /*transport_str*/, void* /*ptr*/, size_t /*size*/) {
+        return nullptr;
+    }
 };
 
 // Registration page granularity fixed by the RegisterMemory contract above.

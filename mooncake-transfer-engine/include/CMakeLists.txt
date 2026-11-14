@@ -25,6 +25,11 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
       ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/adaptive_congestion_control/task_congestion_observation.h
     DESTINATION include)
 endif()
+install(FILES
+        scheduler/scheduling_hint.h
+        scheduler/scheduler_policy.h
+        scheduler/scheduler_core.h
+        DESTINATION include/scheduler)
 
 # Device API headers (header-only, consumed by EP kernel)
 install(FILES transport/device/device_transport.h

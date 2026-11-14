@@ -18,10 +18,16 @@ inline constexpr char kBatchOpLogSnapshotFormat[] =
 inline constexpr uint32_t kBatchOpLogWeightSnapshotSchemaVersion = 2;
 inline constexpr char kBatchOpLogWeightSnapshotFormat[] =
     "standby-oplog-materialized/v2";
-
 inline constexpr uint32_t kBatchOpLogObjectSnapshotSchemaVersion = 3;
 inline constexpr char kBatchOpLogObjectSnapshotFormat[] =
     "standby-oplog-materialized/v3";
+// v4 is a superset of v3: the weight and object_storage sections stay
+// optional and the manifest additionally carries the mandatory
+// vsegment_partitions artifact. Only v4 manifests may carry the
+// vsegment_partitions descriptor.
+inline constexpr uint32_t kBatchOpLogVSegmentSnapshotSchemaVersion = 4;
+inline constexpr char kBatchOpLogVSegmentSnapshotFormat[] =
+    "standby-oplog-materialized/v4";
 
 struct BatchOpLogSnapshotDescriptor {
     uint32_t schema_version{kBatchOpLogSnapshotSchemaVersion};
@@ -61,6 +67,7 @@ struct BatchOpLogSnapshotManifest {
     std::vector<BatchOpLogSnapshotChunkDescriptor> object_chunks;
     std::optional<BatchOpLogSnapshotObjectDescriptor> weight_metadata;
     std::optional<BatchOpLogSnapshotObjectDescriptor> object_storage;
+    std::optional<BatchOpLogSnapshotObjectDescriptor> vsegment_partitions;
 };
 
 std::string EncodeBatchOpLogSnapshotDescriptor(
@@ -96,6 +103,8 @@ std::string BuildBatchOpLogSnapshotObjectChunkKey(
     const std::string& snapshot_root, std::string_view snapshot_id,
     uint64_t chunk_index);
 std::string BuildBatchOpLogSnapshotWeightMetadataKey(
+    const std::string& snapshot_root, std::string_view snapshot_id);
+std::string BuildBatchOpLogSnapshotVSegmentPartitionsKey(
     const std::string& snapshot_root, std::string_view snapshot_id);
 
 std::string BuildBatchOpLogSnapshotObjectStorageKey(

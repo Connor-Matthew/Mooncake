@@ -73,8 +73,11 @@ bool IsAmbiguousTxnError(ErrorCode error) {
 }  // namespace
 
 OpLogBatchStorage::OpLogBatchStorage(std::string cluster_id,
-                                     HaKvBackend& backend)
-    : cluster_id_(std::move(cluster_id)), backend_(backend) {
+                                     HaKvBackend& backend,
+                                     std::string source_id)
+    : cluster_id_(std::move(cluster_id)),
+      source_id_(std::move(source_id)),
+      backend_(backend) {
     cluster_id_valid_ =
         NormalizeAndValidateClusterId(cluster_id_) && !cluster_id_.empty();
 }
@@ -98,7 +101,7 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto batch_range = BuildBatchRecordRange(cluster_id_, 0);
+    auto batch_range = BuildBatchRecordRange(cluster_id_, 0, source_id_);
     std::vector<KvPair> existing_batches;
     err = backend_.Range(batch_range.begin_key, batch_range.end_key,
                          /*limit=*/1, existing_batches);
@@ -110,7 +113,7 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    const std::string durable_key = BuildDurablePrefixKey(cluster_id_);
+    const std::string durable_key = BuildDurablePrefixKey(cluster_id_, source_id_);
     DurablePrefix initial{.batch_id = 0, .last_seq = 0};
     KvTxn txn;
     txn.compares.push_back({.key = durable_key,
@@ -143,7 +146,7 @@ ErrorCode OpLogBatchStorage::ReadDurablePrefix(DurablePrefix& prefix) {
         return ErrorCode::INVALID_PARAMS;
     }
     std::string value;
-    const std::string key = BuildDurablePrefixKey(cluster_id_);
+    const std::string key = BuildDurablePrefixKey(cluster_id_, source_id_);
     ErrorCode err = backend_.Get(key, value);
     if (err != ErrorCode::OK) {
         return err;
@@ -162,7 +165,7 @@ ErrorCode OpLogBatchStorage::ReadProducerView(
         return ErrorCode::INVALID_PARAMS;
     }
     std::string value;
-    ErrorCode err = backend_.Get(BuildProducerViewKey(cluster_id_), value);
+    ErrorCode err = backend_.Get(BuildProducerViewKey(cluster_id_, source_id_), value);
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -195,7 +198,7 @@ ErrorCode OpLogBatchStorage::ClaimProducerView(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    const std::string key = BuildProducerViewKey(cluster_id_);
+    const std::string key = BuildProducerViewKey(cluster_id_, source_id_);
     const std::string requested_value = std::to_string(producer_view_version);
     while (true) {
         std::string current_value;
@@ -367,7 +370,7 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefixImpl(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    const std::string durable_key = BuildDurablePrefixKey(cluster_id_);
+    const std::string durable_key = BuildDurablePrefixKey(cluster_id_, source_id_);
     const std::string encoded_batch = EncodeOpLogBatchRecord(batch);
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
     HAMetricManager::instance().observe_batch_record_batch_bytes(
@@ -376,7 +379,7 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefixImpl(
     KvTxn txn;
     if (producer_view_version != nullptr) {
         txn.compares.push_back(
-            {.key = BuildProducerViewKey(cluster_id_),
+            {.key = BuildProducerViewKey(cluster_id_, source_id_),
              .kind = KvCompareKind::kValueEquals,
              .expected_value = std::to_string(*producer_view_version)});
     }
@@ -385,13 +388,13 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefixImpl(
         {.key = durable_key,
          .kind = KvCompareKind::kValueEquals,
          .expected_value = EncodeDurablePrefix(expected_prefix)});
-    txn.puts.push_back({.key = BuildBatchRecordKey(cluster_id_, batch.batch_id),
-                        .value = encoded_batch});
-    txn.puts.push_back({.key = durable_key,
-                        .value = EncodeDurablePrefix({
-                            .batch_id = batch.batch_id,
-                            .last_seq = batch.last_seq,
-                        })});
+    txn.puts.push_back(
+        {.key = BuildBatchRecordKey(cluster_id_, batch.batch_id, source_id_),
+         .value = encoded_batch});
+    txn.puts.push_back(
+        {.key = durable_key,
+         .value = EncodeDurablePrefix(
+             {.batch_id = batch.batch_id, .last_seq = batch.last_seq})});
     ErrorCode err = backend_.Txn(txn);
     if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
         std::string raw_prefix;
@@ -442,7 +445,8 @@ ErrorCode OpLogBatchStorage::ReadBatch(uint64_t batch_id,
     }
     std::string value;
     ErrorCode err =
-        backend_.Get(BuildBatchRecordKey(cluster_id_, batch_id), value);
+        backend_.Get(BuildBatchRecordKey(cluster_id_, batch_id, source_id_),
+                     value);
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -466,7 +470,7 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
     if (!IsValidClusterId()) {
         return ErrorCode::INVALID_PARAMS;
     }
-    auto range = BuildBatchRecordRange(cluster_id_, after_batch_id);
+    auto range = BuildBatchRecordRange(cluster_id_, after_batch_id, source_id_);
     std::string begin_key = range.begin_key;
     do {
         std::vector<KvPair> kvs;
@@ -531,19 +535,54 @@ ErrorCode OpLogBatchStorage::RejectLegacyLayout() const {
         return err;
     }
 
+    // Legacy per-entry keys have the exact shape root + <20 digits> with no
+    // trailing '/'. Batch-layout keys (root + <source_id>/batches/... and
+    // root + <source_id>/durable_prefix) can sort lexically inside the legacy
+    // numeric range when the source id starts with a digit (e.g. an
+    // "ip:port" master id such as "141.61.84.245:50052"), so a bare range
+    // probe would false-positive on this node's own batch keys after a
+    // restart. Scan the range with pagination and reject only keys matching
+    // the legacy per-entry shape.
+    std::string begin_key = root + "00000000000000000000";
+    const std::string end_key = root + ":";
+    constexpr size_t kLegacyScanPageLimit = 100;
+    // Reused as the scan page buffer below and as the receiver of the
+    // snapshot-control scan that follows the loop.
     std::vector<KvPair> entries;
-    err = backend_.Range(root + "00000000000000000000", root + ":",
-                         /*limit=*/1, entries);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    if (!entries.empty()) {
-        LOG(ERROR) << "Legacy per-entry OpLog key exists for cluster="
-                   << cluster_id_
-                   << "; clear the legacy OpLog namespace before enabling "
-                      "batch-record OpLog";
-        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
-    }
+    do {
+        err = backend_.Range(begin_key, end_key, kLegacyScanPageLimit, entries);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        for (const auto& kv : entries) {
+            const std::string_view suffix(kv.key.data() + root.size(),
+                                          kv.key.size() - root.size());
+            bool is_legacy_entry = suffix.size() ==
+                                       static_cast<size_t>(
+                                           kOpLogBatchIdWidth) &&
+                                   suffix.find('/') ==
+                                       std::string_view::npos;
+            if (is_legacy_entry) {
+                for (char c : suffix) {
+                    if (c < '0' || c > '9') {
+                        is_legacy_entry = false;
+                        break;
+                    }
+                }
+            }
+            if (is_legacy_entry) {
+                LOG(ERROR) << "Legacy per-entry OpLog key exists for cluster="
+                           << cluster_id_ << ": key=" << kv.key
+                           << "; clear the legacy OpLog namespace before "
+                              "enabling batch-record OpLog";
+                return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            }
+        }
+        if (entries.size() < kLegacyScanPageLimit) {
+            break;
+        }
+        begin_key = entries.back().key + '\0';
+    } while (begin_key < end_key);
 
     entries.clear();
     const std::string snapshot_prefix = root + "snapshot/";

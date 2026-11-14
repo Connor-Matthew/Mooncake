@@ -254,6 +254,46 @@ class MasterServiceTestPeer {
         return service.need_mem_eviction_;
     }
 
+    // --- CVM slot ownership ------------------------------------------------
+    // These mirror the ownership driver the SlotOwnerHeartbeat uses, so a test
+    // can sequence expected/ready transitions without real etcd.
+    static void ExpectSlots(MasterService& service,
+                            const std::vector<uint16_t>& slots) {
+        service.UpdateExpectedSlots(slots);
+    }
+    static void MarkSlotsReady(MasterService& service,
+                               const std::vector<uint16_t>& slots) {
+        service.MarkSlotsReady(slots);
+    }
+    static ErrorCode SlotStatus(const MasterService& service,
+                                uint16_t slot) {
+        return service.CheckSlotServiceability(slot);
+    }
+    // Declares a ring transition from `previous_owners` to this master and
+    // imports one slot's metadata from the derived old owner.
+    static void SetRingOwners(MasterService& service,
+                              const std::vector<std::string>& previous,
+                              const std::vector<std::string>& alive) {
+        service.cvm_prev_primary_ids_ = previous;
+        service.cvm_last_primary_ids_ = {service.master_id_};
+        service.cvm_alive_master_ids_ = alive;
+        service.cvm_ring_revision_ = 10;
+    }
+    static ErrorCode ImportSlotMetadataForTesting(MasterService& service,
+                                                  uint16_t slot) {
+        return service.ImportSlotMetadata(slot, nullptr, nullptr);
+    }
+
+    // Additive OpLog replay materialization, exercised without a live stream.
+    static tl::expected<void, ErrorCode> MaterializeReplayedStateForTesting(
+        MasterService& service,
+        const std::vector<StandbyObjectEntry>& objects,
+        const std::vector<StandbySegmentInfo>& segments = {},
+        const std::vector<vsegment::PartitionVSegmentSnapshot>& partitions =
+            {}) {
+        return service.MaterializeReplayedState(objects, segments, partitions);
+    }
+
     static auto& NofSegmentManager(MasterService& service) {
         return service.nof_segment_manager_;
     }

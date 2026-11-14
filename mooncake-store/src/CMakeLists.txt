@@ -20,6 +20,24 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     common/file_util.cpp
     storage/distributed/kvcs/kvcs_efc_target.cpp
     storage/distributed/kvcs/kvcs_capi_driver.cpp
+    # 930: cluster view manager (CVM), partition routing and VSegment. Both
+    # master_service.cpp (master objects) and client_service.cpp (client
+    # objects) reference these, so they are compiled once here.
+    cvm/etcd_view_store.cpp
+    cvm/cvm_controller.cpp
+    cvm/slot_owner_heartbeat.cpp
+    cvm/slot_migrator.cpp
+    cvm/cvm_http_server.cpp
+    cvm/inter_master_rpc.cpp
+    partition/partition_router.cpp
+    vsegment/vsegment.cpp
+    vsegment/partition_quota_planner.cpp
+    vsegment/vsegment_runtime.cpp
+    vsegment/vsegment_transfer.cpp
+    vsegment/vsegment_ha.cpp
+    vsegment/vsegment_service.cpp
+    vsegment/vsegment_manager.cpp
+    vsegment/vsegment_metrics.cpp
     nof/nof_runtime.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES
@@ -71,6 +89,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
     shutdown_request.cpp
+    ha/master_metrics_reporter.cpp
     ha/kv/etcd_ha_kv_backend.cpp
     ha/kv/redis_ha_kv_backend.cpp
     ha/kv/ha_kv_backend_factory.cpp
@@ -89,6 +108,26 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
     task_manager.cpp
+    io_pattern/collector_impl.cpp
+    io_pattern/reporter.cpp
+    io_pattern/cfm_client_impl.cpp
+    io_pattern/cfm_ingress.cpp
+    io_pattern/cfm_service.cpp
+    io_pattern/cfm_ownership_client.cpp
+    io_pattern/cfm_protocol.cpp
+    io_pattern/resilient_cfm_channel.cpp
+    io_pattern/feedback.cpp
+    io_pattern/degrading_policy_engine.cpp
+    io_pattern/legacy_eviction_ops.cpp
+    io_pattern/kmeans_analyzer.cpp
+    io_pattern/observability.cpp
+    io_pattern/sliding_window_analyzer.cpp
+    io_pattern/tier_executor.cpp
+    io_pattern/resilient_analyzer.cpp
+    io_pattern/rpc_transport.cpp
+    io_pattern/runtime.cpp
+    io_pattern/threshold_analyzer.cpp
+    io_pattern/policy_strategies.cpp
     ha/oplog/oplog_types.cpp
     ha/oplog/oplog_batch_codec.cpp
     ha/oplog/oplog_batch_storage.cpp
@@ -426,30 +465,53 @@ if(USE_NOF)
         "`sudo bash dependencies.sh --with-spdk`, or set -DSPDK_ISA_L_LIB_DIR.")
   endif()
 
+  # 930: version-tolerant SPDK link list (upstream v23.01 baseline / the
+  # project's 26.x fork).
+  # - event/nvme must exist in every version; a missing one means `make
+  #   install` did not finish, so fail hard.
+  # - Version-dependent archives are added only when present: 26.x splits
+  #   lib/rdma into rdma_cm/rdma_provider/rdma_utils (absent without
+  #   --with-rdma), folds sock_posix into libspdk_sock.a and drops blobfs;
+  #   v23.01 ships a single rdma archive.
+  # - Every other archive should exist in any version; a missing one warns
+  #   (usually an incomplete install).
+  foreach(_lib event nvme)
+    if(NOT EXISTS "${SPDK_LIB_DIR}/libspdk_${_lib}.a")
+      message(FATAL_ERROR
+        "SPDK lib missing: ${SPDK_LIB_DIR}/libspdk_${_lib}.a — "
+        "回 SPDK 目录执行 sudo make install（部署文档阶段 2）")
+    endif()
+  endforeach()
+
+  set(SPDK_CORE_LIBS)
+  foreach(_lib event nvme sock_posix rdma rdma_cm rdma_provider rdma_utils)
+    if(EXISTS "${SPDK_LIB_DIR}/libspdk_${_lib}.a")
+      list(APPEND SPDK_CORE_LIBS ${SPDK_LIB_DIR}/libspdk_${_lib}.a)
+    endif()
+  endforeach()
+
+  set(SPDK_OPTIONAL_LIBS)
+  foreach(_lib vfio_user dma init env_dpdk log util blob bdev conf json jsonrpc
+               sock thread trace vmd rpc keyring keyring_file keyring_linux
+               fuse_dispatcher)
+    if(EXISTS "${SPDK_LIB_DIR}/libspdk_${_lib}.a")
+      list(APPEND SPDK_OPTIONAL_LIBS ${SPDK_LIB_DIR}/libspdk_${_lib}.a)
+    else()
+      message(WARNING
+        "SPDK lib not found (skipped): libspdk_${_lib}.a in ${SPDK_LIB_DIR}")
+    endif()
+  endforeach()
+
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/SpdkLinkDependencies.cmake)
+  mooncake_spdk_check_core_dpdk("${DPDK_LIB_DIR}")
+  mooncake_spdk_split_dpdk_libs(SPDK_SPLIT_DPDK_LIBS "${DPDK_LIB_DIR}")
+  mooncake_spdk_fuse_lib(SPDK_FUSE_LIB "${SPDK_LIB_DIR}")
+
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
-      ${SPDK_LIB_DIR}/libspdk_event.a
-      ${SPDK_LIB_DIR}/libspdk_rdma.a
-      ${SPDK_LIB_DIR}/libspdk_nvme.a
-      ${SPDK_LIB_DIR}/libspdk_sock_posix.a
+      ${SPDK_CORE_LIBS}
       -Wl,--no-whole-archive
-      ${SPDK_LIB_DIR}/libspdk_vfio_user.a
-      ${SPDK_LIB_DIR}/libspdk_dma.a
-      ${SPDK_LIB_DIR}/libspdk_init.a
-      ${SPDK_LIB_DIR}/libspdk_env_dpdk.a
-      ${SPDK_LIB_DIR}/libspdk_log.a
-      ${SPDK_LIB_DIR}/libspdk_util.a
-      ${SPDK_LIB_DIR}/libspdk_blob.a
-      ${SPDK_LIB_DIR}/libspdk_blobfs.a
-      ${SPDK_LIB_DIR}/libspdk_bdev.a
-      ${SPDK_LIB_DIR}/libspdk_conf.a
-      ${SPDK_LIB_DIR}/libspdk_json.a
-      ${SPDK_LIB_DIR}/libspdk_jsonrpc.a
-      ${SPDK_LIB_DIR}/libspdk_sock.a
-      ${SPDK_LIB_DIR}/libspdk_thread.a
-      ${SPDK_LIB_DIR}/libspdk_trace.a
-      ${SPDK_LIB_DIR}/libspdk_vmd.a
-      ${SPDK_LIB_DIR}/libspdk_rpc.a
+      ${SPDK_OPTIONAL_LIBS}
       ${DPDK_LIB_DIR}/librte_eal.a
       ${DPDK_LIB_DIR}/librte_mempool.a
       ${DPDK_LIB_DIR}/librte_ring.a
@@ -469,6 +531,7 @@ if(USE_NOF)
       ${DPDK_LIB_DIR}/librte_cryptodev.a
       ${DPDK_LIB_DIR}/librte_hash.a
       ${DPDK_LIB_DIR}/librte_rcu.a
+      ${SPDK_SPLIT_DPDK_LIBS}
       pthread
       dl
       numa
@@ -484,18 +547,97 @@ if(USE_NOF)
       ibverbs
       rdmacm
       ssl
-      bsd)
+      bsd
+      ${SPDK_FUSE_LIB})
+
+  # ---------------------------------------------------------------------------
+  # 930: URMA transport (UMDK). Objects inside libspdk_nvme.a reference liburma
+  # symbols, so the library has to appear after nvme in link order.
+  # Use -DUMDK_ROOT=/path/to/umdk-prefix for a non-system install.
+  # ---------------------------------------------------------------------------
+  if(USE_NOF_URMA)
+    # /usr/local may still hold an SPDK without the URMA transport (e.g. an
+    # upstream v23.01 leftover). nvme_urma.h is the fork's marker header, so
+    # reject that installation here instead of failing later on a missing
+    # symbol or declaration.
+    if(NOT EXISTS "${SPDK_INCLUDE_DIR}/spdk/nvme_urma.h")
+      message(
+        FATAL_ERROR
+          "USE_NOF_URMA=ON but ${SPDK_INCLUDE_DIR}/spdk/nvme_urma.h not found — "
+          "installed SPDK has no URMA transport. 确认 urma_modified_v6 分支产物"
+          "已 make install 到 /usr/local（部署文档阶段 2），或用 -DSPDK_INCLUDE_DIR="
+          "指向正确前缀")
+    endif()
+    set(UMDK_ROOT
+        ""
+        CACHE PATH "UMDK install prefix for the SPDK URMA transport")
+    find_path(
+      URMA_INCLUDE_DIR
+      NAMES urma_api.h
+      HINTS ${UMDK_ROOT}
+      PATHS /usr /usr/local
+      PATH_SUFFIXES include/ub/umdk/urma include/ub/umdk include)
+    find_library(
+      URMA_LIBRARY
+      NAMES urma
+      HINTS ${UMDK_ROOT}
+      PATHS /usr /usr/local
+      PATH_SUFFIXES lib64 lib build/lib lib)
+    if(NOT URMA_INCLUDE_DIR OR NOT URMA_LIBRARY)
+      message(
+        FATAL_ERROR
+          "USE_NOF_URMA=ON but UMDK (urma_api.h / liburma) not found; \
+pass -DUMDK_ROOT=/path/to/umdk-prefix")
+    endif()
+    message(STATUS "NoF URMA: include=${URMA_INCLUDE_DIR} lib=${URMA_LIBRARY}")
+    include(CheckCXXSourceCompiles)
+    set(_NOF_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES})
+    set(CMAKE_REQUIRED_INCLUDES ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR}
+                                ${URMA_INCLUDE_DIR})
+    check_cxx_source_compiles("
+#include <spdk/nvme_urma.h>
+static_assert(sizeof(decltype(&spdk_nvme_urma_register_memory_for_qpair)) > 0);
+int main() { return 0; }
+" HAVE_SPDK_URMA_WHOLE_POOL)
+    set(CMAKE_REQUIRED_INCLUDES ${_NOF_REQUIRED_INCLUDES})
+    unset(_NOF_REQUIRED_INCLUDES)
+    list(APPEND SPDK_STATIC_LIBS ${URMA_LIBRARY})
+  endif()
+
+  # 930: NoF GPU Direct (memory domains) needs the CUDA driver API for pointer
+  # classification and DMA-BUF export.
+  if(USE_NOF_GPU_DIRECT)
+    find_package(CUDAToolkit REQUIRED)
+    message(STATUS "NoF GPU Direct: CUDA driver library required for provider")
+    list(APPEND SPDK_STATIC_LIBS CUDA::cuda_driver)
+  endif()
 
   # ---------------------------------------------------------------------------
   # SPDK-backed NoF initiator implementation, linked PRIVATE so SPDK/DPDK
   # static libs stop propagating as usage requirements to client/master.
+  # The 930 URMA memory-domain provider is SPDK-facing, so it is compiled here
+  # as well (private: no SPDK header may leak into include/).
   # ---------------------------------------------------------------------------
   add_library(mooncake_nof_spdk STATIC nof/spdk_initiator.cpp)
+  if(USE_NOF_URMA)
+    target_sources(mooncake_nof_spdk PRIVATE nof/nof_memory_domain.cpp)
+  endif()
   target_include_directories(
     mooncake_nof_spdk
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SPDK_INCLUDE_DIR}
             ${DPDK_INCLUDE_DIR})
+  if(USE_NOF_URMA)
+    target_include_directories(mooncake_nof_spdk PRIVATE ${URMA_INCLUDE_DIR})
+    if(HAVE_SPDK_URMA_WHOLE_POOL)
+      target_compile_definitions(mooncake_nof_spdk
+                                 PRIVATE HAVE_SPDK_URMA_WHOLE_POOL=1)
+    endif()
+  endif()
+  if(USE_NOF_GPU_DIRECT)
+    target_include_directories(mooncake_nof_spdk
+                               PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  endif()
   target_link_libraries(mooncake_nof_spdk
                         PRIVATE ${SPDK_STATIC_LIBS} glog::glog
                                 mooncake_nof_core yalantinglibs::yalantinglibs)
@@ -569,13 +711,22 @@ elseif(USE_HIP)
   find_package(hip REQUIRED)
 endif()
 
+# SpDiag instrumentation. Store sources emit perf points through
+# spdiag/auto_perf.h against a shared .def file that lives next to the Python
+# extension, so every object library that includes it needs both the SpDiag
+# include path (mock headers or the system SDK) and that directory.
+include(${CMAKE_SOURCE_DIR}/mooncake-common/FindSpDiag.cmake)
+set(MOONCAKE_STORE_SPDIAG_DEF_DIR
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-integration/store)
+
 # Sources used by both the Master and Client sides of Store.
 add_library(mooncake_store_shared_objects OBJECT
             ${MOONCAKE_STORE_SHARED_SOURCES})
 set_target_properties(mooncake_store_shared_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mooncake_store_shared_objects
-                           PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
+                           PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
+                                   ${MOONCAKE_STORE_SPDIAG_DEF_DIR})
 target_link_libraries(
   mooncake_store_shared_objects
   PRIVATE cachelib_memory_allocator
@@ -585,6 +736,7 @@ target_link_libraries(
           mooncake_common
           $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
+          SpDiag::spdiag_lib
           yalantinglibs::yalantinglibs)
 if(MOONCAKE_KVCS_SDK_FOUND)
   target_compile_definitions(mooncake_store_shared_objects
@@ -605,7 +757,8 @@ set_target_properties(mooncake_store_master_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(
   mooncake_store_master_objects PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
-                                        ${CMAKE_CURRENT_SOURCE_DIR})
+                                        ${CMAKE_CURRENT_SOURCE_DIR}
+                                        ${MOONCAKE_STORE_SPDIAG_DEF_DIR})
 target_link_libraries(
   mooncake_store_master_objects
   PRIVATE mooncake_store_shared_objects
@@ -620,6 +773,7 @@ target_link_libraries(
           Mooncake::xxhash
           OpenSSL::Crypto
           asio_shared
+          SpDiag::spdiag_lib
           yalantinglibs::yalantinglibs)
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store_master_objects
@@ -647,7 +801,8 @@ set_target_properties(mooncake_store_client_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(
   mooncake_store_client_objects PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
-                                        ${CMAKE_CURRENT_SOURCE_DIR})
+                                        ${CMAKE_CURRENT_SOURCE_DIR}
+                                        ${MOONCAKE_STORE_SPDIAG_DEF_DIR})
 target_link_libraries(
   mooncake_store_client_objects
   PRIVATE mooncake_store_shared_objects
@@ -661,6 +816,7 @@ target_link_libraries(
           mooncake_common
           $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
+          SpDiag::spdiag_lib
           yalantinglibs::yalantinglibs)
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store_client_objects
@@ -744,6 +900,9 @@ if(USE_NOF)
   # SPDK-backed initiator.
   target_link_libraries(mooncake_store_master PRIVATE mooncake_nof_spdk)
 endif()
+# SpDiag perf points (see the object libraries above): the static library has
+# to carry the link requirement so mooncake_master ends up with libspdiag.
+target_link_libraries(mooncake_store_master PRIVATE SpDiag::spdiag_lib)
 
 # Complete public Store library.
 add_library(
@@ -775,6 +934,8 @@ endif()
 if(MOONCAKE_KVCS_SDK_FOUND)
   target_link_libraries(mooncake_store PRIVATE PkgConfig::KVCS)
 endif()
+# SpDiag perf points (see the object libraries above).
+target_link_libraries(mooncake_store PRIVATE SpDiag::spdiag_lib)
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
 endif()
@@ -845,7 +1006,12 @@ target_link_libraries(
           yalantinglibs::yalantinglibs
           ${ETCD_WRAPPER_LIB}
           ${ALLOCATOR_LIBS}
-          asio_shared)
+          asio_shared
+          SpDiag::spdiag_lib)
+# mooncake_store is static and propagates optional runtime dependencies to its
+# consumers. The metadata-only master does not use accelerator staging, so drop
+# those dependencies when they do not satisfy any symbols in the final binary.
+target_link_options(mooncake_master PRIVATE "LINKER:--as-needed")
 if(USE_SUNRISE)
   target_link_directories(mooncake_master PRIVATE ${MC_TANGRT_ROOT}/lib)
 endif()
@@ -853,11 +1019,18 @@ endif()
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_master build_etcd_wrapper)
 endif()
+
 if(CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")
   target_compile_options(mooncake_master PRIVATE -Os)
   target_link_options(mooncake_master PRIVATE -Os -s)
 endif()
 install(TARGETS mooncake_master DESTINATION bin)
+
+# 930: VSegment quota planner tool.
+add_executable(vsegment_quota_planner ../tools/vsegment_quota_planner.cpp)
+target_link_libraries(vsegment_quota_planner PRIVATE mooncake_store glog::glog
+                                                        gflags::gflags)
+install(TARGETS vsegment_quota_planner DESTINATION bin)
 
 # Store Client executable.
 add_executable(mooncake_client real_client_main.cpp)
@@ -952,3 +1125,16 @@ if(WITH_STORE_C_SHARED)
     "$<$<CONFIG:Release>:-Wl,-s>")
   install(TARGETS mooncake_store_c DESTINATION lib)
 endif()
+
+# NoF segment register/unregister tools (local helper binaries)
+add_executable(nof_register nof_register.cpp)
+target_link_libraries(
+  nof_register PRIVATE mooncake_store mooncake_common pthread asio_shared
+                       SpDiag::spdiag_lib)
+target_link_options(nof_register PRIVATE "LINKER:--as-needed")
+
+add_executable(nof_unregister nof_unregister.cpp)
+target_link_libraries(
+  nof_unregister PRIVATE mooncake_store mooncake_common pthread asio_shared
+                         SpDiag::spdiag_lib)
+target_link_options(nof_unregister PRIVATE "LINKER:--as-needed")

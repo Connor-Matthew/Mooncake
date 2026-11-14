@@ -1,5 +1,7 @@
 #include "spdk_controller_config.h"
 
+#include <glog/logging.h>
+
 #include "environ.h"
 #include "environment_variables.h"
 
@@ -20,6 +22,18 @@ SpdkControllerConfig SpdkControllerConfig::FromEnvironment() {
         Environ::Read(Variables::MC_NVME_FABRICS_CONNECT_TIMEOUT_US);
     config.header_digest = Environ::Read(Variables::MC_NVME_HEADER_DIGEST);
     config.data_digest = Environ::Read(Variables::MC_NVME_DATA_DIGEST);
+    config.keep_alive_timeout_ms =
+        Environ::Read(Variables::MC_NVME_KEEP_ALIVE_TIMEOUT_MS);
+    if (const auto qpairs =
+            Environ::Read(Variables::MC_NOF_QPAIRS_PER_SEGMENT)) {
+        if (*qpairs == 0 || *qpairs > kMaxQpairsPerSegment) {
+            LOG(WARNING) << "Invalid MC_NOF_QPAIRS_PER_SEGMENT=" << *qpairs
+                         << " (allowed 1.." << kMaxQpairsPerSegment
+                         << "), using default " << kDefaultQpairsPerSegment;
+        } else {
+            config.qpairs_per_segment = *qpairs;
+        }
+    }
     return config;
 }
 

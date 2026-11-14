@@ -155,6 +155,72 @@ TEST(BatchOpLogSnapshotTypesTest, WeightSnapshotRequiresVersionedArtifact) {
     EXPECT_FALSE(legacy->weight_metadata);
 }
 
+TEST(BatchOpLogSnapshotTypesTest, VSegmentSnapshotRequiresVersionedArtifact) {
+    // v4 without the vsegment section is rejected, mirroring v2 without
+    // weight_metadata.
+    auto manifest = MakeManifest();
+    manifest.schema_version = kBatchOpLogVSegmentSnapshotSchemaVersion;
+    manifest.snapshot_format = kBatchOpLogVSegmentSnapshotFormat;
+    ExpectManifestRejected(EncodeBatchOpLogSnapshotManifest(manifest));
+    manifest.vsegment_partitions = BatchOpLogSnapshotObjectDescriptor{
+        .key = "snapshots/batch-oplog/9-12345/vsegment_partitions.bin",
+        .stored_size = 42,
+        .crc32c = 7,
+    };
+    auto encoded = EncodeBatchOpLogSnapshotManifest(manifest);
+    auto decoded = DecodeBatchOpLogSnapshotManifest(encoded);
+    ASSERT_TRUE(decoded) << decoded.error();
+    ASSERT_TRUE(decoded->vsegment_partitions);
+    EXPECT_EQ(42u, decoded->vsegment_partitions->stored_size);
+    EXPECT_FALSE(decoded->weight_metadata);
+    auto json = ParseJson(encoded);
+    json["vsegment_partitions"]["stored_size"] = 0;
+    ExpectManifestRejected(WriteJson(json));
+    // v2 carrying the section is rejected: only v4 allows vsegment_partitions.
+    manifest.schema_version = kBatchOpLogWeightSnapshotSchemaVersion;
+    manifest.snapshot_format = kBatchOpLogWeightSnapshotFormat;
+    manifest.weight_metadata = BatchOpLogSnapshotObjectDescriptor{
+        .key = "snapshots/batch-oplog/9-12345/weight_metadata.bin",
+        .stored_size = 42,
+        .crc32c = 7,
+    };
+    ExpectManifestRejected(EncodeBatchOpLogSnapshotManifest(manifest));
+    // v1 carrying the section is rejected as well.
+    manifest.schema_version = kBatchOpLogSnapshotSchemaVersion;
+    manifest.snapshot_format = kBatchOpLogSnapshotFormat;
+    manifest.weight_metadata.reset();
+    ExpectManifestRejected(EncodeBatchOpLogSnapshotManifest(manifest));
+    // v4 is a superset of v3: the weight section may ride along.
+    manifest.schema_version = kBatchOpLogVSegmentSnapshotSchemaVersion;
+    manifest.snapshot_format = kBatchOpLogVSegmentSnapshotFormat;
+    manifest.weight_metadata = BatchOpLogSnapshotObjectDescriptor{
+        .key = "snapshots/batch-oplog/9-12345/weight_metadata.bin",
+        .stored_size = 42,
+        .crc32c = 7,
+    };
+    auto superset = DecodeBatchOpLogSnapshotManifest(
+        EncodeBatchOpLogSnapshotManifest(manifest));
+    ASSERT_TRUE(superset) << superset.error();
+    ASSERT_TRUE(superset->vsegment_partitions);
+    ASSERT_TRUE(superset->weight_metadata);
+    EXPECT_EQ(42u, superset->weight_metadata->stored_size);
+    // The object_storage section may ride along in v4 as well.
+    manifest.object_storage = BatchOpLogSnapshotObjectDescriptor{
+        .key = "snapshots/batch-oplog/9-12345/object_storage.bin",
+        .stored_size = 42,
+        .crc32c = 7,
+    };
+    auto with_objects = DecodeBatchOpLogSnapshotManifest(
+        EncodeBatchOpLogSnapshotManifest(manifest));
+    ASSERT_TRUE(with_objects) << with_objects.error();
+    ASSERT_TRUE(with_objects->vsegment_partitions);
+    ASSERT_TRUE(with_objects->object_storage);
+    // v3 (object snapshot) carrying the vsegment section is rejected.
+    manifest.schema_version = kBatchOpLogObjectSnapshotSchemaVersion;
+    manifest.snapshot_format = kBatchOpLogObjectSnapshotFormat;
+    ExpectManifestRejected(EncodeBatchOpLogSnapshotManifest(manifest));
+}
+
 TEST(BatchOpLogSnapshotTypesTest, JsonRoundTripPreservesEscapedKeys) {
     auto descriptor = MakeDescriptor();
     descriptor.manifest_key = R"(snapshots/"quoted"/manifest\key.json)";

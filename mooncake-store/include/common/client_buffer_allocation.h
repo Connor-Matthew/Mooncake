@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -79,6 +80,12 @@ void free_buffer_mmap_memory(void* ptr, size_t total_size);
 // only these. Returns `nodes` unchanged if the kernel does not answer (a
 // seccomp profile that blocks get_mempolicy blocks mbind too).
 std::vector<int> FilterNumaNodesToAllowed(const std::vector<int>& nodes);
+
+// Parse a comma-separated list of non-negative NUMA node IDs. Whitespace
+// around entries is ignored. Empty entries, duplicate nodes, and values
+// outside the range of int are rejected.
+std::optional<std::vector<int>> try_parse_numa_nodes(
+    const std::string& node_list);
 
 // One region per node, each bound to its node. With base pages the mapping is
 // advised for THP and total_size must be a multiple of 2MB * numa_nodes.size().

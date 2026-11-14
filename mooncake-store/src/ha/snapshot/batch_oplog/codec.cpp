@@ -37,6 +37,18 @@ DecodeBatchOpLogSnapshotWeightMetadata(const std::vector<uint8_t>& encoded) {
     return Decode<WeightMetadataSnapshot>(encoded, "snapshot weight metadata");
 }
 
+std::vector<uint8_t> EncodeBatchOpLogSnapshotVSegmentPartitions(
+    const std::vector<vsegment::PartitionVSegmentSnapshot>& partitions) {
+    return Encode(partitions);
+}
+
+tl::expected<std::vector<vsegment::PartitionVSegmentSnapshot>, std::string>
+DecodeBatchOpLogSnapshotVSegmentPartitions(
+    const std::vector<uint8_t>& encoded) {
+    return Decode<std::vector<vsegment::PartitionVSegmentSnapshot>>(
+        encoded, "snapshot vsegment partitions");
+}
+
 std::vector<uint8_t> EncodeBatchOpLogSnapshotSegments(
     const std::vector<StandbySegmentInfo>& segments) {
     return Encode(segments);

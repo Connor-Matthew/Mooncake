@@ -2,7 +2,9 @@
 
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <utility>
 
 #include <glog/logging.h>
 
@@ -94,6 +96,7 @@ inline std::string ResolveConfiguredHABackendConnstring(
 // The configuration for the master server
 struct MasterConfig {
     MetricsBootstrapConfig metrics;
+    uint32_t admin_metrics_log_interval_sec = 10;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
     uint32_t handler_worker_thread_num;
@@ -113,6 +116,13 @@ struct MasterConfig {
     double nof_eviction_high_watermark_ratio;
     int64_t client_active_ttl_sec;
     int64_t client_suspicion_ttl_sec;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    // When true, merged client reports may drive bounded evictions of the
+    // coldest keys even when the memory watermark is not exceeded. All three
+    // default to disabled (watermark-only eviction) unless explicitly set.
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     int64_t nof_heartbeat_interval_sec;
     uint32_t nof_heartbeat_probe_timeout_ms;
     uint32_t nof_heartbeat_failures_threshold;
@@ -125,6 +135,11 @@ struct MasterConfig {
     std::string etcd_endpoints;
     int32_t etcd_max_send_message_bytes = 2 * 1024 * 1024;
 
+    // Master view lease TTL in seconds (HA leadership lease).
+    // When the lease expires without successful renewal, the Master
+    // is considered dead and a standby can take over.
+    int64_t master_view_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
+
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
@@ -135,7 +150,26 @@ struct MasterConfig {
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t batch_oplog_retry_timeout_sec = 180;
 
+    // Metrics reporting to HA backend (etcd/redis).
+    bool enable_metrics_report_to_backend =
+        DEFAULT_ENABLE_METRICS_REPORT_TO_BACKEND;
+    int metrics_report_interval_sec = DEFAULT_METRICS_REPORT_INTERVAL_SEC;
+    int metrics_report_lease_ttl_sec = DEFAULT_METRICS_REPORT_LEASE_TTL_SEC;
+
     std::string cluster_id;
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为
+    // standby。
+    uint32_t submaster_count = 1;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用）：本集群 segment 的物理介质标识与「vsegment 专用且空」声明。
+    // 见 MasterServiceConfig 同名字段说明。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
     std::string root_fs_dir;
     int64_t global_file_segment_size;
     std::string memory_allocator;
@@ -188,11 +222,29 @@ struct MasterConfig {
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
 
+    // Strict replica allocation: require memory-only multi-replica requests
+    // to allocate exactly replica_num replicas in PutStart/UpsertStart,
+    // instead of best-effort degradation to fewer replicas.
+    bool strict_replica_allocation = false;
+
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY so the next Get is fast.
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     // Max promotion tasks PromotionObjectHeartbeat returns to a single
     // client per call. Each task is a synchronous SSD-read + RDMA-write
     // on the client; serializing them avoids blocking past the client-
@@ -253,6 +305,10 @@ class MasterServiceSupervisorConfig {
         DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     std::string rpc_address = "0.0.0.0";
+    // Interval (seconds, clamped to >=1) of the admin metrics log thread,
+    // which emits both the "Master Admin Metrics" line and the periodic
+    // "VSegment Status" line. --admin_metrics_log_interval_sec overrides.
+    uint32_t admin_metrics_log_interval_sec = 10;
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
@@ -262,6 +318,7 @@ class MasterServiceSupervisorConfig {
     std::string ha_backend_connstring;
     int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints = "0.0.0.0:2379";
+    int64_t master_view_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     // OpLog store configuration
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
@@ -273,6 +330,34 @@ class MasterServiceSupervisorConfig {
     uint32_t batch_oplog_retry_timeout_sec = 180;
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    uint32_t submaster_count = 1;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用）：见 MasterServiceConfig 同名字段说明。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
+    // vsegment auto-plan 重试策略：master.cpp 从 --vsegment_auto_plan /
+    // --vsegment_member_count / --vsegment_stripe_size /
+    // --vsegment_member_extent_size / --vsegment_reserved_ratio flags 解析
+    // 填充（flags 是唯一事实源，不进 JSON schema），supervisor 在 serve
+    // phase 前经 SetVSegmentAutoPlanPolicy 注入 MasterService。
+    // vsegment_auto_plan=false（或 member_count==0）表示未启用。
+    bool vsegment_auto_plan = false;
+    uint32_t vsegment_auto_plan_member_count = 0;
+    uint64_t vsegment_auto_plan_stripe_size = 0;
+    uint64_t vsegment_auto_plan_member_extent_size = 0;
+    double vsegment_auto_plan_reserved_ratio = 0.0;
+
+    // Metrics reporting to HA backend (etcd/redis).
+    bool enable_metrics_report_to_backend =
+        DEFAULT_ENABLE_METRICS_REPORT_TO_BACKEND;
+    int metrics_report_interval_sec = DEFAULT_METRICS_REPORT_INTERVAL_SEC;
+    int metrics_report_lease_ttl_sec = DEFAULT_METRICS_REPORT_LEASE_TTL_SEC;
+
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -302,16 +387,36 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool strict_replica_allocation = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     uint32_t promotion_max_per_heartbeat = 1;
     std::string dynamic_replication_mode = "off";
     uint32_t dynamic_replication_heat_window_seconds = 10;
     double dynamic_replication_admission_qps_threshold = 0.8;
     size_t dynamic_replication_max_memory_replicas = 2;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    // Mirrors MasterConfig / WrappedMasterServiceConfig; carried through the
+    // supervisor config used by HA deployments.
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -342,6 +447,7 @@ class MasterServiceSupervisorConfig {
     MasterServiceSupervisorConfig(const MasterConfig& config) {
         // Set required parameters using RequiredParam
         metrics = config.metrics;
+        admin_metrics_log_interval_sec = config.admin_metrics_log_interval_sec;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         max_kv_soft_pin_ttl = config.max_kv_soft_pin_ttl;
@@ -356,6 +462,11 @@ class MasterServiceSupervisorConfig {
             config.nof_eviction_high_watermark_ratio;
         client_active_ttl_sec = config.client_active_ttl_sec;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -363,11 +474,18 @@ class MasterServiceSupervisorConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        strict_replica_allocation = config.strict_replica_allocation;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
@@ -402,6 +520,7 @@ class MasterServiceSupervisorConfig {
         etcd_endpoints = config.etcd_endpoints;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
+        master_view_lease_ttl_sec = config.master_view_lease_ttl_sec;
         enable_oplog = config.enable_oplog;
         weight_management_oplog_capability_confirmed =
             config.weight_management_oplog_capability_confirmed;
@@ -413,6 +532,17 @@ class MasterServiceSupervisorConfig {
         batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
+        submaster_count = config.submaster_count;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
+
+        enable_metrics_report_to_backend =
+            config.enable_metrics_report_to_backend;
+        metrics_report_interval_sec = config.metrics_report_interval_sec;
+        metrics_report_lease_ttl_sec = config.metrics_report_lease_ttl_sec;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
 
@@ -549,6 +679,10 @@ class WrappedMasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     ViewVersionId view_version = 0;
     int64_t client_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t client_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC;
@@ -561,11 +695,29 @@ class WrappedMasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool strict_replica_allocation = false;
+    // SP930 port: serving primaries restore from the PromotionContext only;
+    // snapshot bootstrap belongs to standby. The standby-side tests opt in
+    // explicitly; the supervisor always leaves it off.
+    bool enable_snapshot_restore = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     uint32_t promotion_max_per_heartbeat = 1;
     std::string dynamic_replication_mode = "off";
     uint32_t dynamic_replication_heat_window_seconds = 10;
@@ -594,6 +746,30 @@ class WrappedMasterServiceConfig {
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
+    // Stable identifier of this master instance, used as the SlotOwner
+    // primary_master_id for the KV partition view. Empty disables the
+    // SlotOwnerHeartbeat. In HA mode this is the local_hostname.
+    std::string master_id;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled; set a non-zero port to expose /segment_view and
+    // /health for inspection.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为
+    // standby。
+    uint32_t submaster_count = 1;
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用，不应由用户在配额文件中手写）：
+    //   cvm_segment_default_medium —— 本集群 segment 的物理介质标识，与
+    //       VSegmentProfile.required_medium 匹配。默认 "REGISTERED_MEMORY"。
+    //       未来由底层 allocator 在 mount 时上报真实介质。
+    //   cvm_segments_vsegment_exclusive —— 声明本集群 segment 为「vsegment
+    //       专用且当前为空」。true 时自动发现可直接按 capacity 切分；false
+    //       时自动发现拒绝，需通过空间管理机制显式声明可分配范围（避免把
+    //       总容量当作空闲空间）。仅在初始化阶段整个集群专供 vsegment 时置 true。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -643,6 +819,11 @@ class WrappedMasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         view_version = view_version_param;
         client_active_ttl_sec = config.client_active_ttl_sec;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
@@ -654,11 +835,18 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        strict_replica_allocation = config.strict_replica_allocation;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
@@ -692,6 +880,12 @@ class WrappedMasterServiceConfig {
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
+        submaster_count = config.submaster_count;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
@@ -768,6 +962,11 @@ class WrappedMasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         view_version = view_version_param;
         client_active_ttl_sec = config.client_active_ttl_sec;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
@@ -780,11 +979,18 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        strict_replica_allocation = config.strict_replica_allocation;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
@@ -818,6 +1024,13 @@ class WrappedMasterServiceConfig {
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
+        master_id = config.local_hostname;
+        submaster_count = config.submaster_count;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
@@ -875,6 +1088,7 @@ class MasterServiceConfigBuilder {
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha_ = false;
     bool enable_offload_ = false;
+    bool strict_replica_allocation_ = false;
     std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
     // OpLog store configuration
@@ -1011,6 +1225,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_offload(bool enable) {
         enable_offload_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_strict_replica_allocation(bool strict) {
+        strict_replica_allocation_ = strict;
         return *this;
     }
 
@@ -1216,6 +1435,10 @@ class MasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     // Zero denotes a directly constructed, supervisor-unmanaged service;
     // HA supervisor serving paths always inject the acquired non-zero view.
     ViewVersionId view_version = 0;
@@ -1230,11 +1453,25 @@ class MasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool strict_replica_allocation = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     uint32_t promotion_max_per_heartbeat = 1;
     std::string dynamic_replication_mode = "off";
     uint32_t dynamic_replication_heat_window_seconds = 10;
@@ -1265,6 +1502,30 @@ class MasterServiceConfig {
     uint64_t restore_repair_durable_timeout_ms =
         DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
+    // Stable identifier of this master instance, used as the SlotOwner
+    // primary_master_id for the KV partition view. Empty disables the
+    // SlotOwnerHeartbeat. In HA mode this is the local_hostname.
+    std::string master_id;
+    // CVM external HTTP API (CvmHttpServer) bind config. Port 0 keeps the
+    // HTTP server disabled; set a non-zero port to expose /segment_view and
+    // /health for inspection.
+    uint16_t cvm_http_port = 0;
+    std::string cvm_http_host = "0.0.0.0";
+    // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
+    // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为
+    // standby。
+    uint32_t submaster_count = 1;
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用，不应由用户在配额文件中手写）：
+    //   cvm_segment_default_medium —— 本集群 segment 的物理介质标识，与
+    //       VSegmentProfile.required_medium 匹配。默认 "REGISTERED_MEMORY"。
+    //       未来由底层 allocator 在 mount 时上报真实介质。
+    //   cvm_segments_vsegment_exclusive —— 声明本集群 segment 为「vsegment
+    //       专用且当前为空」。true 时自动发现可直接按 capacity 切分；false
+    //       时自动发现拒绝，需通过空间管理机制显式声明可分配范围（避免把
+    //       总容量当作空闲空间）。仅在初始化阶段整个集群专供 vsegment 时置 true。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -1310,6 +1571,11 @@ class MasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         view_version = config.view_version;
         client_active_ttl_sec = config.client_active_ttl_sec;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
@@ -1321,11 +1587,18 @@ class MasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        strict_replica_allocation = config.strict_replica_allocation;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
@@ -1357,6 +1630,13 @@ class MasterServiceConfig {
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
+        master_id = config.master_id;
+        cvm_http_port = config.cvm_http_port;
+        cvm_http_host = config.cvm_http_host;
+        submaster_count = config.submaster_count;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator =
@@ -1422,6 +1702,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
+    config.strict_replica_allocation = strict_replica_allocation_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
     config.enable_oplog = enable_oplog_;

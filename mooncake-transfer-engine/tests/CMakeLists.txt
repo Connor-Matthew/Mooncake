@@ -58,6 +58,15 @@ add_test(
     ${CMAKE_COMMAND} -DTRANSFER_ENGINE_LIBRARY=$<TARGET_FILE:transfer_engine>
     -P
     ${CMAKE_CURRENT_BINARY_DIR}/installed_congestion_control_header_test.cmake)
+add_executable(scheduler_policy_test scheduler_policy_test.cpp)
+target_link_libraries(scheduler_policy_test PRIVATE transfer_engine gtest
+                                                    gtest_main)
+add_test(NAME scheduler_policy_test COMMAND scheduler_policy_test)
+
+add_executable(scheduler_core_test scheduler_core_test.cpp)
+target_link_libraries(scheduler_core_test PRIVATE transfer_engine gtest
+                                                  gtest_main)
+add_test(NAME scheduler_core_test COMMAND scheduler_core_test)
 
 if(USE_HIP)
   file(GLOB TEST_SOURCES "*.cpp")
@@ -556,6 +565,21 @@ endif()
 
 # UB transport test with URMA endpoint and mock support
 if(USE_UB)
+  add_executable(urma_eid_test ${WORKSPACE}/urma_eid_test.cpp)
+  target_include_directories(urma_eid_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include ${urma_INCLUDE_DIR})
+  target_link_libraries(urma_eid_test PRIVATE gtest gtest_main)
+  add_test(NAME urma_eid_test COMMAND urma_eid_test)
+
+  add_executable(urma_compat_test ${WORKSPACE}/urma_compat_test.cpp)
+  target_include_directories(urma_compat_test PRIVATE ${urma_INCLUDE_DIR})
+  target_link_libraries(urma_compat_test PRIVATE transfer_engine gtest
+                                                   gtest_main)
+  if(NOT URMA_LIBRARY)
+    target_compile_definitions(urma_compat_test PRIVATE MOONCAKE_MOCK_URMA=1)
+  endif()
+  add_test(NAME urma_compat_test COMMAND urma_compat_test)
+
   add_executable(ub_transport_test ${WORKSPACE}/ub_transport_test.cpp)
   target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest
                                                  gtest_main glog::glog pthread)

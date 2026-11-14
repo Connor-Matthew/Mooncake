@@ -32,6 +32,7 @@ class TestMooncakeConfig(unittest.TestCase):
             "tenant_id": "tenant-a",
             "enable_client_http_server": True,
             "client_http_port": 19300,
+            "ub_numa_nodes": [0, 2],
         }
 
     def tearDown(self):
@@ -59,6 +60,7 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.tenant_id, "tenant-a")
         self.assertEqual(config.enable_client_http_server, True)
         self.assertEqual(config.client_http_port, 19300)
+        self.assertEqual(config.ub_numa_nodes, "0,2")
 
     def test_load_with_default_values(self):
         """Test loading configuration with default values"""
@@ -79,6 +81,14 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.tenant_id, "default")
         self.assertEqual(config.enable_client_http_server, False)
         self.assertEqual(config.client_http_port, 9300)
+        self.assertEqual(config.ub_numa_nodes, "")
+
+    def test_rejects_invalid_ub_numa_nodes(self):
+        for value in ("0,,2", "-1", "1,1", [0, 0], [0, "node1"]):
+            with self.subTest(value=value):
+                self.write_config({**self.valid_config, "ub_numa_nodes": value})
+                with self.assertRaises(ValueError):
+                    MooncakeConfig.from_file(self.config_file)
 
     def test_load_tenant_id_from_file(self):
         """Test loading tenant_id from configuration file"""
@@ -218,6 +228,7 @@ class TestMooncakeConfig(unittest.TestCase):
         os.environ["MOONCAKE_CLIENT_HTTP_PORT"] = str(
             self.valid_config["client_http_port"]
         )
+        os.environ["MOONCAKE_UB_NUMA_NODES"] = "0,2"
 
         try:
             config = MooncakeConfig.load_from_env()
@@ -247,6 +258,7 @@ class TestMooncakeConfig(unittest.TestCase):
             self.assertEqual(
                 config.client_http_port, self.valid_config["client_http_port"]
             )
+            self.assertEqual(config.ub_numa_nodes, "0,2")
 
         finally:
             # Clean up environment variable
@@ -261,6 +273,7 @@ class TestMooncakeConfig(unittest.TestCase):
             del os.environ["MOONCAKE_TENANT_ID"]
             del os.environ["MOONCAKE_ENABLE_CLIENT_HTTP_SERVER"]
             del os.environ["MOONCAKE_CLIENT_HTTP_PORT"]
+            del os.environ["MOONCAKE_UB_NUMA_NODES"]
 
     def test_tenant_id_from_env(self):
         """Test loading tenant_id from MOONCAKE_TENANT_ID"""
