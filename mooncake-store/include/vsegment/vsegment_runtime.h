@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -97,6 +98,12 @@ class LogicalRangeAllocator {
     // a terminal operation outcome, so the same operation id may be retried.
     ErrorCode CancelReservation(const std::string& operation_id);
     ErrorCode Release(const std::string& allocation_id, LogicalRange range);
+    // O(1) lookup used to validate an expected range before Commit, replacing
+    // a full Snapshot(). Priority matches the former snapshot scan exactly:
+    // an outstanding reservation wins, otherwise a COMMITTED completion
+    // record; ABORTED/RELEASED operations are treated as absent.
+    std::optional<LogicalRange> FindOperationRange(
+        const std::string& operation_id) const;
 
     LogicalAllocationSnapshot Snapshot() const;
     ErrorCode Restore(const LogicalAllocationSnapshot& snapshot,

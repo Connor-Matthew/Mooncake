@@ -1905,6 +1905,70 @@ TEST(VSegmentServiceTest, RejectsDescriptorMismatchBeforeCommit) {
               ErrorCode::OK);
 }
 
+// A PutEnd retry after a successful commit must still validate: once committed,
+// the operation's range lives in the completion record rather than in the
+// reservation map, so the expected-range check must fall back to it.
+TEST(VSegmentServiceTest, CommitPutAcceptsRetryAfterCommit) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {{"partition-1",
+                        "default",
+                        "DRAM",
+                        {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 8, "put-1", 80);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+    EXPECT_EQ(service.CommitPut(started.replica, 8, "put-1", "object-1"),
+              ErrorCode::OK);
+    // Idempotent retry: the range is now only recorded in the COMMITTED
+    // completion record.
+    EXPECT_EQ(service.CommitPut(started.replica, 8, "put-1", "object-1"),
+              ErrorCode::OK);
+}
+
+// After the object is released the operation is no longer a valid commit
+// target; the expected-range check must report INVALID_VERSION rather than
+// INVALID_WRITE, matching the previous snapshot-based behaviour.
+TEST(VSegmentServiceTest, CommitPutRejectsReleasedOperation) {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {{"partition-1",
+                        "default",
+                        "DRAM",
+                        {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 8, "put-1", 80);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+    ASSERT_EQ(service.CommitPut(started.replica, 8, "put-1", "object-1"),
+              ErrorCode::OK);
+    ASSERT_EQ(service.ReleaseObject(started.replica, "object-1"),
+              ErrorCode::OK);
+    EXPECT_EQ(service.CommitPut(started.replica, 8, "put-1", "object-1"),
+              ErrorCode::INVALID_VERSION);
+}
+
 TEST(VSegmentServiceTest, RejectsPartitionWithoutPublishedQuota) {
     PartitionPhysicalQuotaSnapshot snapshot;
     snapshot.config_generation = 1;

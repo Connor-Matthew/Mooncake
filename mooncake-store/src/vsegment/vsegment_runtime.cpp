@@ -153,6 +153,18 @@ ErrorCode LogicalRangeAllocator::CancelReservation(
     return ErrorCode::OK;
 }
 
+std::optional<LogicalRange> LogicalRangeAllocator::FindOperationRange(
+    const std::string& operation_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto reservation = reservations_.find(operation_id);
+    if (reservation != reservations_.end()) return reservation->second;
+    auto completed = completed_operations_.find(operation_id);
+    if (completed != completed_operations_.end() &&
+        completed->second.outcome == OperationOutcome::COMMITTED)
+        return completed->second.range;
+    return std::nullopt;
+}
+
 bool LogicalRangeAllocator::OverlapsFreeOrReserved(LogicalRange range) const {
     for (const auto& free : free_ranges_) {
         if (Overlaps(range, free)) return true;
