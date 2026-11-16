@@ -18,3 +18,7 @@ target_link_libraries(
   mooncake_kvtest
   PRIVATE mooncake_store transfer_engine asio_shared JsonCpp::JsonCpp
           glog::glog pthread)
+
+if(BUILD_UNIT_TESTS)
+  add_subdirectory(tests)
+endif()
