@@ -93,7 +93,8 @@ struct Config {
     size_t notify_queue_max{65536};
     bool start_paused{false};
     std::vector<uint64_t> data_sizes{1024 * 1024};
-    int metrics_interval_ms{3000};
+    // 0 = window CSV disabled (default): no flush thread, no window samples.
+    int metrics_interval_ms{0};
     std::string output_dir{"mooncake_kvtest_output"};
     std::string cpu_affinity;
     std::string verify_level{"size"};

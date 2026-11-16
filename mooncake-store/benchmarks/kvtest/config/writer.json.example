@@ -14,7 +14,7 @@
   "batch_keys_count": 1,
   "key_pool_size": 256,
   "data_sizes": ["8MB"],
-  "metrics_interval_ms": 3000,
+  "metrics_interval_ms": 0,
   "output_dir": "kvtest-writer-output",
   "nodes": [
     {

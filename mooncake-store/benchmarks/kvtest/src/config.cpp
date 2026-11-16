@@ -392,8 +392,8 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
         if (cfg.store.replica_num == 0) {
             throw std::runtime_error("store.replica_num must be > 0");
         }
-        if (cfg.metrics_interval_ms <= 0) {
-            throw std::runtime_error("metrics_interval_ms must be > 0");
+        if (cfg.metrics_interval_ms < 0) {
+            throw std::runtime_error("metrics_interval_ms must be >= 0");
         }
         if (!OneOf(cfg.verify_level, {"off", "size", "sample", "full"})) {
             throw std::runtime_error("verify_level is invalid");

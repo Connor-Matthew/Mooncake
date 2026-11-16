@@ -7,7 +7,7 @@
   "num_threads": 1,
   "num_total_threads": 5,
   "data_sizes": ["8MB"],
-  "metrics_interval_ms": 3000,
+  "metrics_interval_ms": 0,
   "output_dir": "kvtest-reader-output",
   "verify_level": "sample",
   "verify_sample_bytes": "4KB",

@@ -87,6 +87,9 @@ class MetricsCollector {
         std::atomic<uint64_t> error{0};
         std::atomic<uint64_t> warmup{0};
         mutable std::mutex latency_mutex;
+        // Continuous sum of successful interface latencies (not sampled), used
+        // for MCP-style busy throughput.
+        double success_latency_ms_sum{0};
         // One in-memory row per measured operation. The request path never
         // writes a file; Stop() emits the complete sample set in one batch.
         std::vector<RequestSample> samples;

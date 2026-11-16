@@ -102,7 +102,7 @@ MetricsCollector::MetricsCollector(int instance_id, int interval_ms,
       output_dir_(std::move(output_dir)),
       samples_max_(samples_max),
       generation_(NextGeneration()),
-      interval_ms_(std::max(1, interval_ms)) {}
+      interval_ms_(std::max(0, interval_ms)) {}
 
 MetricsCollector::~MetricsCollector() { Stop(); }
 
@@ -115,19 +115,21 @@ void MetricsCollector::Start() {
     std::filesystem::create_directories(output_dir_);
     process_start_us_ = SteadyNowUs();
     last_flush_us_.store(process_start_us_, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lock(flush_mutex_);
-        window_file_.open(
-            std::filesystem::path(output_dir_) /
-                ("metrics_" + std::to_string(instance_id_) + ".csv"),
-            std::ios::out | std::ios::trunc);
-        window_file_
-            << "elapsed_ms,operation,count,success,failure,miss,mismatch,error,"
-               "avg_ms,p90_ms,p99_ms,p999_ms,p9999_ms,max_ms,qps,"
-               "throughput_mb_s\n";
-        flush_stop_.store(false, std::memory_order_release);
+    if (interval_ms_ > 0) {
+        {
+            std::lock_guard<std::mutex> lock(flush_mutex_);
+            window_file_.open(
+                std::filesystem::path(output_dir_) /
+                    ("metrics_" + std::to_string(instance_id_) + ".csv"),
+                std::ios::out | std::ios::trunc);
+            window_file_
+                << "elapsed_ms,operation,count,success,failure,miss,mismatch,"
+                   "error,avg_ms,p90_ms,p99_ms,p999_ms,p9999_ms,max_ms,qps,"
+                   "throughput_mb_s\n";
+            flush_stop_.store(false, std::memory_order_release);
+        }
+        flush_thread_ = std::thread([this] { FlushLoop(); });
     }
-    flush_thread_ = std::thread([this] { FlushLoop(); });
     start_time_us_.store(SteadyNowUs(), std::memory_order_release);
     end_time_us_.store(0, std::memory_order_release);
     recording_.store(true, std::memory_order_release);
@@ -147,6 +149,7 @@ void MetricsCollector::Reset() {
         metric->mismatch.store(0, std::memory_order_relaxed);
         metric->error.store(0, std::memory_order_relaxed);
         metric->warmup.store(0, std::memory_order_relaxed);
+        metric->success_latency_ms_sum = 0.0;
         metric->samples.clear();
         metric->window_samples.clear();
         metric->stride = 1;
@@ -181,12 +184,14 @@ double MetricsCollector::ElapsedSeconds() const {
 
 void MetricsCollector::Stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
-    {
-        std::lock_guard<std::mutex> lock(flush_mutex_);
-        flush_stop_.store(true, std::memory_order_release);
+    if (flush_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(flush_mutex_);
+            flush_stop_.store(true, std::memory_order_release);
+        }
+        flush_cv_.notify_all();
+        flush_thread_.join();
     }
-    flush_cv_.notify_all();
-    if (flush_thread_.joinable()) flush_thread_.join();
     Freeze();
     WriteSamples();
     WriteSummary();
@@ -250,6 +255,7 @@ void MetricsCollector::FlushLoop() {
 }
 
 void MetricsCollector::FlushWindows() {
+    if (interval_ms_ <= 0) return;
     const int64_t now = SteadyNowUs();
     const int64_t last = last_flush_us_.exchange(now);
     const double seconds =
@@ -376,6 +382,7 @@ void MetricsCollector::Record(const std::string &operation, double latency_ms,
         case RecordStatus::kOk:
             metric->success.fetch_add(1, std::memory_order_relaxed);
             metric->bytes.fetch_add(bytes, std::memory_order_relaxed);
+            metric->success_latency_ms_sum += latency_ms;
             break;
         case RecordStatus::kMiss:
             metric->failure.fetch_add(1, std::memory_order_relaxed);
@@ -398,7 +405,7 @@ void MetricsCollector::Record(const std::string &operation, double latency_ms,
     RequestSample sample{std::max<int64_t>(0, recorded_us - start),
                          latency_ms, status, bytes, code};
     metric->samples.push_back(sample);
-    metric->window_samples.push_back(sample);
+    if (interval_ms_ > 0) metric->window_samples.push_back(sample);
 }
 
 void MetricsCollector::RecordVerifyFailure() {
@@ -440,8 +447,22 @@ std::string MetricsCollector::StatsJson() const {
             metric->success.load(std::memory_order_relaxed));
         op["failure"] = static_cast<Json::UInt64>(
             metric->failure.load(std::memory_order_relaxed));
-        op["bytes"] = static_cast<Json::UInt64>(
-            metric->bytes.load(std::memory_order_relaxed));
+        const uint64_t bytes =
+            metric->bytes.load(std::memory_order_relaxed);
+        op["bytes"] = static_cast<Json::UInt64>(bytes);
+        double busy_ms = 0.0;
+        {
+            std::lock_guard<std::mutex> latency_lock(metric->latency_mutex);
+            busy_ms = metric->success_latency_ms_sum;
+        }
+        op["busy_ms"] = busy_ms;
+        const double busy_s = busy_ms / 1000.0;
+        const double throughput_mb =
+            busy_s > 0.0
+                ? static_cast<double>(bytes) / busy_s / (1024.0 * 1024.0)
+                : 0.0;
+        op["throughput_mb_s"] = throughput_mb;
+        op["throughput_gb_s"] = throughput_mb / 1024.0;
         op["miss"] = static_cast<Json::UInt64>(
             metric->miss.load(std::memory_order_relaxed));
         op["mismatch"] = static_cast<Json::UInt64>(
@@ -504,6 +525,7 @@ void MetricsCollector::WriteSummary() {
     std::lock_guard<std::mutex> lock(operations_mutex_);
     for (const auto &[name, metric] : operations_) {
         std::vector<double> latencies;
+        double busy_ms = 0.0;
         {
             std::lock_guard<std::mutex> latency_lock(metric->latency_mutex);
             latencies.reserve(metric->samples.size());
@@ -514,6 +536,7 @@ void MetricsCollector::WriteSummary() {
                     latencies.push_back(sample.latency_ms);
                 }
             }
+            busy_ms = metric->success_latency_ms_sum;
         }
         auto op = LatencyJson(std::move(latencies));
         op["total"] = static_cast<Json::UInt64>(
@@ -522,8 +545,17 @@ void MetricsCollector::WriteSummary() {
             metric->success.load(std::memory_order_relaxed));
         op["failure"] = static_cast<Json::UInt64>(
             metric->failure.load(std::memory_order_relaxed));
-        op["bytes"] = static_cast<Json::UInt64>(
-            metric->bytes.load(std::memory_order_relaxed));
+        const uint64_t bytes =
+            metric->bytes.load(std::memory_order_relaxed);
+        op["bytes"] = static_cast<Json::UInt64>(bytes);
+        op["busy_ms"] = busy_ms;
+        const double busy_s = busy_ms / 1000.0;
+        const double throughput_mb =
+            busy_s > 0.0
+                ? static_cast<double>(bytes) / busy_s / (1024.0 * 1024.0)
+                : 0.0;
+        op["throughput_mb_s"] = throughput_mb;
+        op["throughput_gb_s"] = throughput_mb / 1024.0;
         op["miss"] = static_cast<Json::UInt64>(
             metric->miss.load(std::memory_order_relaxed));
         op["mismatch"] = static_cast<Json::UInt64>(
