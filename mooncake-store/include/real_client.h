@@ -699,10 +699,9 @@ class RealClient : public PyClient {
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
-        size_t offload_rpc_thread_num = 8,
         bool enable_client_http_server = false,
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
-        bool enable_embedded_master = false,
+        bool enable_embedded_master = false, size_t offload_rpc_thread_num = 8,
         const std::string &ub_numa_nodes = "");
 
     // Overload that accepts a configuration dictionary
@@ -1487,8 +1486,8 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path, int local_rpc_port,
         bool enable_ssd_offload, bool start_offload_rpc_server,
         const std::string &ssd_offload_path, const std::string &tenant_id,
-        size_t offload_rpc_thread_num, bool enable_client_http_server,
-        int client_http_port, bool enable_embedded_master,
+        bool enable_client_http_server, int client_http_port,
+        bool enable_embedded_master, size_t offload_rpc_thread_num,
         const std::string &ub_numa_nodes_config);
 
     friend class DirectGpuReadTest;

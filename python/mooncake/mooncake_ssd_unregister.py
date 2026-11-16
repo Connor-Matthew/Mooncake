@@ -331,8 +331,8 @@ class MooncakeNoFUnregister:
                     cfg["nsid"],
                     cfg["traddr"],
                     cfg["trsvcid"],
+                    cfg["master_server_address"],
                     cfg.get("trtype", self.transport_type),
-                    cfg["master_server_address"]
                 )
 
                 if ret != 0:

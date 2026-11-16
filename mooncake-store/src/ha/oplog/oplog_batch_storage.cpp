@@ -288,7 +288,7 @@ ErrorCode OpLogBatchStorage::ValidateDurablePrefixAtStartup(
         return ErrorCode::INTERNAL_ERROR;
     }
     if (prefix.batch_id == 0) {
-        const auto range = BuildBatchRecordRange(cluster_id_, 0);
+        const auto range = BuildBatchRecordRange(cluster_id_, 0, source_id_);
         std::vector<KvPair> batches;
         ErrorCode err =
             backend_.Range(range.begin_key, range.end_key, 1, batches);
@@ -513,8 +513,9 @@ ErrorCode OpLogBatchStorage::DeleteBatchesThrough(uint64_t batch_id) {
     }
     // The suffix range starts immediately after the inclusive cutoff, and
     // already handles UINT64_MAX without overflowing the batch ID.
-    const auto suffix = BuildBatchRecordRange(cluster_id_, batch_id);
-    return backend_.DeleteRange(BuildBatchRecordKey(cluster_id_, 0),
+    const auto suffix =
+        BuildBatchRecordRange(cluster_id_, batch_id, source_id_);
+    return backend_.DeleteRange(BuildBatchRecordKey(cluster_id_, 0, source_id_),
                                 suffix.begin_key);
 }
 

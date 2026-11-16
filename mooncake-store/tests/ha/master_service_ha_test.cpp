@@ -8102,8 +8102,6 @@ TEST_F(MasterServiceHATest, MaterializeReplayedStateIsAdditiveAndIdempotent) {
     EXPECT_TRUE(second) << toString(second.error());
 }
 
-}  // namespace mooncake::test
-
 #ifdef STORE_USE_ETCD
 // A broadcast free still queued from an earlier allocation of a key must not
 // release a newer allocation of the same key on the segment-owning peer.
@@ -8143,6 +8141,8 @@ TEST_F(MasterServiceHATest, InterMasterFreeOnlyReleasesMatchingAllocation) {
     EXPECT_EQ(zero.error(), ErrorCode::INVALID_PARAMS);
 }
 #endif
+
+}  // namespace mooncake::test
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);

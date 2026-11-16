@@ -2482,13 +2482,14 @@ PYBIND11_MODULE(_store, m) {
         .def(py::init<>())
         // Modified By Yida (v3): trtype 显式作为参数传递（RDMA/TCP/URMA），
         // 避免依赖 MC_NOF_TRTYPE 环境变量造成 register/unregister 不一致。
+        // trtype 放在最后，社区既有的位置参数调用保持不变。
         .def("real_register",
              [](MooncakeDistributedNoFRegisterPyWrapper &self,
                 const std::string &nqn = "", size_t nsid = 1,
                 const std::string &traddr = "", size_t trsvcid = 4420,
-                const std::string &trtype = "",
                 uintptr_t base = 0x0, size_t size = 1024,
-                const std::string &master_server_addr = "127.0.0.1:50051") {
+                const std::string &master_server_addr = "127.0.0.1:50051",
+                const std::string &trtype = "") {
                  self.register_ = std::make_shared<NoFRegisterClient>();
                  return self.register_->set_register(nqn, nsid, traddr, trsvcid,
                                                      trtype, base, size,
@@ -2498,8 +2499,8 @@ PYBIND11_MODULE(_store, m) {
              [](MooncakeDistributedNoFRegisterPyWrapper &self,
                 const std::string &nqn = "", size_t nsid = 1,
                 const std::string &traddr = "", size_t trsvcid = 4420,
-                const std::string &trtype = "",
-                const std::string &master_server_addr = "127.0.0.1:50051") {
+                const std::string &master_server_addr = "127.0.0.1:50051",
+                const std::string &trtype = "") {
                  self.register_ = std::make_shared<NoFRegisterClient>();
                  return self.register_->set_unregister_by_endpoint(
                      nqn, nsid, traddr, trsvcid, trtype, master_server_addr);
@@ -2560,9 +2561,9 @@ PYBIND11_MODULE(_store, m) {
                         local_buffer_size, protocol, rdma_devices,
                         master_server_addr, transfer_engine, "", 50052,
                         enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                        /*offload_rpc_thread_num=*/8,
                         enable_client_http_server, client_http_port,
-                        enable_embedded_master, /*ub_numa_nodes=*/"");
+                        enable_embedded_master,
+                        /*offload_rpc_thread_num=*/8, /*ub_numa_nodes=*/"");
                     ret = result.has_value() ? 0
                                              : static_cast<int>(result.error());
                 }

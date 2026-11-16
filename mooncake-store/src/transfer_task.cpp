@@ -881,13 +881,18 @@ void NofWorkerPool::workerThread(int work_idx) {
                     IsolateNofLane(*initiator_, lane, nof_qos.get(),
                                    *total_outstanding_io, work_idx,
                                    "NoF lane poll failed");
-                } else if (ret < 0) {
-                    LOG(ERROR) << "poll completion error: ret " << ret;
-                } else if (io_timeout.count() > 0 && !nof_qos->live.empty() &&
-                           now - nof_qos->last_progress > io_timeout) {
-                    IsolateNofLane(*initiator_, lane, nof_qos.get(),
-                                   *total_outstanding_io, work_idx,
-                                   "NoF lane I/O timeout");
+                } else {
+                    if (ret < 0) {
+                        LOG(ERROR) << "poll completion error: ret " << ret;
+                    }
+                    // A lane that keeps failing its polls makes no progress
+                    // either, so the I/O timeout still isolates it.
+                    if (io_timeout.count() > 0 && !nof_qos->live.empty() &&
+                        now - nof_qos->last_progress > io_timeout) {
+                        IsolateNofLane(*initiator_, lane, nof_qos.get(),
+                                       *total_outstanding_io, work_idx,
+                                       "NoF lane I/O timeout");
+                    }
                 }
             }
         }

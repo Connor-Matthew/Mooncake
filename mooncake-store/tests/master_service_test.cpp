@@ -919,13 +919,21 @@ static bool InjectLocalDiskReplicaForTest(
     sm.data_size = size;
     sm.transport_endpoint = transport_endpoint;
     std::vector<StorageObjectMetadata> metas{sm};
+    // NotifyOffloadSuccess only accepts a client with a liveness record and a
+    // LOCAL_DISK segment; a repeated mount of the same client is harmless.
+    (void)service.MountLocalDiskSegment(client_id, true);
     return service.NotifyOffloadSuccess(client_id, tasks, metas).has_value();
+}
+
+static std::unique_ptr<MasterService> MakeOffloadEnabledServiceForTest() {
+    return std::make_unique<MasterService>(
+        MasterServiceConfig::builder().set_enable_offload(true).build());
 }
 
 // A key offloaded by multiple nodes must keep one LOCAL_DISK replica per node
 // (distinct client_id), instead of dropping later ones.
 TEST_F(MasterServiceTest, AddReplicaRecordsOneLocalDiskPerClient) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_ = MakeOffloadEnabledServiceForTest();
     const std::string key = "multi_local_disk_key";
     const UUID node_a = generate_uuid();
     const UUID node_b = generate_uuid();
@@ -956,7 +964,7 @@ TEST_F(MasterServiceTest, AddReplicaRecordsOneLocalDiskPerClient) {
 // A re-offload from the SAME client (e.g. restart re-registration) must update
 // that client's LOCAL_DISK replica endpoint in place, not append a duplicate.
 TEST_F(MasterServiceTest, AddReplicaSameClientUpdatesInPlace) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_ = MakeOffloadEnabledServiceForTest();
     const std::string key = "idempotent_local_disk_key";
     const UUID node_a = generate_uuid();
 
@@ -984,7 +992,7 @@ TEST_F(MasterServiceTest, AddReplicaSameClientUpdatesInPlace) {
 // Mixed: A and B each recorded; then A re-offloads -> still 2 replicas, only
 // A's endpoint refreshed.
 TEST_F(MasterServiceTest, AddReplicaMixedAppendAndUpdate) {
-    std::unique_ptr<MasterService> service_(new MasterService());
+    auto service_ = MakeOffloadEnabledServiceForTest();
     const std::string key = "mixed_local_disk_key";
     const UUID node_a = generate_uuid();
     const UUID node_b = generate_uuid();

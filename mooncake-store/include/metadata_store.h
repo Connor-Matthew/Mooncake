@@ -116,13 +116,14 @@ struct StandbySnapshot {
     uint64_t oplog_sequence_id{0};
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
-    struct_pack::compatible<WeightMetadataSnapshot, 1> weight_metadata;
-    std::vector<vsegment::PartitionVSegmentSnapshot> vsegment_partitions;
     // struct_pack compatible fields must stay last.
+    struct_pack::compatible<WeightMetadataSnapshot, 1> weight_metadata;
     struct_pack::compatible<ObjectReplicaSnapshot, 2> object_storage;
+    struct_pack::compatible<std::vector<vsegment::PartitionVSegmentSnapshot>, 3>
+        vsegment_partitions;
 
     YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
-             weight_metadata, vsegment_partitions, object_storage);
+             weight_metadata, object_storage, vsegment_partitions);
 };
 
 /**

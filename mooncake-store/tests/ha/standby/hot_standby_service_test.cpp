@@ -1081,10 +1081,11 @@ TEST_F(HotStandbyServiceTest, ReplaysAndExportsVSegmentState) {
 
     StandbySnapshot snapshot;
     ASSERT_TRUE(service->ExportStandbySnapshot(snapshot));
-    ASSERT_EQ(snapshot.vsegment_partitions.size(), 1u);
-    EXPECT_EQ(snapshot.vsegment_partitions.front().partition_id,
+    ASSERT_TRUE(snapshot.vsegment_partitions);
+    ASSERT_EQ(snapshot.vsegment_partitions->size(), 1u);
+    EXPECT_EQ(snapshot.vsegment_partitions->front().partition_id,
               state.partition_id);
-    EXPECT_EQ(snapshot.vsegment_partitions.front().metadata_revision, 1u);
+    EXPECT_EQ(snapshot.vsegment_partitions->front().metadata_revision, 1u);
     service->Stop();
 }
 

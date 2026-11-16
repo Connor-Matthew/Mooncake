@@ -276,10 +276,10 @@ class MooncakeNoFRegister:
                     cfg["nsid"],
                     cfg["traddr"],
                     cfg["trsvcid"],
-                    cfg.get("trtype", self.transport_type),
                     cfg["base"],
                     cfg["size"],
                     cfg["master_server_address"],
+                    cfg.get("trtype", self.transport_type),
                 )
 
                 if ret != 0:

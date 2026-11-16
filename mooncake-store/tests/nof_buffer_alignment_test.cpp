@@ -4,6 +4,7 @@
 // 块对齐校验（submitSpdkNofOperation 要求 buffer_address_ % block_size == 0、
 // size % block_size == 0）；kNofBufferAlignment=4096 时 512B sector 亦满足。
 #include "client_buffer.h"
+#include "nof/dma_buffer_allocator.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -30,8 +31,8 @@ TEST_F(NofBufferAlignmentTest, AllocateAlignmentMatrix) {
     constexpr size_t kTotalSize = 64ull * 1024 * 1024;
     const std::vector<size_t> kSizes = {512, 4096, 128 * 1024, 1024 * 1024};
 
-    auto allocator = ClientBufferAllocator::create(kTotalSize, "", false,
-                                                   /*use_spdk_dma=*/true);
+    auto allocator = ClientBufferAllocator::create(
+        kTotalSize, "", false, std::make_shared<SystemDmaAllocator>());
     ASSERT_NE(allocator, nullptr);
 
     // base 必须页对齐
@@ -63,8 +64,8 @@ TEST_F(NofBufferAlignmentTest, AllocateAlignmentMatrix) {
 // 顺序分配偏移量均为页对齐（freed 区间重用后仍保持）
 TEST_F(NofBufferAlignmentTest, RepeatedAllocationStaysPageAligned) {
     constexpr size_t kChunk = 128 * 1024;
-    auto allocator = ClientBufferAllocator::create(16 * kChunk, "", false,
-                                                   /*use_spdk_dma=*/true);
+    auto allocator = ClientBufferAllocator::create(
+        16 * kChunk, "", false, std::make_shared<SystemDmaAllocator>());
     ASSERT_NE(allocator, nullptr);
 
     for (int round = 0; round < 3; ++round) {
@@ -87,8 +88,7 @@ TEST_F(NofBufferAlignmentTest, RepeatedAllocationStaysPageAligned) {
 
 // 未启用 USE_NOF_URMA 时行为不变：64B 对齐、size 不取整
 TEST(NofBufferAlignmentDisabledTest, UnalignedSmallAllocationKept) {
-    auto allocator = ClientBufferAllocator::create(1024 * 1024, "", false,
-                                                   /*use_spdk_dma=*/false);
+    auto allocator = ClientBufferAllocator::create(1024 * 1024, "", false);
     ASSERT_NE(allocator, nullptr);
     auto handle = allocator->allocate(512);
     ASSERT_TRUE(handle.has_value());

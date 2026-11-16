@@ -1046,6 +1046,12 @@ class Replica {
           status_(status),
           refcnt_(0) {}
 
+    Replica(ReplicaID id, VSegmentDescriptor descriptor, ReplicaStatus status)
+        : id_(id),
+          data_(VSegmentReplicaData{std::move(descriptor)}),
+          status_(status),
+          refcnt_(0) {}
+
     // Process-wide and monotonic. Standby restores bump it past the max
     // restored id and never roll back: a failed restore keeps the counter
     // advanced so ids are never reused.

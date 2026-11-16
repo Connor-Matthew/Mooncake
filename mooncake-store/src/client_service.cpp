@@ -2027,9 +2027,11 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
         for (size_t i = 0; i < response.size(); ++i) {
             if (response[i]) {
                 // No lease granted on the read-only path: expiry pinned to now.
-                results.emplace_back(
-                    QueryResult(std::move(response[i].value().replicas), start_time,
-                                response[i].value().object_checksum));
+                QueryResult query(std::move(response[i].value().replicas),
+                                  start_time,
+                                  response[i].value().object_checksum);
+                query.vsegment_layouts = MakeVSegmentLayouts(*response[i]);
+                results.emplace_back(std::move(query));
             } else {
                 results.emplace_back(tl::unexpected(response[i].error()));
             }

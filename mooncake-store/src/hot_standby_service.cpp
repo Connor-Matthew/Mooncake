@@ -893,7 +893,8 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
         out.object_storage = ObjectReplicaSnapshot{};
     }
     out.segments = CollectSegmentsLocked();
-    CollectVSegmentPartitions(out.vsegment_partitions);
+    out.vsegment_partitions.emplace();
+    CollectVSegmentPartitions(*out.vsegment_partitions);
 
     lock.unlock();
     Stop();
@@ -1033,7 +1034,8 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
 
     // Export segments from the applier registries (Patch B)
     out.segments = CollectSegmentsLocked();
-    CollectVSegmentPartitions(out.vsegment_partitions);
+    out.vsegment_partitions.emplace();
+    CollectVSegmentPartitions(*out.vsegment_partitions);
 
     return true;
 }

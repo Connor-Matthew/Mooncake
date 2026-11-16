@@ -1616,6 +1616,9 @@ MasterService::TryVSegmentPutStart(const UUID& client_id,
         }
         return tl::make_unexpected(inserted.error());
     }
+    if (weight_lock) {
+        weight_manager_.RecordImportWrite(*normalized, plan->group_id);
+    }
     PutStartResult result{
         operation_ids.size() == 1 ? operation_ids.front() : std::string{},
         std::move(*inserted)};
@@ -2245,14 +2248,18 @@ ErrorCode MasterService::RunVSegmentOwnershipReconcile(
 
     auto process = [&](const std::string& partition_id) {
         if (!vsegment_service_->HasPartitionQuota(partition_id)) return;
-        const vsegment::PartitionVSegmentSnapshot* state = nullptr;
-        for (const auto& snapshot : recovered_vsegment_snapshots_) {
-            if (snapshot.partition_id == partition_id) {
-                state = &snapshot;
-                break;
+        std::optional<vsegment::PartitionVSegmentSnapshot> state;
+        {
+            std::lock_guard<std::mutex> lock(
+                recovered_vsegment_snapshots_mutex_);
+            for (const auto& snapshot : recovered_vsegment_snapshots_) {
+                if (snapshot.partition_id == partition_id) {
+                    state = snapshot;
+                    break;
+                }
             }
         }
-        process_partition(partition_id, state);
+        process_partition(partition_id, state ? &*state : nullptr);
     };
     if (!acquiring.empty()) {
         process(acquiring);
@@ -2319,6 +2326,7 @@ ErrorCode MasterService::RunVSegmentOwnershipReconcile(
     if (complete) {
         // Keep state for pending imports; a per-slot acquire must not discard
         // the other Partitions recovered from the primary/standby snapshot.
+        std::lock_guard<std::mutex> lock(recovered_vsegment_snapshots_mutex_);
         recovered_vsegment_snapshots_.erase(
             std::remove_if(recovered_vsegment_snapshots_.begin(),
                            recovered_vsegment_snapshots_.end(),
@@ -2524,6 +2532,18 @@ ErrorCode MasterService::StartInterMasterRpc() {
 }
 
 void MasterService::StopInterMasterRpc() {
+    // Stop the P4 reshard driver before the inter-master RPC client it uses
+    // （拉取/ack 依赖 inter_master_rpc_，须先 join 再销毁客户端）。The
+    // supervisor calls this on every primary-to-standby downgrade, not only
+    // at destruction.
+    {
+        std::lock_guard<std::mutex> lock(reshard_wake_mutex_);
+        reshard_driver_running_ = false;
+    }
+    reshard_wake_cv_.notify_all();
+    if (reshard_driver_thread_.joinable()) {
+        reshard_driver_thread_.join();
+    }
     if (inter_master_rpc_) {
         inter_master_rpc_->Stop();
         inter_master_rpc_.reset();
@@ -3090,11 +3110,15 @@ ErrorCode MasterService::ImportSlotMetadata(
         const auto partition_id = std::to_string(slot);
         const bool has_quota =
             vsegment_service_->HasPartitionQuota(partition_id);
-        const bool has_recovered_state = std::any_of(
-            recovered_vsegment_snapshots_.begin(),
-            recovered_vsegment_snapshots_.end(), [&](const auto& state) {
-                return state.partition_id == partition_id;
-            });
+        const bool has_recovered_state = [&] {
+            std::lock_guard<std::mutex> lock(
+                recovered_vsegment_snapshots_mutex_);
+            return std::any_of(recovered_vsegment_snapshots_.begin(),
+                               recovered_vsegment_snapshots_.end(),
+                               [&](const auto& state) {
+                                   return state.partition_id == partition_id;
+                               });
+        }();
         vsegment::PartitionVSegmentSnapshot installed;
         if (has_quota && !has_recovered_state &&
             vsegment_service_->SnapshotPartition(partition_id, &installed) !=
@@ -3742,6 +3766,20 @@ ErrorCode MasterService::InstallSlotMetadataExport(
         return std::make_pair(std::move(tenant_id), std::move(user_key));
     };
 
+    // Imported memory and local-disk replicas read only while their owner has
+    // a liveness record (same rule as standby restore). Register each owner as
+    // soon as a replica binds to it, so an early return below cannot leave a
+    // published replica bound to an unregistered record.
+    std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    const auto known_owner = [this](const UUID& owner) {
+        auto [it, inserted] = client_liveness_records_.try_emplace(
+            owner, std::make_shared<ClientLivenessRecord>(
+                       owner, ClientLivenessRecord::Clock::now()));
+        if (inserted) {
+            MasterMetricManager::instance().client_liveness_record_created();
+        }
+        return it->second;
+    };
     for (const auto& entry : export_payload.objects) {
         auto [tenant_id, user_key] = resolve(entry);
         if (!tenant_id.IsValid() || cvm::KeySlot(tenant_id, user_key) != slot)
@@ -3767,8 +3805,7 @@ ErrorCode MasterService::InstallSlotMetadataExport(
                 auto allocated =
                     std::make_unique<AllocatedBuffer>(alloc, buffer);
                 if (desc.is_memory_replica()) {
-                    auto owner = RecordRestoreKnownOwner(
-                        restored_known_owners_, standby_meta.client_id);
+                    auto owner = known_owner(standby_meta.client_id);
                     allocated->bindSegmentLifetime(SegmentLifetime(owner));
                     replicas.emplace_back(std::move(allocated), desc.status);
                 } else {
@@ -3783,8 +3820,8 @@ ErrorCode MasterService::InstallSlotMetadataExport(
                 const auto& disk = desc.get_local_disk_descriptor();
                 replicas.emplace_back(disk.client_id, disk.object_size,
                                       disk.transport_endpoint, desc.status);
-                replicas.back().bindLocalDiskSession(RecordRestoreKnownOwner(
-                    restored_known_owners_, disk.client_id));
+                replicas.back().bindLocalDiskSession(
+                    known_owner(disk.client_id));
             } else if (desc.is_dfs_replica()) {
                 replicas.emplace_back(desc.get_dfs_descriptor(), desc.status);
             } else if (desc.is_vsegment_replica()) {
@@ -3816,6 +3853,7 @@ ErrorCode MasterService::InstallSlotMetadataExport(
                 tenant_id.MakeScopedKey(user_key), 0);
         }
     }
+    client_lock.unlock();
     // Complete vsegment activation before ACK: a failed activation must leave
     // the source's export intact for the next acquire attempt.
     const auto activation =
@@ -4926,17 +4964,6 @@ MasterService::~MasterService() {
     // Stop the SlotOwnerHeartbeat thread before tearing down the rest.
     StopSlotOwnerHeartbeat();
 
-    // Stop the P4 reshard driver before the inter-master RPC client it uses
-    // （拉取/ack 依赖 inter_master_rpc_，须先 join 再销毁客户端）。
-    {
-        std::lock_guard<std::mutex> lock(reshard_wake_mutex_);
-        reshard_driver_running_ = false;
-    }
-    reshard_wake_cv_.notify_all();
-    if (reshard_driver_thread_.joinable()) {
-        reshard_driver_thread_.join();
-    }
-
     StopInterMasterRpc();
 
     // Stop and join the threads
@@ -5221,7 +5248,6 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     InvalidateVSegmentLayoutCache();
-    std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
         auto [record_it, record_inserted] =
@@ -5542,8 +5568,12 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 (void)restore.replicas[i]->replace_memory_buffer(
                     std::move(restore.buffers[i]));
             }
-            invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
-            invalid_replica_endpoints_.erase(restore.segment.name);
+            {
+                std::lock_guard<std::shared_mutex> invalid_lock(
+                    invalid_endpoints_mutex_);
+                invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
+                invalid_replica_endpoints_.erase(restore.segment.name);
+            }
             standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
             standby_allocator_keepalive_.erase(restore.segment.name);
         }
@@ -7725,6 +7755,18 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     break;
                 }
                 replicas.push_back(Replica(desc.id, dfs_desc, desc.status));
+            } else if (desc.is_vsegment_replica()) {
+                // The vsegment's own layout is restored from the snapshot's
+                // vsegment partitions; the replica keeps only its location.
+                const auto& vsegment_desc = desc.get_vsegment_descriptor();
+                if (vsegment_desc.length < standby_meta.size) {
+                    NoteLegacyStandbyRejection(ctx, entry,
+                                               "invalid_vsegment_descriptor");
+                    construction_ok = false;
+                    break;
+                }
+                replicas.push_back(
+                    Replica(desc.id, vsegment_desc, desc.status));
             } else {
                 LOG(ERROR) << "RestoreFromStandbySnapshot: unsupported replica "
                            << "descriptor, tenant="
@@ -7865,6 +7907,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
 // after a successful restore, so a failed attempt never leaves duplicates.
 void MasterService::AccumulateRecoveredVSegmentSnapshots(
     const std::vector<vsegment::PartitionVSegmentSnapshot>& partitions) {
+    std::lock_guard<std::mutex> lock(recovered_vsegment_snapshots_mutex_);
     recovered_vsegment_snapshots_.insert(recovered_vsegment_snapshots_.end(),
                                          partitions.begin(), partitions.end());
 }
@@ -7887,9 +7930,9 @@ tl::expected<void, ErrorCode> MasterService::MaterializeReplayedState(
     // keep the full set.
     std::vector<StandbyObjectEntry> owned_objects;
     const std::vector<StandbyObjectEntry>* objects_to_install = &objects;
-    const bool kv_partition_enabled = enable_ha_ &&
-                                      ha_backend_type_ == "etcd" &&
-                                      !master_id_.empty() && !cluster_id_.empty();
+    const bool kv_partition_enabled =
+        enable_ha_ && ha_backend_type_ == "etcd" && submaster_count_ > 1 &&
+        !master_id_.empty() && !cluster_id_.empty();
     if (kv_partition_enabled) {
         const std::vector<uint16_t> owned_slots = ResolveOwnedSlotsForCvm();
         if (!owned_slots.empty()) {
@@ -8412,6 +8455,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     }
                     replicas.push_back(Replica(desc.id, dfs_desc, desc.status));
+                } else if (desc.is_vsegment_replica()) {
+                    // The vsegment's own layout is restored from the
+                    // snapshot's vsegment partitions; the replica keeps only
+                    // its location.
+                    const auto& vsegment_desc = desc.get_vsegment_descriptor();
+                    if (vsegment_desc.length < standby_meta.size) {
+                        LOG(ERROR) << "RestoreFromStandbySnapshot: invalid "
+                                   << "vsegment descriptor, tenant="
+                                   << tenant_id.value() << ", key=" << user_key;
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    replicas.push_back(
+                        Replica(desc.id, vsegment_desc, desc.status));
                 } else {
                     LOG(ERROR)
                         << "RestoreFromStandbySnapshot: unsupported replica "
@@ -8484,7 +8540,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         standby_accounted_memory_bytes_;
     const auto prev_standby_memory_segments = standby_memory_segments_;
     const auto prev_standby_allocator_keepalive = standby_allocator_keepalive_;
-    const auto prev_invalid_replica_endpoints = invalid_replica_endpoints_;
+    const auto prev_invalid_replica_endpoints = [this] {
+        std::shared_lock<std::shared_mutex> lock(invalid_endpoints_mutex_);
+        return invalid_replica_endpoints_;
+    }();
 
     // A failed restore leaves nothing behind: installed keys go back out
     // through the canonical removal, bookkeeping returns to its pre-restore
@@ -8501,7 +8560,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         standby_accounted_memory_bytes_ = prev_standby_accounted_memory_bytes;
         standby_memory_segments_ = prev_standby_memory_segments;
         standby_allocator_keepalive_ = prev_standby_allocator_keepalive;
-        invalid_replica_endpoints_ = prev_invalid_replica_endpoints;
+        {
+            std::lock_guard<std::shared_mutex> lock(invalid_endpoints_mutex_);
+            invalid_replica_endpoints_ = prev_invalid_replica_endpoints;
+        }
         for (const auto& [client_id, record] : new_known_owner_records) {
             client_liveness_records_.erase(client_id);
             MasterMetricManager::instance().on_client_liveness_record_removed(
@@ -8514,7 +8576,12 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         std::move(restored_accounted_memory_bytes);
     standby_memory_segments_ = std::move(restored_memory_segments);
     standby_allocator_keepalive_ = std::move(restored_allocators);
-    invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
+    size_t invalid_endpoint_count = 0;
+    {
+        std::lock_guard<std::shared_mutex> lock(invalid_endpoints_mutex_);
+        invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
+        invalid_endpoint_count = invalid_replica_endpoints_.size();
+    }
     for (auto& [client_id, record] : new_known_owner_records) {
         // Copy, not move: rollback_restored_state() still needs a valid
         // record (state() for the removal metric) when a later durable
@@ -8658,7 +8725,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     LOG(INFO) << "Restored from standby: " << restored_object_count
               << " objects, " << segments.size()
               << " segments, initial_seq_id=" << initial_oplog_sequence_id
-              << ", invalid_endpoints=" << invalid_replica_endpoints_.size()
+              << ", invalid_endpoints=" << invalid_endpoint_count
               << ", rejected_objects=" << rejected_count;
     if (dropped_stale_replica_count > 0) {
         LOG(WARNING) << "Restored from standby dropped "
@@ -8928,7 +8995,10 @@ auto MasterService::BatchReplicaClear(
 
 bool MasterService::IsAwaitingRemount(const Replica& replica) const {
     // The set is empty outside the window between a standby restore and the
-    // owners' remounts, so the endpoint is looked up only inside it.
+    // owners' remounts, so the endpoint is looked up only inside it. Runtime
+    // reports and mounts also write it without master_state_mutex_, so the
+    // read takes the set's own lock.
+    std::shared_lock<std::shared_mutex> lock(invalid_endpoints_mutex_);
     if (invalid_replica_endpoints_.empty()) {
         return false;
     }
@@ -10446,13 +10516,19 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const bool replacing_existing =
-        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    // One LOCAL_DISK replica per owning client: a key offloaded by several
+    // nodes keeps one replica each, so only this client's own replica is
+    // refreshed in place (a re-offload or restart only moves its endpoint or
+    // size); any other node's replica is left alone and this one is added.
+    const auto owned_by_client = [client_id](const Replica& rep) {
+        return rep.type() == ReplicaType::LOCAL_DISK &&
+               rep.get_descriptor().get_local_disk_descriptor().client_id ==
+                   client_id;
+    };
+    const bool replacing_existing = metadata.HasReplica(owned_by_client);
 
     // Build OPLog payload BEFORE moving the replica, so that
     // get_descriptor() is still valid on `replica`.
-    std::string oplog_payload;
-    bool oplog_required = false;
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
         for (const auto& existing : metadata.GetAllReplicas()) {
@@ -10490,11 +10566,6 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         }
     }
 
-    // Step 1: Update metadata first for LOCAL_DISK replicas.
-    // This ensures the replica is registered immediately, even when the
-    // OPLog writer is backed up (e.g. during standby promotion recovery).
-    // LOCAL_DISK is a secondary replica type: losing its OPLog entry is
-    // recoverable because the client will re-register on remount.
     if (!replacing_existing) {
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
@@ -10505,42 +10576,11 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         return true;
     }
 
-    // Replace-existing path: update the existing LOCAL_DISK replica.
-    // Record every LOCAL_DISK replica per owning client. First try to refresh
-    // an existing replica owned by THIS client (idempotent re-offload or
-    // restart re-registration only changes the endpoint/size). If this client
-    // has no LOCAL_DISK replica yet, append a new one so that a key offloaded
-    // by multiple nodes keeps one LOCAL_DISK replica per node.
-    size_t updated = metadata.VisitReplicas(
-        [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
-        },
-        [&replica](Replica& rep) {
-            const auto desc =
-                replica.get_descriptor().get_local_disk_descriptor();
-            rep.update_local_disk_location(desc.transport_endpoint,
-                                           desc.object_size);
-        });
-
-    if (updated == 0) {
-        std::vector<Replica> replicas;
-        replicas.emplace_back(std::move(replica));
-        metadata.AddReplicas(std::move(replicas));
-    }
-
-    // Best-effort OPLog write for replace-existing path.
-    if (oplog_required) {
-        auto persist_result = AppendOpLogVisibleBeforeDurable(
-            OpType::PUT_END, object_id.tenant_id.value(), key, oplog_payload);
-        if (!persist_result) {
-            LOG(WARNING) << "AddReplica: OpLog skipped for local_disk"
-                         << " (metadata already updated), key=" << key
-                         << ", err="
-                         << static_cast<int>(persist_result.error());
-        }
-    }
+    metadata.VisitReplicas(owned_by_client, [&replica](Replica& rep) {
+        const auto desc = replica.get_descriptor().get_local_disk_descriptor();
+        rep.update_local_disk_location(desc.transport_endpoint,
+                                       desc.object_size);
+    });
     return false;
 }
 
@@ -10568,6 +10608,34 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                    << key << ", was PutStart-ed by " << metadata.client_id;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
+    if (!accessor.InProcessing()) {
+        LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
+    auto processing_rep =
+        metadata.GetFirstReplica([replica_type](const Replica& replica) {
+            if (replica.is_vsegment_replica() &&
+                (replica_type == ReplicaType::ALL ||
+                 replica_type == ReplicaType::MEMORY ||
+                 replica_type == ReplicaType::VSEGMENT)) {
+                return !replica.is_processing();
+            }
+            if (replica_type == ReplicaType::ALL) {
+                return (replica.is_memory_replica() ||
+                        replica.is_nof_replica() || replica.is_dfs_replica()) &&
+                       !replica.is_processing();
+            }
+            return replica.type() == replica_type && !replica.is_processing();
+        });
+    if (processing_rep != nullptr) {
+        LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
+                   << ", error=invalid_replica_status";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
+    // Abort the vsegment reservation only once the revoke is known to be
+    // valid: a rejected revoke must leave the in-flight write intact.
     ErrorCode vsegment_abort_error = ErrorCode::OK;
     metadata.VisitReplicas(
         &Replica::fn_is_vsegment_replica, [&](const Replica& replica) {
@@ -10595,32 +10663,6 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         });
     if (vsegment_abort_error != ErrorCode::OK)
         return tl::make_unexpected(vsegment_abort_error);
-
-    if (!accessor.InProcessing()) {
-        LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
-        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-    }
-
-    auto processing_rep =
-        metadata.GetFirstReplica([replica_type](const Replica& replica) {
-            if (replica.is_vsegment_replica() &&
-                (replica_type == ReplicaType::ALL ||
-                 replica_type == ReplicaType::MEMORY ||
-                 replica_type == ReplicaType::VSEGMENT)) {
-                return !replica.is_processing();
-            }
-            if (replica_type == ReplicaType::ALL) {
-                return (replica.is_memory_replica() ||
-                        replica.is_nof_replica() || replica.is_dfs_replica()) &&
-                       !replica.is_processing();
-            }
-            return replica.type() == replica_type && !replica.is_processing();
-        });
-    if (processing_rep != nullptr) {
-        LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
-                   << ", error=invalid_replica_status";
-        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-    }
 
     auto target_pred = [replica_type](const Replica& r) {
         if (!r.is_processing()) {
@@ -13577,7 +13619,6 @@ auto MasterService::NotifyOffloadSuccess(
                                       request_object_id.tenant_id,
                                       previous_kv_media);
                 }
-                handled_existing_object = true;
             }
         }
 

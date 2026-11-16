@@ -253,13 +253,6 @@ class MasterService {
     // 端点两个低频触发点重试发布配额快照，修复「submaster 先于 client 启动
     // 时一次性 bootstrap 发现零段而永久放弃」的时序死锁。
     void SetVSegmentAutoPlanPolicy(const vsegment::VSegmentUserPolicy& policy);
-    const std::vector<vsegment::PartitionVSegmentSnapshot>&
-    recovered_vsegment_snapshots() const {
-        return recovered_vsegment_snapshots_;
-    }
-    void ClearRecoveredVSegmentSnapshots() {
-        recovered_vsegment_snapshots_.clear();
-    }
     // 测试专用：阻塞等待 stale-evict 异步 drain 队列清空（含 1s debounce
     // 与在途请求），上限 5s。生产代码勿用；non-etcd 构建为空操作。
     void FlushStaleEvictQueueForTesting();
@@ -2633,8 +2626,12 @@ class MasterService {
         0};  // 日志状态变化控制（首条 INFO 后 VLOG）
     // Decoded before Partition ownership is activated. The route lifecycle
     // consumes the matching state when it creates each local manager.
+    // Restores, the reconcile thread and slot imports on the heartbeat thread
+    // all touch it, so every access holds the mutex (a leaf lock: nothing is
+    // acquired while it is held, and readers copy the entry they need).
     std::vector<vsegment::PartitionVSegmentSnapshot>
         recovered_vsegment_snapshots_;
+    mutable std::mutex recovered_vsegment_snapshots_mutex_;
 
     // ----- Inter-master allocation forwarding (CVM plan B phase 2) -----
 

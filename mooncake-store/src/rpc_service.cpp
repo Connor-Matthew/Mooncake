@@ -474,30 +474,6 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         total_keys);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
-    if (sample) {
-        // 采样诊断路径：仅当 ShouldSampleHiFreqLog 命中时才逐 key 计时。
-        // 历史问题：此处逐 key 循环此前未被 sample 门控，结果随即被批量
-        // 结果整体覆盖——纯浪费。实测仅贡献 ~20µs/请求（构建本身 2.5µs/
-        // shard），handler 的 ~415µs 大头在服务调用内部其余段，归因见
-        // GroupRoute/RecordAccess/HandlerConvert 三子点。
-        results.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            const auto item_start = std::chrono::steady_clock::now();
-            results.emplace_back(
-                master_service_.GetReplicaList(keys[i], TenantId(tenant_id)));
-            const auto item_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - item_start)
-                    .count();
-            const auto& item = results.back();
-            MC_LOG(INFO) << "BatchGetReplicaListItem key=" << keys[i]
-                         << " batch_index=" << i << " replica_count="
-                         << (item ? item->replicas.size() : 0)
-                         << " latency_us=" << item_us << " status="
-                         << (item ? "ok" : toString(item.error()));
-        }
-    }
-
     const auto metadata_query_start =
         sample ? std::chrono::steady_clock::now()
                : std::chrono::steady_clock::time_point{};

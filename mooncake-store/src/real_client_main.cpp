@@ -14,7 +14,6 @@
 #include "real_client.h"
 #include "version.h"
 #include "mooncake_logging.h"
-#include "real_client.h"
 #include "scheduler/scheduler_policy.h"
 
 using namespace mooncake;
@@ -168,6 +167,7 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::batch_get_offload_object>(
         &real_client);
     server.register_handler<&RealClient::batch_get_offload_object_ranges>(
+        &real_client);
     server.register_handler<&RealClient::batch_get_offload_object_push>(
         &real_client);
     server.register_handler<&RealClient::release_offload_buffer>(&real_client);
@@ -193,12 +193,6 @@ int main(int argc, char *argv[]) {
 
     LOG(INFO) << "Mooncake real client version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;
-    // Guard against double init: globalConfig() (transfer engine) may already
-    // have called InitGoogleLogging and populated FLAGS_log_dir from
-    // MC_LOG_DIR.
-    if (!FLAGS_log_dir.empty() && !google::IsGoogleLoggingInitialized()) {
-        google::InitGoogleLogging(argv[0]);
-    }
     mooncake::logging::ApplyMooncakeLogEnableToGlog();
 
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
@@ -221,8 +215,9 @@ int main(int argc, char *argv[]) {
         FLAGS_master_server_address, nullptr,
         "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
         FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
-        FLAGS_tenant_id, offload_rpc_thread_num, FLAGS_enable_http_server,
-        FLAGS_http_port, FLAGS_ub_numa_nodes);
+        FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port,
+        /*enable_embedded_master=*/false, offload_rpc_thread_num,
+        FLAGS_ub_numa_nodes);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;

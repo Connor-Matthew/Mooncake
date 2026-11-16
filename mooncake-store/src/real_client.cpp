@@ -1064,16 +1064,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    size_t offload_rpc_thread_num, bool enable_client_http_server,
-    int client_http_port, bool enable_embedded_master,
+    bool enable_client_http_server, int client_http_port,
+    bool enable_embedded_master, size_t offload_rpc_thread_num,
     const std::string &ub_numa_nodes) {
     return setup_internal(
         EgmStorePoolConfig{}, local_hostname, metadata_server,
         global_segment_size, local_buffer_size, protocol, rdma_devices,
         master_server_addr, transfer_engine, ipc_socket_path, local_rpc_port,
         enable_ssd_offload, start_offload_rpc_server, ssd_offload_path,
-        tenant_id, offload_rpc_thread_num, enable_client_http_server,
-        client_http_port, enable_embedded_master, ub_numa_nodes);
+        tenant_id, enable_client_http_server, client_http_port,
+        enable_embedded_master, offload_rpc_thread_num, ub_numa_nodes);
 }
 
 tl::expected<void, ErrorCode> RealClient::setup_internal(
@@ -1085,8 +1085,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    size_t offload_rpc_thread_num, bool enable_client_http_server,
-    int client_http_port, bool enable_embedded_master,
+    bool enable_client_http_server, int client_http_port,
+    bool enable_embedded_master, size_t offload_rpc_thread_num,
     const std::string &ub_numa_nodes_config) {
     // Re-entry guard (mirrors initAll_internal): a second setup would
     // overwrite client_ and skip the first instance's ordered cleanup.
@@ -1889,8 +1889,9 @@ int RealClient::setup_real(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
-        tenant_id, 8, enable_client_http_server, client_http_port,
-        /*enable_embedded_master=*/false, /*ub_numa_nodes=*/""));
+        tenant_id, enable_client_http_server, client_http_port,
+        /*enable_embedded_master=*/false, /*offload_rpc_thread_num=*/8,
+        /*ub_numa_nodes=*/""));
 }
 
 namespace {
@@ -2082,8 +2083,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             *egm_config, local_hostname, metadata_server, global_segment_size,
             local_buffer_size, protocol, rdma_devices, master_server_addr,
             nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
-            ssd_offload_path, tenant_id, offload_rpc_thread_num,
-            enable_client_http_server, client_http_port, enable_embedded_master,
+            ssd_offload_path, tenant_id, enable_client_http_server,
+            client_http_port, enable_embedded_master, offload_rpc_thread_num,
             ub_numa_nodes);
         if (!result && egm_config->enabled) {
             (void)tearDownAll_internal();
@@ -2107,8 +2108,9 @@ tl::expected<void, ErrorCode> RealClient::initAll_internal(
     return setup_internal("localhost:12345", "127.0.0.1:2379",
                           mount_segment_size, buffer_allocator_size, protocol_,
                           device_name, "127.0.0.1:50051", nullptr, "", 50052,
-                          false, false, "", "default", 8, false,
-                          DEFAULT_CLIENT_HTTP_PORT, false, "");
+                          false, false, "", "default", false,
+                          DEFAULT_CLIENT_HTTP_PORT, false,
+                          /*offload_rpc_thread_num=*/8, "");
 }
 
 int RealClient::initAll(const std::string &protocol_,

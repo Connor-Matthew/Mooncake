@@ -1026,7 +1026,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                           CvmMembershipCoordinator cvm_membership_coordinator(
                               config.cluster_id, config.local_hostname);
                           std::unique_ptr<cvm::CvmController> cvm_controller;
+                          // Only multi-submaster clusters run CVM. A single
+                          // leader keeps the community election, producer
+                          // view fencing and the unpartitioned OpLog stream
+                          // that ha::OpLogSourceId selects for it.
                           if (spec.type == HABackendType::ETCD &&
+                              config.submaster_count > 1 &&
                               !config.local_hostname.empty() &&
                               !config.cluster_id.empty()) {
                               ErrorCode connect_err =
@@ -1221,11 +1226,15 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                                       config.rpc_address,
                                       config.rpc_conn_timeout,
                                       config.rpc_enable_tcp_no_delay);
-                                  const char* protocol =
-                                      std::getenv("MC_RPC_PROTOCOL");
-                                  if (protocol &&
-                                      std::string_view(protocol) == "rdma") {
+                                  if (RpcProtocolConfig::FromEnvironment()
+                                          .use_rdma) {
+#ifdef YLT_ENABLE_IBV
                                       server.init_ibv();
+#else
+                                      LOG(WARNING)
+                                          << "RDMA RPC is disabled at "
+                                             "compile time; using TCP RPC";
+#endif
                                   }
 
                                   const ViewVersionId view_version =
@@ -1383,8 +1392,42 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                                       }
                                   }
 
+                                  // Same serving-exit order as the
+                                  // single-leader term: drain the handler
+                                  // workers first, then the CVM runtimes, the
+                                  // OpLog writer, the serving state and finally
+                                  // the HTTP metadata cleanup. Every step is a
+                                  // no-op on a resource that was never started
+                                  // or is already stopped.
+                                  std::unique_ptr<RpcWorkerPool> worker_pool;
+                                  auto stop_serve_resources = [&]() {
+                                      worker_pool.reset();
+                                      ring_standby_runtime.Stop();
+                                      ring_standby_runtime
+                                          .SetWrappedMasterService(nullptr);
+                                      metrics_reporter.Stop();
+                                      metrics_reporter.SetRole("standby");
+                                      wrapped_master_service
+                                          ->StopSlotOwnerHeartbeat();
+                                      wrapped_master_service
+                                          ->StopInterMasterRpc();
+                                      wrapped_master_service
+                                          ->StopBatchOpLogWriter();
+                                      cvm_membership_coordinator
+                                          .SetServeStopSignal(nullptr);
+                                      DeactivateServingState(admin_server,
+                                                             label_reconciler);
+                                      wrapped_master_service
+                                          ->StopHttpMetadataCleanup();
+                                  };
+
+                                  worker_pool = std::make_unique<RpcWorkerPool>(
+                                      config.handler_worker_thread_num != 0
+                                          ? config.handler_worker_thread_num
+                                          : config.rpc_thread_num);
                                   mooncake::RegisterRpcService(
-                                      server, *wrapped_master_service);
+                                      server, *wrapped_master_service,
+                                      worker_pool.get());
                                   ServingShutdownTrigger shutdown_trigger(
                                       shutdown_requested, [&]() {
                                           serving_state.RequestShutdown([&]() {
@@ -1397,7 +1440,24 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                                           ec.emplace(server.async_start());
                                       }
                                   });
-                                  if (!ec) return -1;
+                                  if (!ec) {
+                                      // Shutdown, or a terminal OpLog writer,
+                                      // closed the gate before the listener
+                                      // started.
+                                      shutdown_trigger.Stop();
+                                      stop_serve_resources();
+                                      if (ShutdownObserved(
+                                              shutdown_requested)) {
+                                          return shutdown_exit(
+                                              "cvm_serve_start",
+                                              ShutdownLease{});
+                                      }
+                                      EnterStandbyMode(
+                                          admin_server, *standby_controller,
+                                          accept_standby_runtime_updates,
+                                          std::nullopt, cvm_controller);
+                                      continue;
+                                  }
                                   if (ec->hasResult()) {
                                       const coro_rpc::err_code& start_err =
                                           ec->result().value();
@@ -1407,8 +1467,14 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                                           << start_err.val() << ", reason="
                                           << std::string(
                                                  start_err.message());
-                                      DeactivateServingState(admin_server,
-                                                             label_reconciler);
+                                      shutdown_trigger.Stop();
+                                      stop_serve_resources();
+                                      if (ShutdownObserved(
+                                              shutdown_requested)) {
+                                          return shutdown_exit(
+                                              "cvm_serve_start_failure",
+                                              ShutdownLease{});
+                                      }
                                       EnterStandbyMode(
                                           admin_server,
                                           *standby_controller,
@@ -1502,26 +1568,17 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                                   LOG(INFO) << "Master service stopped: "
                                             << server_err;
 
-                                  // ── Downgrade sequence (kPrimary →
-                                  // kStandby) ── 先停环跟随（join 线程 +
-                                  // StopStandby），保证降级到待命池模式时
-                                  // 同一时刻只有一条跟随路径活跃。
-                                  ring_standby_runtime.Stop();
-                                  // 互备 1.4：环跟随已停（Loop 线程 join
-                                  // 完成），清空物化入口，消除对已析构
-                                  // serve 实例的悬挂引用。
-                                  ring_standby_runtime
-                                      .SetWrappedMasterService(nullptr);
-                                  metrics_reporter.Stop();
-                                  metrics_reporter.SetRole("standby");
-                                  wrapped_master_service
-                                      ->StopSlotOwnerHeartbeat();
-                                  wrapped_master_service->StopInterMasterRpc();
-                                  wrapped_master_service->StopBatchOpLogWriter();
-                                  cvm_membership_coordinator
-                                      .SetServeStopSignal(nullptr);
-                                  DeactivateServingState(admin_server,
-                                                         label_reconciler);
+                                  // ── Downgrade sequence (kPrimary → kStandby)
+                                  // ── 先停 handler workers 与环跟随（join 线程
+                                  // +
+                                  // StopStandby），保证降级到待命池模式时同一时刻
+                                  // 只有一条跟随路径活跃，再按社区顺序停 OpLog
+                                  // writer、serving 状态和 HTTP 元数据清理。
+                                  stop_serve_resources();
+                                  if (ShutdownObserved(shutdown_requested)) {
+                                      return shutdown_exit("cvm_serving",
+                                                           ShutdownLease{});
+                                  }
                                   EnterStandbyMode(
                                       admin_server, *standby_controller,
                                       accept_standby_runtime_updates,

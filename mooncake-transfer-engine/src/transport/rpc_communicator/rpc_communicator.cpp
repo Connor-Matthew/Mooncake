@@ -9,9 +9,10 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/coro_io.hpp>
-// URMA RPC socket support (safe no-op unless YLT_ENABLE_URMA is defined and
-// yalantinglibs was built with -DYLT_ENABLE_URMA=ON).
+#ifdef YLT_ENABLE_URMA
+// Only the 930 YLT fork selected by YLT_ENABLE_URMA ships this header.
 #include <ylt/coro_io/urma/urma_rpc_env.hpp>
+#endif
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include "async_simple/coro/SyncAwait.h"
