@@ -2537,15 +2537,15 @@ WrappedMasterService::InterMasterHandshake() {
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::InterMasterAllocateReplicas(
-    const std::string& tenant_id, const std::string& key,
-    uint64_t slice_length, uint64_t replica_num,
-    const std::vector<std::string>& preferred_segments) {
+    const std::string& tenant_id, const std::string& key, uint64_t slice_length,
+    uint64_t replica_num, const std::vector<std::string>& preferred_segments,
+    uint64_t allocation_token) {
     return execute_rpc(
         "InterMasterAllocateReplicas",
         [&] {
             return master_service_.InterMasterAllocateReplicas(
-                tenant_id, key, slice_length, replica_num,
-                preferred_segments);
+                tenant_id, key, slice_length, replica_num, preferred_segments,
+                allocation_token);
         },
         [&](auto& timer) {
             timer.LogRequest("key=", key, ", slice_length=", slice_length,
@@ -2555,11 +2555,13 @@ WrappedMasterService::InterMasterAllocateReplicas(
 }
 
 tl::expected<bool, ErrorCode> WrappedMasterService::InterMasterFreeReplicas(
-    const std::string& tenant_id, const std::string& key) {
+    const std::string& tenant_id, const std::string& key,
+    uint64_t allocation_token) {
     return execute_rpc(
         "InterMasterFreeReplicas",
         [&] {
-            return master_service_.InterMasterFreeReplicas(tenant_id, key);
+            return master_service_.InterMasterFreeReplicas(tenant_id, key,
+                                                           allocation_token);
         },
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
 }

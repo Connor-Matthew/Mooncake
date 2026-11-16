@@ -303,12 +303,16 @@ class MasterService {
     InterMasterAllocateReplicas(
         const std::string& tenant_id, const std::string& key,
         uint64_t slice_length, uint64_t replica_num,
-        const std::vector<std::string>& preferred_segments);
+        const std::vector<std::string>& preferred_segments,
+        uint64_t allocation_token);
 
     // Frees the keepalive entry (and the handles) for (tenant, key).
-    // Idempotent: returns false when no entry exists.
+    // A non-zero token frees only the allocation it names, so a late free
+    // cannot release a newer allocation for the same key; zero frees any.
+    // Idempotent: returns false when no matching entry exists.
     tl::expected<bool, ErrorCode> InterMasterFreeReplicas(
-        const std::string& tenant_id, const std::string& key);
+        const std::string& tenant_id, const std::string& key,
+        uint64_t allocation_token);
 
     // Inter-master read forwarding (CVM plan B phase 2). Called by
     // WrappedMasterService when a peer submaster forwards a GetReplicaList /
@@ -1854,10 +1858,15 @@ class MasterService {
     // Allocate the physical replicas without changing object metadata.  This
     // is used by leased upserts to prove that replacement storage is available
     // before the old metadata is removed.
+    // `remote_fallback_tenant`, when set, lets a failed local memory
+    // allocation fall back to a peer submaster (CVM). Only callers that
+    // allocate for a key holding no object may pass it: the erase of an
+    // object still under the key would free the new remote handles.
     auto AllocateReplicas(const std::string& key, uint64_t value_length,
                           const ReplicateConfig& config,
                           const std::string& writer_host_id,
-                          bool* dfs_allocation_failed = nullptr)
+                          bool* dfs_allocation_failed = nullptr,
+                          const TenantId* remote_fallback_tenant = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     class MetadataAccessorRW;
@@ -1912,6 +1921,16 @@ class MasterService {
                            const ReplicateConfig& config,
                            std::string_view action)
         -> tl::expected<WriteStartPlan, ErrorCode>;
+    // CVM slot ownership for PutStart / UpsertStart: nullopt when this master
+    // writes the key itself, otherwise the reply to return (the slot owner's,
+    // for a forwarded call, or SLOT_MIGRATING / SLOT_NOT_OWNED).
+    auto RouteWriteStartToSlotOwner(const char* action, bool upsert,
+                                    const UUID& client_id,
+                                    const ObjectIdentity& object_id,
+                                    uint64_t slice_length,
+                                    const ReplicateConfig& config)
+        -> std::optional<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>;
     // A write's first step under the key: drops the held object's stale
     // replica handles and, without the oplog, the object itself when none is
     // left. With the oplog the cleanup is only queued and the write is refused
@@ -2617,16 +2636,22 @@ class MasterService {
     // slot-owning peers, keyed by scoped key. The real handles stay alive
     // here; the peer only holds dummy-allocator replicas. Freed by
     // InterMasterFreeReplicas (broadcast by the slot owner on erase).
+    struct InterMasterAllocation {
+        uint64_t token{0};
+        std::vector<Replica> replicas;
+    };
     std::mutex inter_master_keepalive_mutex_;
-    std::unordered_map<std::string, std::vector<Replica>>
+    std::unordered_map<std::string, InterMasterAllocation>
         inter_master_keepalive_;
 
     // Slot-owner side: scoped keys whose handles live on a peer submaster
     // (remote-allocated or migrated-in). Drives the broadcast-free on
     // EraseMetadata; kHandoff (slot migration) keeps the handles alive and
-    // transfers the responsibility to the importing master.
+    // transfers the responsibility to the importing master. The value is
+    // the allocation token sent to the peer; zero (migrated-in keys, whose
+    // token is not carried over) frees whatever a peer holds for the key.
     std::mutex remote_allocated_keys_mutex_;
-    std::unordered_set<std::string> remote_allocated_keys_;
+    std::unordered_map<std::string, uint64_t> remote_allocated_keys_;
 
     // Slot-owner side: keeps the DummyBufferAllocator of remote replicas
     // alive (the replicas hold only weak references), keyed by endpoint.
@@ -3214,7 +3239,6 @@ class MasterService {
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
-    bool IsMemoryReplicaEvictable(const Replica& replica) const;
 
     /**
      * Appends a SEGMENT_MOUNT / SEGMENT_UNMOUNT entry without waiting for it

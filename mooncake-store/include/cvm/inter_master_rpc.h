@@ -94,24 +94,32 @@ class InterMasterRpcClient {
     // non-empty the allocation is strict: only those segments are used.
     // The peer keeps the real handles alive; the caller only materializes
     // dummy-allocator replicas from the returned descriptors.
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-    AllocateReplicas(const std::string& master_id, const std::string& tenant_id,
-                     const std::string& key, uint64_t slice_length,
-                     uint64_t replica_num,
-                     const std::vector<std::string>& preferred_segments);
+    // `allocation_token` (non-zero, chosen by the caller) names this
+    // allocation, so a later free can target it and no other.
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> AllocateReplicas(
+        const std::string& master_id, const std::string& tenant_id,
+        const std::string& key, uint64_t slice_length, uint64_t replica_num,
+        const std::vector<std::string>& preferred_segments,
+        uint64_t allocation_token);
 
     // Frees replicas previously allocated via AllocateReplicas on the
     // target submaster. Returns true when a keepalive entry was found.
+    // A non-zero `allocation_token` frees only the allocation it names;
+    // zero frees whatever the peer holds for the key.
     tl::expected<bool, ErrorCode> FreeReplicas(const std::string& master_id,
                                                const std::string& tenant_id,
-                                               const std::string& key);
+                                               const std::string& key,
+                                               uint64_t allocation_token);
 
     // Fire-and-forget: broadcast the free to every known peer. Used when the
     // slot owner erases an object whose handles live on a segment-owning
     // peer (it does not track which peer, so all peers are asked; only the
-    // owner of the keepalive entry reacts).
+    // owner of the keepalive entry reacts). The token keeps a free that is
+    // still queued when the key is allocated again from releasing the new
+    // allocation.
     void EnqueueBroadcastFree(const std::string& tenant_id,
-                              const std::string& key);
+                              const std::string& key,
+                              uint64_t allocation_token);
 
     // ----- Read forwarding (CVM plan B phase 2) -----
 
@@ -208,6 +216,7 @@ class InterMasterRpcClient {
     struct FreeTask {
         std::string tenant_id;
         std::string key;
+        uint64_t allocation_token{0};
         int attempts{0};
     };
 

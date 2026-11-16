@@ -394,6 +394,35 @@ struct MasterService::MemoryEviction {
         const char* medium_;
     };
 
+    // A VSegment extent is a pool allocation, not a memory buffer the
+    // offload pipeline can copy from (PushOffloadingQueue refuses it), so an
+    // object holding one gives its memory up without an offload.
+    class VSegmentAwareReclaimer final : public eviction::Reclaimer {
+       public:
+        VSegmentAwareReclaimer(eviction::Reclaimer& offloading,
+                               eviction::Reclaimer& immediate)
+            : offloading_(offloading), immediate_(immediate) {}
+
+        tl::expected<eviction::Effect, ErrorCode> Apply(
+            metadata::Namespace& ns, const route::WriteGuard& hold,
+            const eviction::Plan& plan,
+            const eviction::Report& so_far) override {
+            if (hold.metadata().HasReplica(&Replica::fn_is_vsegment_replica)) {
+                return immediate_.Apply(ns, hold, plan, so_far);
+            }
+            return offloading_.Apply(ns, hold, plan, so_far);
+        }
+
+        void TearDown(metadata::Namespace& ns,
+                      const route::WriteGuard& hold) override {
+            immediate_.TearDown(ns, hold);
+        }
+
+       private:
+        eviction::Reclaimer& offloading_;
+        eviction::Reclaimer& immediate_;
+    };
+
     struct Settings {
         bool through_oplog = false;
         bool allow_evict_soft_pinned = false;
@@ -407,15 +436,50 @@ struct MasterService::MemoryEviction {
           oplog(service),
           offload_queue(service),
           offloading(immediate, offload_queue, settings.offload),
+          offloading_unless_vsegment(offloading, immediate),
           kv_events(service),
           log(settings.offload.cap),
-          evictor(service.namespaces_, policy,
-                  settings.through_oplog
-                      ? static_cast<eviction::Reclaimer&>(oplog)
-                  : settings.offload_on_evict
-                      ? static_cast<eviction::Reclaimer&>(offloading)
-                      : static_cast<eviction::Reclaimer&>(immediate),
-                  Observers(settings)) {}
+          reclaimer(settings.through_oplog
+                        ? static_cast<eviction::Reclaimer&>(oplog)
+                    : settings.offload_on_evict
+                        ? static_cast<eviction::Reclaimer&>(
+                              offloading_unless_vsegment)
+                        : static_cast<eviction::Reclaimer&>(immediate)),
+          observers(Observers(settings)),
+          evictor(service.namespaces_, policy, reclaimer, observers) {}
+
+    // Evicts the one object `hold` holds as a run would: what the evictor
+    // keeps (a hard pin, a live lease) and what the policy refuses stay.
+    // Returns the replicas taken, to be freed once the key lock is let go,
+    // or the reclaimer's error (an OpLog write), which ends a run.
+    tl::expected<std::vector<Replica>, ErrorCode> EvictObject(
+        metadata::Namespace& ns, const route::WriteGuard& hold,
+        eviction::Report& report) {
+        const ObjectMetadata& metadata = hold.metadata();
+        // Not const: ObjectMetadata::IsLeaseExpired takes it by reference.
+        eviction::Clock::time_point now = eviction::Clock::now();
+        if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now)) {
+            return std::vector<Replica>{};
+        }
+        auto plan = policy.Decide(eviction::Candidate{
+            ns.id(), hold.key(), metadata, now, /*fallback=*/false});
+        if (!plan) {
+            return std::vector<Replica>{};
+        }
+        auto effect = reclaimer.Apply(ns, hold, *plan, report);
+        if (!effect) {
+            return tl::make_unexpected(effect.error());
+        }
+        report.Add(*effect);
+        const eviction::ObjectView view{ns.id(), hold.key(), hold.metadata()};
+        for (eviction::EvictionObserver* observer : observers) {
+            observer->OnApplied(view, *effect);
+        }
+        if (effect->needs_teardown) {
+            reclaimer.TearDown(ns, hold);
+        }
+        return std::move(effect->detached);
+    }
 
     static bool InPlan(const eviction::Plan& plan, const Replica& replica) {
         return std::find(plan.release.begin(), plan.release.end(),
@@ -436,9 +500,14 @@ struct MasterService::MemoryEviction {
     OpLogReclaimer oplog;
     OffloadQueue offload_queue;
     eviction::OffloadingReclaimer offloading;
+    VSegmentAwareReclaimer offloading_unless_vsegment;
     KvEventObserver kv_events;
     eviction::MetricsObserver metrics;
     eviction::LogObserver log;
+    // The reclaimer and observers the settings select, shared by the
+    // evictor's runs and EvictObject.
+    eviction::Reclaimer& reclaimer;
+    const std::vector<eviction::EvictionObserver*> observers;
     // Last, so everything it refers to is built first.
     eviction::Evictor evictor;
 };
@@ -2473,8 +2542,10 @@ uint32_t MasterService::GetOwnedSlotCount() const {
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterService::InterMasterAllocateReplicas(
     const std::string& tenant_id, const std::string& key, uint64_t slice_length,
-    uint64_t replica_num, const std::vector<std::string>& preferred_segments) {
-    if (key.empty() || slice_length == 0 || replica_num == 0) {
+    uint64_t replica_num, const std::vector<std::string>& preferred_segments,
+    uint64_t allocation_token) {
+    if (key.empty() || slice_length == 0 || replica_num == 0 ||
+        allocation_token == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -2529,8 +2600,9 @@ MasterService::InterMasterAllocateReplicas(
         // Replace any stale keepalive entry for the same key: erasing frees
         // the old handles (idempotent re-PutStart after an aborted write).
         inter_master_keepalive_.erase(scoped_key);
-        inter_master_keepalive_.emplace(scoped_key,
-                                        std::move(allocation.value()));
+        inter_master_keepalive_.emplace(
+            scoped_key, InterMasterAllocation{allocation_token,
+                                              std::move(allocation.value())});
     }
     LOG(INFO) << "InterMasterAllocateReplicas: allocated " << descriptors.size()
               << " replica(s) for scoped_key=" << scoped_key
@@ -2540,7 +2612,8 @@ MasterService::InterMasterAllocateReplicas(
 }
 
 tl::expected<bool, ErrorCode> MasterService::InterMasterFreeReplicas(
-    const std::string& tenant_id, const std::string& key) {
+    const std::string& tenant_id, const std::string& key,
+    uint64_t allocation_token) {
     const std::string scoped_key = TenantId(tenant_id).MakeScopedKey(key);
     std::vector<Replica> released;
     {
@@ -2549,7 +2622,12 @@ tl::expected<bool, ErrorCode> MasterService::InterMasterFreeReplicas(
         if (it == inter_master_keepalive_.end()) {
             return false;  // not the owner of this key's handles
         }
-        released = std::move(it->second);
+        if (allocation_token != 0 && it->second.token != allocation_token) {
+            // A free queued for an earlier allocation of this key: the
+            // entry here is a newer allocation and must stay alive.
+            return false;
+        }
+        released = std::move(it->second.replicas);
         inter_master_keepalive_.erase(it);
     }
     // Replica destructors free the handles at this (segment owning) master.
@@ -2610,13 +2688,17 @@ MasterService::TryAllocateReplicasRemotely(
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
     const std::string tenant_str = tenant_id.value();
+    // Names this allocation at the peer; a free for an earlier allocation
+    // of the same key, still queued, then leaves it alone.
+    const uint64_t token =
+        randomUniform<uint64_t>(1, std::numeric_limits<uint64_t>::max());
     for (const auto& member : inter_master_rpc_->GetMembers()) {
         if (member.master_id.empty() || member.master_id == master_id_) {
             continue;
         }
         auto remote = inter_master_rpc_->AllocateReplicas(
             member.master_id, tenant_str, key, value_length,
-            static_cast<uint64_t>(replica_num), preferred_segments);
+            static_cast<uint64_t>(replica_num), preferred_segments, token);
         if (!remote.has_value()) {
             VLOG(1) << "Remote allocation on " << member.master_id
                     << " failed for key=" << key << ": "
@@ -2625,7 +2707,8 @@ MasterService::TryAllocateReplicasRemotely(
         }
         if (remote->size() < replica_num) {
             // Partial result: free it at the peer and keep probing.
-            inter_master_rpc_->FreeReplicas(member.master_id, tenant_str, key);
+            inter_master_rpc_->FreeReplicas(member.master_id, tenant_str, key,
+                                            token);
             continue;
         }
 
@@ -2658,13 +2741,26 @@ MasterService::TryAllocateReplicasRemotely(
         }
         if (replicas.size() != replica_num) {
             // Unexpected descriptor types: undo at the peer and fail.
-            inter_master_rpc_->FreeReplicas(member.master_id, tenant_str, key);
+            inter_master_rpc_->FreeReplicas(member.master_id, tenant_str, key,
+                                            token);
             continue;
         }
 
+        std::optional<uint64_t> superseded;
         {
             std::lock_guard<std::mutex> lock(remote_allocated_keys_mutex_);
-            remote_allocated_keys_.insert(tenant_id.MakeScopedKey(key));
+            auto [it, inserted] = remote_allocated_keys_.try_emplace(
+                tenant_id.MakeScopedKey(key), token);
+            if (!inserted) {
+                // An earlier allocation was never erased (its write failed
+                // before publication); free it rather than leak it.
+                superseded = it->second;
+                it->second = token;
+            }
+        }
+        if (superseded) {
+            inter_master_rpc_->EnqueueBroadcastFree(tenant_str, key,
+                                                    *superseded);
         }
         LOG(INFO) << "Allocated " << replicas.size()
                   << " remote replica(s) for key=" << key
@@ -2686,11 +2782,15 @@ void MasterService::EnqueueRemoteFreeIfTracked(const TenantId& tenant_id,
                                                const std::string& key,
                                                EraseMode quota_mode) {
 #ifdef STORE_USE_ETCD
+    uint64_t token = 0;
     {
         std::lock_guard<std::mutex> lock(remote_allocated_keys_mutex_);
-        if (remote_allocated_keys_.erase(tenant_id.MakeScopedKey(key)) == 0) {
+        auto it = remote_allocated_keys_.find(tenant_id.MakeScopedKey(key));
+        if (it == remote_allocated_keys_.end()) {
             return;  // handles (if any) are local
         }
+        token = it->second;
+        remote_allocated_keys_.erase(it);
     }
     if (quota_mode == EraseMode::kHandoff) {
         // Slot migration: the data bytes live on. The importing master
@@ -2698,7 +2798,7 @@ void MasterService::EnqueueRemoteFreeIfTracked(const TenantId& tenant_id,
         return;
     }
     if (inter_master_rpc_) {
-        inter_master_rpc_->EnqueueBroadcastFree(tenant_id.value(), key);
+        inter_master_rpc_->EnqueueBroadcastFree(tenant_id.value(), key, token);
     }
 #endif
 }
@@ -3711,7 +3811,9 @@ ErrorCode MasterService::InstallSlotMetadataExport(
         PublishKvStored(user_key, metadata, tenant_id);
         {
             std::lock_guard<std::mutex> lock(remote_allocated_keys_mutex_);
-            remote_allocated_keys_.insert(tenant_id.MakeScopedKey(user_key));
+            // The peer's allocation token is not carried over: zero.
+            remote_allocated_keys_.insert_or_assign(
+                tenant_id.MakeScopedKey(user_key), 0);
         }
     }
     // Complete vsegment activation before ACK: a failed activation must leave
@@ -3753,11 +3855,12 @@ tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterService::InterMasterAllocateReplicas(const std::string&,
                                            const std::string&, uint64_t,
                                            uint64_t,
-                                           const std::vector<std::string>&) {
+                                           const std::vector<std::string>&,
+                                           uint64_t) {
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 tl::expected<bool, ErrorCode> MasterService::InterMasterFreeReplicas(
-    const std::string&, const std::string&) {
+    const std::string&, const std::string&, uint64_t) {
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 tl::expected<GetReplicaListResponse, ErrorCode>
@@ -4369,7 +4472,7 @@ void MasterService::EvictStaleGenerationForHost(const Segment& incoming,
         }
     }
 
-    RecomputeTenantEffectiveQuotas();
+    NotifyPolicyCapacityChanged();
 }
 
 std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
@@ -4957,6 +5060,7 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    InvalidateVSegmentLayoutCache();
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -5754,6 +5858,7 @@ void MasterService::EvictManagedWeightMembersToCold(
         const bool has_cold =
             metadata.HasReplica([this](const Replica& replica) {
                 return !replica.is_memory_replica() &&
+                       !replica.is_vsegment_replica() &&
                        IsReplicaReadable(replica);
             });
         if (!has_cold || !metadata.IsLeaseExpired(now) ||
@@ -6645,6 +6750,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
 
 bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
     bool quota_recompute_needed = false;
+    std::vector<UUID> committed_segments;
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
 
@@ -6791,10 +6897,19 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                       << ", segment_name=" << it->segment_name
                       << ", action=unmount_offline_mem_segment";
             quota_recompute_needed = true;
+            committed_segments.push_back(it->segment_id);
             it = job.prepared_segments.erase(it);
         }
     }
 
+    // A client that expires never calls UnmountSegment, so its CVM segment
+    // descriptor and this master's mount entry would otherwise stay in etcd
+    // and keep routing allocations to a dead endpoint. Done once the segment
+    // lock is released; RemoveSegmentOwnerForCvm keeps the descriptor while
+    // another master still mounts the segment.
+    for (const auto& segment_id : committed_segments) {
+        RemoveSegmentOwnerForCvm(segment_id);
+    }
     if (quota_recompute_needed) {
         NotifyPolicyCapacityChanged();
     }
@@ -6873,6 +6988,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     -> tl::expected<void, ErrorCode> {
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
+    InvalidateVSegmentLayoutCache();
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     // 1. Prepare to unmount the segment by deleting its allocator
     {
@@ -6925,6 +7041,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
                               std::string(bytes.begin(), bytes.end()));
     }
     NotifyPolicyCapacityChanged();
+    RemoveSegmentOwnerForCvm(segment_id);
     return {};
 }
 
@@ -6932,6 +7049,7 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
                                            const UUID& client_id,
                                            uint64_t grace_period_ms)
     -> tl::expected<void, ErrorCode> {
+    InvalidateVSegmentLayoutCache();
     std::unique_lock<std::shared_mutex> lock(master_state_mutex_);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
@@ -7121,6 +7239,16 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
+        // A key of a slot another master owns would otherwise read as absent
+        // here, and the client would take a stale route for a missing
+        // object. Not forwarded: the client refreshes its route and retries
+        // the batch on SLOT_NOT_OWNED / SLOT_MIGRATING.
+        const ErrorCode svc =
+            CheckSlotServiceability(cvm::KeySlot(normalized_tenant, keys[i]));
+        if (svc != ErrorCode::OK) {
+            results[i] = tl::make_unexpected(svc);
+            continue;
+        }
         MetadataAccessorRO accessor(this, normalized_tenant, keys[i]);
         if (!accessor.Exists()) {
             VLOG(1) << "key=" << keys[i] << ", tenant_id=" << normalized_tenant
@@ -7764,6 +7892,10 @@ tl::expected<void, ErrorCode> MasterService::MaterializeReplayedState(
                 owned_objects.push_back(entry);
             }
             objects_to_install = &owned_objects;
+            // Publish the same partition to the read/write ownership bitmap
+            // so the new primary rejects or forwards other masters' slots
+            // from its first request, not only after the next heartbeat.
+            UpdateExpectedSlots(owned_slots);
         }
     }
 
@@ -8671,7 +8803,13 @@ auto MasterService::BatchReplicaClear(
             }
 
             // Erase the entire metadata (all replicas will be deallocated)
-            accessor.Erase();
+            if (const auto erased = accessor.Erase(); erased != ErrorCode::OK) {
+                LOG(WARNING)
+                    << "BatchReplicaClear: tenant=" << normalized_tenant
+                    << " failed to erase key=" << key
+                    << ", error=" << toString(erased);
+                continue;
+            }
             cleared_keys.emplace_back(key);
             VLOG(1) << "BatchReplicaClear: tenant=" << normalized_tenant
                     << " successfully cleared all replicas for key=" << key
@@ -8819,8 +8957,11 @@ bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
 }
 
 bool MasterService::IsEvictableMemoryReplica(const Replica& replica) const {
-    return replica.is_memory_replica() && IsReplicaReadable(replica) &&
-           replica.get_refcnt() == 0;
+    // A VSegment extent is memory too: it is charged as memory cache and is
+    // released with the replica (PopReplicasWithCacheTotalAccounting), so
+    // eviction can reclaim it.
+    return (replica.is_memory_replica() || replica.is_vsegment_replica()) &&
+           IsReplicaReadable(replica) && replica.get_refcnt() == 0;
 }
 
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
@@ -8892,24 +9033,73 @@ auto MasterService::GetOffloadEndpoints()
 auto MasterService::GetReplicaList(const std::string& key,
                                    const TenantId& tenant_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+
+    // CVM read-path slot ownership: when another master owns the key's slot,
+    // forward to it first, and answer SLOT_NOT_OWNED only if that fails so the
+    // client re-routes from its latest slot view.
+    const uint16_t slot = cvm::KeySlot(object_id.tenant_id, object_id.user_key);
+    const ErrorCode svc = CheckSlotServiceability(slot);
+    if (svc == ErrorCode::SLOT_MIGRATING) {
+        LOG(INFO) << "GetReplicaList rejected with SLOT_MIGRATING: key=" << key
+                  << " slot=" << slot;
+        return tl::make_unexpected(ErrorCode::SLOT_MIGRATING);
+    }
+    if (svc == ErrorCode::SLOT_NOT_OWNED) {
+#ifdef STORE_USE_ETCD
+        auto owner = ResolveSlotOwnerMasterId(slot);
+        if (owner && !owner->empty() && *owner != master_id_ &&
+            inter_master_rpc_) {
+            auto result = inter_master_rpc_->GetReplicaList(
+                *owner, key, object_id.tenant_id.value());
+            if (result.has_value()) {
+                return result;
+            }
+            VLOG(1) << "GetReplicaList forward failed: key=" << key
+                    << " owner=" << *owner
+                    << " error=" << toString(result.error());
+        }
+#endif
+        LOG(WARNING) << "GetReplicaList: key=" << key << " slot=" << slot
+                     << " not owned by this master and forwarding failed, "
+                        "rejecting with SLOT_NOT_OWNED";
+        return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
+    }
+
+    return GetReplicaListLocal(object_id);
+}
+
+auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    const std::string& key = object_id.user_key;
 
     ReadFollowUps follow_ups;
     auto resp = [&]() -> tl::expected<GetReplicaListResponse, ErrorCode> {
         MetadataAccessorRO accessor(this, object_id);
-                MasterMetricManager::instance().inc_total_get_nums();
+        MasterMetricManager::instance().inc_total_get_nums();
 
         if (!accessor.Exists()) {
             VLOG(1) << "key=" << key << ", info=object_not_found";
-                                    return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         return ReadReplicaList(object_id.tenant_id, key, accessor.Get(),
                                follow_ups);
     }();
     // RO accessor released. Safe to take a fresh RW accessor now.
     follow_ups.Run(*this);
+    // VSegment replicas carry only their logical position; the reader needs
+    // the stripe layout to reach the members. Built here, at the master that
+    // holds the views, so a forwarded read carries it back too.
+    if (resp) {
+        EnrichVSegmentLayouts(&*resp);
+    }
     return resp;
+}
+
+void MasterService::InvalidateVSegmentLayoutCache() {
+    std::lock_guard<std::mutex> lock(vsegment_layout_cache_mutex_);
+    vsegment_layout_cache_.clear();
 }
 
 auto MasterService::ReadReplicaList(const TenantId& tenant_id,
@@ -9190,11 +9380,26 @@ auto MasterService::AllocateReplicas(const std::string& key,
                                      uint64_t value_length,
                                      const ReplicateConfig& config,
                                      const std::string& writer_host_id,
-                                     bool* dfs_allocation_failed)
+                                     bool* dfs_allocation_failed,
+                                     const TenantId* remote_fallback_tenant)
     -> tl::expected<std::vector<Replica>, ErrorCode> {
     if (dfs_allocation_failed != nullptr) {
         *dfs_allocation_failed = false;
     }
+    // Remote memory replicas taken below are freed at the peer if a later
+    // tier fails and this allocation is dropped.
+    struct RemoteAllocationRelease {
+        MasterService* service;
+        const TenantId* tenant;
+        const std::string& key;
+        bool armed = false;
+        ~RemoteAllocationRelease() {
+            if (armed) {
+                service->EnqueueRemoteFreeIfTracked(*tenant, key,
+                                                    EraseMode::kFull);
+            }
+        }
+    } remote_release{this, remote_fallback_tenant, key};
     std::vector<Replica> replicas;
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
@@ -9269,6 +9474,20 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 config.replica_num;
         }
 
+        if (!allocation_result.has_value() &&
+            allocation_result.error() != ErrorCode::INVALID_PARAMS &&
+            remote_fallback_tenant != nullptr) {
+            // CVM multi-submaster: the segments this key needs may be
+            // mounted on a peer. Forwarded with no allocator lock held, so
+            // two masters forwarding to each other cannot deadlock.
+            auto remote_replicas = TryAllocateReplicasRemotely(
+                key, *remote_fallback_tenant, value_length, config.replica_num,
+                preferred_segments);
+            if (remote_replicas.has_value()) {
+                allocation_result = std::move(remote_replicas);
+                remote_release.armed = true;
+            }
+        }
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
                     << ", error: " << allocation_result.error();
@@ -9407,6 +9626,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
         }
     }
 
+    remote_release.armed = false;
     return replicas;
 }
 
@@ -9493,8 +9713,10 @@ auto MasterService::AllocateAndInsertMetadata(
         return tl::make_unexpected(grown.error());
     }
 
-    auto allocation_result = AllocateReplicas(
-        key, value_length, config, writer_host_id, dfs_allocation_failed);
+    // The key holds no object, so a remote fallback is safe here.
+    auto allocation_result =
+        AllocateReplicas(key, value_length, config, writer_host_id,
+                         dfs_allocation_failed, &accessor.GetTenantId());
     if (!allocation_result) {
         return tl::make_unexpected(allocation_result.error());
     }
@@ -9659,6 +9881,57 @@ auto MasterService::AdmitWithDfsRecovery(const ReplicateConfig& config,
     return result;
 }
 
+// CVM slot ownership for a write start. Returns nullopt when this master may
+// write the key here. Otherwise returns what the caller must answer: the slot
+// owner's own reply when the call was forwarded, or SLOT_MIGRATING /
+// SLOT_NOT_OWNED. A non-owner must not write the metadata locally: reads are
+// routed by slot ownership, so the object would be unreadable. The owner sees
+// its slot as writable and never forwards again, so the chain ends at the
+// first hop. Single-master deployments have no slot partition and always
+// write locally.
+auto MasterService::RouteWriteStartToSlotOwner(const char* action, bool upsert,
+                                               const UUID& client_id,
+                                               const ObjectIdentity& object_id,
+                                               uint64_t slice_length,
+                                               const ReplicateConfig& config)
+    -> std::optional<
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>> {
+    const uint16_t slot = cvm::KeySlot(object_id.tenant_id, object_id.user_key);
+    // Writes go through CheckSlotWritable: a slot migrating out is frozen for
+    // writes while it still serves reads.
+    const ErrorCode svc = CheckSlotWritable(slot);
+    if (svc == ErrorCode::OK) {
+        return std::nullopt;
+    }
+    if (svc == ErrorCode::SLOT_NOT_OWNED) {
+#ifdef STORE_USE_ETCD
+        auto owner = ResolveSlotOwnerMasterId(slot);
+        if (owner && !owner->empty() && *owner != master_id_ &&
+            inter_master_rpc_) {
+            LOG(INFO) << action << " forwarded: key=" << object_id.user_key
+                      << " slot=" << slot << " -> owner=" << *owner;
+            // Upsert is forwarded as an upsert so the owner keeps its
+            // overwrite-if-exists semantics.
+            return upsert
+                       ? inter_master_rpc_->UpsertStart(
+                             *owner, client_id, object_id.user_key,
+                             object_id.tenant_id.value(), slice_length, config)
+                       : inter_master_rpc_->PutStart(
+                             *owner, client_id, object_id.user_key,
+                             object_id.tenant_id.value(), slice_length, config);
+        }
+#else
+        (void)upsert;
+        (void)client_id;
+        (void)slice_length;
+        (void)config;
+#endif
+    }
+    LOG(INFO) << action << " rejected with " << toString(svc)
+              << ": key=" << object_id.user_key << " slot=" << slot;
+    return tl::make_unexpected(svc);
+}
+
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const TenantId& tenant_id,
                              const uint64_t slice_length,
@@ -9669,6 +9942,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                                   slice_length, config, "put_start");
     if (!plan) {
         return tl::make_unexpected(plan.error());
+    }
+    if (auto routed =
+            RouteWriteStartToSlotOwner("PutStart", /*upsert=*/false, client_id,
+                                       object_id, slice_length, config)) {
+        return std::move(*routed);
     }
     std::optional<std::unique_lock<std::mutex>> weight_group_operation_lock;
     if (!plan->group_id.empty() &&
@@ -9726,7 +10004,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     std::move(replicas),
                     metadata.put_start_time + put_start_release_timeout_sec_);
             }
-            accessor.Erase();
+            // A failed VSegment release keeps the object published, and
+            // publishing over it would be fatal.
+            if (const auto erased = accessor.Erase(); erased != ErrorCode::OK) {
+                return tl::make_unexpected(erased);
+            }
         }
 
         return AllocateAndInsertMetadata(
@@ -10040,6 +10322,16 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     -> tl::expected<bool, ErrorCode> {
     assert(tenant_id.IsValid());
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+    // AddReplica creates metadata for a key it does not know (a worker
+    // re-registering its SSD after a master restart), so only the slot owner
+    // may take it; otherwise a non-owner would hold a ghost LOCAL_DISK object.
+    if (const ErrorCode svc =
+            CheckSlotServiceability(cvm::KeySlot(normalized_tenant, key));
+        svc != ErrorCode::OK) {
+        LOG(WARNING) << "AddReplica: rejected non-owned slot key=" << key
+                     << " error=" << toString(svc) << " client=" << client_id;
+        return tl::make_unexpected(svc);
+    }
     // Held for the whole request, so the policy's control plane cannot revoke
     // the tenant between the admission and the write.
     std::unique_ptr<AdmissionToken> admission;
@@ -10407,6 +10699,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     if (!plan) {
         return tl::make_unexpected(plan.error());
     }
+    if (auto routed = RouteWriteStartToSlotOwner("UpsertStart", /*upsert=*/true,
+                                                 client_id, object_id,
+                                                 slice_length, config)) {
+        return std::move(*routed);
+    }
     std::optional<std::unique_lock<std::mutex>> weight_group_operation_lock;
     if (!plan->group_id.empty() &&
         weight_manager_.IsManagedGroup(plan->group_id)) {
@@ -10536,6 +10833,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // PutStart (which only preempts after a timeout), UpsertStart
                 // preempts immediately.
                 if (state.is_processing) {
+                    // Abort the preempted writer's VSegment reservations;
+                    // the raw pop below only detaches the replicas.
+                    ReleaseVSegmentReplicaState(metadata,
+                                                &Replica::fn_is_processing);
                     auto processing_replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     metadata.ClearPendingSoftPinAction();
@@ -10561,7 +10862,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                             *allocation_committed_soft_pin_timeout <= now) {
                             allocation_committed_soft_pin_timeout.reset();
                         }
-                        accessor.Erase();
+                        if (const auto erased = accessor.Erase();
+                            erased != ErrorCode::OK) {
+                            return tl::make_unexpected(erased);
+                        }
                     }
                 }
             }
@@ -12201,7 +12505,10 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 MarkRemovedAndPersist(normalized_tenant, key, metadata);
             continue;
         }
-        accessor.Erase();
+        if (const auto erased = accessor.Erase(); erased != ErrorCode::OK) {
+            results[original_idx] = tl::make_unexpected(erased);
+            continue;
+        }
         results[original_idx] = {};  // Success
     }
 
@@ -13935,6 +14242,17 @@ auto MasterService::PromotionAllocStart(
     uint64_t size, const std::vector<std::string>& preferred_segments)
     -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    // The promotion task and its staged replica live only at the slot owner;
+    // a misrouted AllocStart is rejected and the worker retries at its source
+    // master.
+    if (const ErrorCode svc = CheckSlotServiceability(
+            cvm::KeySlot(object_id.tenant_id, object_id.user_key));
+        svc != ErrorCode::OK) {
+        LOG(WARNING) << "PromotionAllocStart: rejected non-owned slot key="
+                     << key << " error=" << toString(svc)
+                     << " client=" << client_id;
+        return tl::make_unexpected(svc);
+    }
     const auto record = FindClientRecord(client_id);
     auto serving_guard =
         record ? record->TryAcquireServingGuard() : std::nullopt;
@@ -14501,6 +14819,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             }
 
             // HA disabled or never published — apply.
+            ReleaseVSegmentReplicaState(metadata, &Replica::fn_is_processing);
             auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
             metadata.ClearPendingSoftPinIfNoViableReplica();
             metadata.ClearSessionTagIfNoViableReplica();
@@ -14695,6 +15014,169 @@ MasterService::NamespaceEvictionResult MasterService::EvictNamespaceMemory(
         tenant_id, eviction::ByteGoal{.target_bytes = target_bytes});
     return {.freed_bytes = report.released_bytes,
             .evicted_objects = report.evicted_objects};
+}
+
+MasterService::TenantQuotaEvictionResult
+MasterService::EvictTenantMemoryForQuota(
+    const TenantId& tenant_id, uint64_t target_bytes,
+    const std::unordered_set<std::string>* candidate_keys) {
+    if (target_bytes == 0) {
+        return {};
+    }
+    if (candidate_keys == nullptr) {
+        const auto result = EvictNamespaceMemory(tenant_id, target_bytes);
+        return {.freed_bytes = result.freed_bytes,
+                .evicted_objects = result.evicted_objects};
+    }
+    // An IO-pattern plan names the keys to reclaim: evict those, one key lock
+    // at a time, under the same rules and reclaimer as a namespace run. Keys
+    // the rules keep stay; the caller makes up a shortfall with the legacy
+    // fallback.
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    metadata::Namespace* ns = namespaces_.Lookup(tenant_id);
+    if (ns == nullptr) {
+        return {};
+    }
+    eviction::Report report;
+    for (const std::string& key : *candidate_keys) {
+        if (report.released_bytes >= target_bytes) {
+            break;
+        }
+        // Declared before the lock so it is freed after the lock is let go.
+        std::vector<Replica> detached;
+        const std::optional<route::WriteGuard> hold = ns->objects.Write(key);
+        if (!hold || !hold->has_object()) {
+            continue;
+        }
+        auto taken = memory_eviction_->EvictObject(*ns, *hold, report);
+        if (!taken) {
+            report.stopped = true;
+            break;
+        }
+        detached = std::move(taken.value());
+    }
+    for (eviction::EvictionObserver* observer : memory_eviction_->observers) {
+        observer->OnRunEnd(eviction::Scope::Of(tenant_id), report);
+    }
+    return {.freed_bytes = report.released_bytes,
+            .evicted_objects = report.evicted_objects};
+}
+
+void MasterService::ReportEvictedKeysAsTierRemovals(
+    const TenantId& tenant,
+    const std::unordered_set<std::string>& candidate_keys) {
+    if (!io_pattern_runtime_ || candidate_keys.empty()) {
+        return;
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    for (const auto& key : candidate_keys) {
+        {
+            MetadataAccessorRO accessor(this, ObjectIdentity{tenant, key});
+            if (accessor.Exists() &&
+                accessor.Get().HasReplica([](const Replica& replica) {
+                    return replica.is_memory_replica() ||
+                           replica.is_vsegment_replica();
+                })) {
+                continue;
+            }
+        }
+        // The MEMORY replica is gone, so the policy must stop treating this
+        // key as resident in the head tier; otherwise it is never offered to
+        // admission and never promoted back.
+        io_pattern_runtime_->RecordTierEvent(io_pattern::CacheEvent{
+            .type = io_pattern::CacheEventType::kRemoved,
+            .object = {tenant, key},
+            .source_tier = io_pattern::CacheTier::kL1Host});
+    }
+}
+
+bool MasterService::RunLegacyEvictionFallback(uint64_t shortfall_bytes) {
+    if (shortfall_bytes == 0) {
+        return true;
+    }
+    const auto capacity = std::max<int64_t>(
+        0, MasterMetricManager::instance().get_total_mem_capacity());
+    if (capacity == 0) {
+        return false;
+    }
+    // Only one fallback at a time: the watermark thread and the report-driven
+    // worker can both observe a shortfall.
+    std::unique_lock<std::mutex> lock(legacy_eviction_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return false;
+    }
+    const double ratio = std::min(1.0, static_cast<double>(shortfall_bytes) /
+                                           static_cast<double>(capacity));
+    BatchEvict(ratio, ratio * 0.5);
+    return true;
+}
+
+// Policy-driven tier down: queue one MEMORY replica of `object_id` for a
+// LOCAL_DISK copy, keeping the MEMORY replica in place. Uses the offload
+// bookkeeping of offload-on-evict (a refcount pin plus the object's
+// offloading task, both released when the client reports the copy back) and
+// frees nothing: demotion is a copy, not a reclaim.
+MasterService::TierDownOutcome MasterService::TryQueueTierDown(
+    const ObjectIdentity& object_id) {
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) {
+        return TierDownOutcome::kNotFound;
+    }
+    auto& metadata = accessor.Get();
+
+    // Already on disk: there is nothing left to copy down. Reported apart
+    // from kQueued because a driver that keeps selecting paved keys is not
+    // making progress. Re-asserting the lower tier to the collector is
+    // idempotent and lets the selection converge instead of spinning on the
+    // same keys.
+    if (metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        if (io_pattern_runtime_) {
+            io_pattern_runtime_->RecordTierEvent(io_pattern::CacheEvent{
+                .type = io_pattern::CacheEventType::kInserted,
+                .object = {object_id.tenant_id, object_id.user_key},
+                .target_tier = io_pattern::CacheTier::kL3NofSsd});
+        }
+        return TierDownOutcome::kAlreadyPaved;
+    }
+    // A copy is already in flight; pushing again is not progress either.
+    auto& offloading_task = accessor.GetState().offloading_task;
+    if (offloading_task.has_value()) {
+        return TierDownOutcome::kAlreadyInFlight;
+    }
+
+    bool queued = false;
+    metadata.VisitReplicas(
+        [](const Replica& replica) {
+            return replica.is_completed() && replica.is_memory_replica();
+        },
+        [this, &object_id, &offloading_task, &queued](Replica& replica) {
+            if (queued) return;  // one replica is enough to copy down
+            std::vector<UUID> mirror_clients;
+            auto result =
+                PushOffloadingQueue(object_id, replica, &mirror_clients);
+            if (!result) {
+                VLOG(1) << "tier_down_push_failed key=" << object_id.user_key
+                        << " error=" << toString(result.error());
+                return;
+            }
+            replica.inc_refcnt();
+            offloading_task =
+                OffloadingTask{replica.id(), std::chrono::system_clock::now(),
+                               std::move(mirror_clients)};
+            queued = true;
+        });
+    return queued ? TierDownOutcome::kQueued : TierDownOutcome::kPushFailed;
+}
+
+void MasterService::RunBatchEvictForTesting(double evict_ratio_target,
+                                            double evict_ratio_lowerbound) {
+    BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+}
+
+void MasterService::RunNoFBatchEvictForTesting(double evict_ratio_target,
+                                               double evict_ratio_lowerbound) {
+    NoFBatchEvict(evict_ratio_target, evict_ratio_lowerbound);
 }
 
 void MasterService::BatchEvict(double evict_ratio_target,

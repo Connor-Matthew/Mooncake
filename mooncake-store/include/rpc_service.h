@@ -449,12 +449,14 @@ class WrappedMasterService {
     InterMasterAllocateReplicas(
         const std::string& tenant_id, const std::string& key,
         uint64_t slice_length, uint64_t replica_num,
-        const std::vector<std::string>& preferred_segments);
+        const std::vector<std::string>& preferred_segments,
+        uint64_t allocation_token);
 
     // Frees the keepalive entry (and thus the handles) previously created
     // by InterMasterAllocateReplicas. Returns true when an entry existed.
     tl::expected<bool, ErrorCode> InterMasterFreeReplicas(
-        const std::string& tenant_id, const std::string& key);
+        const std::string& tenant_id, const std::string& key,
+        uint64_t allocation_token);
 
     // Inter-master read forwarding (CVM plan B): local GetReplicaList /
     // BatchGetReplicaList query for a forwarding peer. These do NOT

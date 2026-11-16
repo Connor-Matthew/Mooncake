@@ -5303,6 +5303,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             }
 
             FinalizeBatchUpsert(ops);
+            // Report the endpoints whose transfers failed, as BatchPut does,
+            // so the masters stop allocating on them.
+            std::set<std::string> batch_failed_endpoints;
+            AggregateBatchFailedEndpoints(ops, batch_failed_endpoints);
+            ReportFailedEndpointsToMasters(batch_failed_endpoints);
             return CollectResults(ops);
         }
 

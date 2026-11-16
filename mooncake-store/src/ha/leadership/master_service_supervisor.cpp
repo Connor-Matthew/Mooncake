@@ -468,11 +468,16 @@ void EnterStandbyMode(
     std::atomic<bool>& accept_runtime_updates,
     const std::optional<MasterView>& leader_view,
     const std::unique_ptr<cvm::CvmController>& cvm_controller) {
+    accept_runtime_updates.store(true, std::memory_order_release);
     const MasterSources sources = cvm_controller
                                       ? BuildCvmObservedSources(cvm_controller)
                                       : ha::SingleLeaderSources(leader_view);
-    UpdateObservedLeader(admin_server, standby_controller, leader_view,
-                         sources);
+    // CVM has no single leader view; the admin surface shows the earliest
+    // primary instead.
+    UpdateObservedLeader(
+        admin_server, standby_controller,
+        cvm_controller ? BuildCvmObservedLeader(cvm_controller) : leader_view,
+        sources);
     auto err = standby_controller.StartStandby(sources);
     if (err != ErrorCode::OK) {
         LOG(WARNING) << "Failed to start standby replication: "
@@ -1300,13 +1305,11 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                                   // owns its metadata in metadata_store rather
                                   // than in the legacy object vector.
                                   if (has_upstream) {
-                                      // MERGE_REVIEW(MR-1113-01): main refuses
-                                      // to serve when the promotion context
-                                      // still holds object storage obligations
-                                      // it cannot resume. The same gate is
-                                      // applied to the CVM path, so a CVM
-                                      // promotion with pending object storage
-                                      // state now fails instead of dropping it.
+                                      // As on the single-master path, never
+                                      // serve after dropping object storage
+                                      // obligations this promotion cannot
+                                      // resume: a CVM promotion with such
+                                      // state fails instead.
                                       auto restore_result =
                                           promotion_ctx.HasObjectReplicaState()
                                               ? tl::expected<void, ErrorCode>(

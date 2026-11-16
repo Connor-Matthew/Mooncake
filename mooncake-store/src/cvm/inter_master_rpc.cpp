@@ -172,26 +172,27 @@ tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 InterMasterRpcClient::AllocateReplicas(
     const std::string& master_id, const std::string& tenant_id,
     const std::string& key, uint64_t slice_length, uint64_t replica_num,
-    const std::vector<std::string>& preferred_segments) {
+    const std::vector<std::string>& preferred_segments,
+    uint64_t allocation_token) {
     auto address = ResolveAddress(master_id);
     if (!address) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return invoke_rpc<&WrappedMasterService::InterMasterAllocateReplicas,
                       std::vector<Replica::Descriptor>>(
-        *address, tenant_id, key, slice_length, replica_num,
-        preferred_segments);
+        *address, tenant_id, key, slice_length, replica_num, preferred_segments,
+        allocation_token);
 }
 
 tl::expected<bool, ErrorCode> InterMasterRpcClient::FreeReplicas(
     const std::string& master_id, const std::string& tenant_id,
-    const std::string& key) {
+    const std::string& key, uint64_t allocation_token) {
     auto address = ResolveAddress(master_id);
     if (!address) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return invoke_rpc<&WrappedMasterService::InterMasterFreeReplicas, bool>(
-        *address, tenant_id, key);
+        *address, tenant_id, key, allocation_token);
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>
@@ -319,7 +320,8 @@ tl::expected<bool, ErrorCode> InterMasterRpcClient::AckSlotRangeImported(
 }
 
 void InterMasterRpcClient::EnqueueBroadcastFree(const std::string& tenant_id,
-                                                 const std::string& key) {
+                                                const std::string& key,
+                                                uint64_t allocation_token) {
     if (!running_.load()) {
         VLOG(1) << "InterMasterRpc: broadcast free dropped (not running): key="
                 << key;
@@ -335,7 +337,7 @@ void InterMasterRpcClient::EnqueueBroadcastFree(const std::string& tenant_id,
                          << free_queue_.size() << "), dropping key=" << key;
             return;
         }
-        free_queue_.push_back(FreeTask{tenant_id, key, 0});
+        free_queue_.push_back(FreeTask{tenant_id, key, allocation_token, 0});
     }
     free_cv_.notify_one();
 }
@@ -379,7 +381,7 @@ void InterMasterRpcClient::FreeLoop() {
                 continue;
             }
             auto result = FreeReplicas(member.master_id, task.tenant_id,
-                                       task.key);
+                                       task.key, task.allocation_token);
             // Not-found (false) is the common case for non-owner peers.
             if (result.has_value() && result.value()) {
                 LOG(INFO) << "InterMasterRpc: freed remote replicas on "

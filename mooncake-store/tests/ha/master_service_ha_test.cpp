@@ -8104,6 +8104,46 @@ TEST_F(MasterServiceHATest, MaterializeReplayedStateIsAdditiveAndIdempotent) {
 
 }  // namespace mooncake::test
 
+#ifdef STORE_USE_ETCD
+// A broadcast free still queued from an earlier allocation of a key must not
+// release a newer allocation of the same key on the segment-owning peer.
+TEST_F(MasterServiceHATest, InterMasterFreeOnlyReleasesMatchingAllocation) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    PrepareSimpleSegment(service, "peer_segment");
+    const std::string tenant = kDefaultTenant.value();
+
+    ASSERT_TRUE(service.InterMasterAllocateReplicas(tenant, "key", 1024, 1, {},
+                                                    /*allocation_token=*/1));
+    // The key is written again: the peer replaces the stale allocation.
+    ASSERT_TRUE(service.InterMasterAllocateReplicas(tenant, "key", 1024, 1, {},
+                                                    /*allocation_token=*/2));
+
+    auto stale = service.InterMasterFreeReplicas(tenant, "key", 1);
+    ASSERT_TRUE(stale);
+    EXPECT_FALSE(*stale);
+    auto current = service.InterMasterFreeReplicas(tenant, "key", 2);
+    ASSERT_TRUE(current);
+    EXPECT_TRUE(*current);
+    auto again = service.InterMasterFreeReplicas(tenant, "key", 2);
+    ASSERT_TRUE(again);
+    EXPECT_FALSE(*again);
+
+    // Zero (a migrated-in key, token unknown) frees whatever is held.
+    ASSERT_TRUE(service.InterMasterAllocateReplicas(tenant, "key", 1024, 1, {},
+                                                    /*allocation_token=*/3));
+    auto wildcard = service.InterMasterFreeReplicas(tenant, "key", 0);
+    ASSERT_TRUE(wildcard);
+    EXPECT_TRUE(*wildcard);
+
+    // A token of zero is reserved for that wildcard.
+    auto zero = service.InterMasterAllocateReplicas(tenant, "key", 1024, 1, {},
+                                                    /*allocation_token=*/0);
+    ASSERT_FALSE(zero);
+    EXPECT_EQ(zero.error(), ErrorCode::INVALID_PARAMS);
+}
+#endif
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
