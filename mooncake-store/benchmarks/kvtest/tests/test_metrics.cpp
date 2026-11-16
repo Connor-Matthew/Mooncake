@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <json/json.h>
+
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -103,6 +105,46 @@ TEST(MetricsSamplesTest, DecimationCapsRetainedSamples) {
     while (std::getline(input, line)) ++lines;
     EXPECT_LE(lines - 1, 10);  // header + at most samples_max rows
     EXPECT_GT(lines - 1, 0);
+}
+
+TEST(MetricsSummaryTest, BusyThroughputUsesAllSuccessLatencies) {
+    const std::string dir = MetricsDir("busy_throughput");
+    std::filesystem::remove_all(dir);
+    MetricsCollector metrics(11, 0, dir, 2);
+    metrics.Start();
+    for (int i = 1; i <= 10; ++i) {
+        metrics.Record("op", static_cast<double>(i), RecordStatus::kOk, 100);
+    }
+    metrics.Stop();
+
+    std::ifstream input(dir + "/summary.json");
+    ASSERT_TRUE(input.good());
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    ASSERT_TRUE(Json::parseFromStream(builder, input, &root, &errors))
+        << errors;
+
+    const Json::Value &op = root["operations"]["op"];
+    ASSERT_FALSE(op.isNull());
+    // samples_max=2 only limits retained latency samples; busy_ms must cover
+    // every successful request (1+2+...+10 = 55ms).
+    EXPECT_DOUBLE_EQ(op["busy_ms"].asDouble(), 55.0);
+    EXPECT_EQ(op["success"].asUInt64(), 10u);
+    const double expected = 1000.0 / (55.0 / 1000.0) / (1024.0 * 1024.0);
+    EXPECT_NEAR(op["throughput_mb_s"].asDouble(), expected, 1e-9);
+    EXPECT_NEAR(op["throughput_gb_s"].asDouble(), expected / 1024.0, 1e-12);
+}
+
+TEST(MetricsWindowTest, DisabledWindowDoesNotCreateCsv) {
+    const std::string dir = MetricsDir("window_disabled");
+    std::filesystem::remove_all(dir);
+    MetricsCollector metrics(12, 0, dir);
+    metrics.Start();
+    metrics.Record("op", 1.0, RecordStatus::kOk, 10);
+    metrics.Stop();
+    EXPECT_FALSE(std::filesystem::exists(dir + "/metrics_12.csv"));
+    EXPECT_TRUE(std::filesystem::exists(dir + "/summary.json"));
 }
 
 }  // namespace mooncake::kvtest

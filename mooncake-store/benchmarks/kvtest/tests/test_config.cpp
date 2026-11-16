@@ -1,4 +1,4 @@
-#include <gtest/gtest.h>
+﻿#include <gtest/gtest.h>
 
 #include <filesystem>
 #include <fstream>
@@ -248,4 +248,21 @@ TEST(ConfigTest, PrefillAndCleanupExamplesAreOneShot) {
     }
 }
 
+TEST(ConfigTest, MetricsWindowIsOffByDefault) {
+    Config config;
+    EXPECT_EQ(config.metrics_interval_ms, 0);
+
+    Config explicit_on;
+    std::string error;
+    ASSERT_TRUE(Load(
+        WithStore(
+            R"("mode":"pipeline","role":"reader","listen_port":9001,)"
+            R"("notify_pipeline":["getBuffer"],"num_threads":1,)"
+            R"("num_total_threads":2,"data_sizes":["8MB"],)"
+            R"("metrics_interval_ms":3000)"),
+        "metrics_window_on.json", &explicit_on, &error))
+        << error;
+    EXPECT_EQ(explicit_on.metrics_interval_ms, 3000);
+}
 }  // namespace mooncake::kvtest
+
