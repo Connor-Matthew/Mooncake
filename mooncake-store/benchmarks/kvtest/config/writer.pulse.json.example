@@ -1,0 +1,52 @@
+{
+  "mode": "pipeline",
+  "instance_id": 0,
+  "listen_port": 9000,
+  "role": "writer",
+  "traffic_mode": "pulse",
+  "pulse_window_ms": 1000,
+  "target_qps": 52.5,
+  "pacing_catch_up": true,
+  "duration": 30,
+  "warmup_duration": 5,
+  "notify_async": true,
+  "notify_overflow": "block",
+  "notify_format": "json",
+  "pipeline": ["upsertFrom"],
+  "notify_pipeline": ["getBuffer"],
+  "num_threads": 1,
+  "num_total_threads": 2,
+  "notify_threads": 10,
+  "notify_count": 1,
+  "notify_queue_max": 8192,
+  "batch_keys_count": 1,
+  "key_pool_size": 256,
+  "data_sizes": ["8MB"],
+  "metrics_interval_ms": 3000,
+  "output_dir": "kvtest-writer-pulse-output",
+  "nodes": [
+    {
+      "host": "10.0.0.1",
+      "port": 9000,
+      "instance_id": 0,
+      "role": "writer"
+    },
+    {
+      "host": "10.0.0.2",
+      "port": 9001,
+      "instance_id": 1,
+      "role": "reader"
+    }
+  ],
+  "store": {
+    "local_hostname": "10.0.0.1:12345",
+    "metadata_server": "http://10.0.0.10:8080/metadata",
+    "global_segment_size": 0,
+    "local_buffer_size": "8GB",
+    "protocol": "ub",
+    "rdma_devices": "bonding_dev_0",
+    "master_server_address": "10.0.0.10:50051",
+    "tenant_id": "default",
+    "replica_num": 1
+  }
+}
