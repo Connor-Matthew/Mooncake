@@ -5104,6 +5104,17 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                       << ", action=client_liveness_recovered, "
                          "signal=memory_mount";
         }
+        // An idempotent remount marks the client OK too. Ping reports
+        // NEED_REMOUNT until the client is OK, and a client answers that from
+        // a CVM submaster with plain MountSegment calls (not ReMountSegment);
+        // without this the remount repeats on every heartbeat.
+        if (mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS &&
+            ok_client_.insert(client_id).second) {
+            MasterMetricManager::instance().inc_active_clients();
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=mount_segment_idempotent_ok"
+                      << ", segment_name=" << segment.name;
+        }
     }
 
     if (mount_result == ErrorCode::OK && enable_oplog_ &&
@@ -9196,16 +9207,22 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     const auto object_id = MakeObjectIdentity(key, tenant_id);
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    MetadataAccessorRO accessor(this, object_id);
-
-    if (!accessor.Exists()) {
-        VLOG(1) << "key=" << key << ", info=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-    auto resp = ReadReplicaListForAdmin(accessor.Get());
+    auto resp = [&]() -> tl::expected<GetReplicaListResponse, ErrorCode> {
+        MetadataAccessorRO accessor(this, object_id);
+        if (!accessor.Exists()) {
+            VLOG(1) << "key=" << key << ", info=object_not_found";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        return ReadReplicaListForAdmin(accessor.Get());
+    }();
     if (!resp.has_value()) {
-        LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
+        if (resp.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
+        }
+        return resp;
     }
+    // Built once the key lock is let go, as on the read path.
+    EnrichVSegmentLayouts(&*resp);
     return resp;
 }
 
@@ -9713,6 +9730,20 @@ auto MasterService::AllocateAndInsertMetadata(
         return tl::make_unexpected(grown.error());
     }
 
+    if (vsegment_service_) {
+        auto replicas = ReserveVSegmentReplicas(accessor.GetTenantId(), key,
+                                                value_length, config);
+        if (!replicas) {
+            return tl::make_unexpected(replicas.error());
+        }
+        // InsertMetadata cannot fail, so the reservation never needs a
+        // rollback here.
+        return InsertMetadata(accessor, client_id, value_length, config,
+                              group_id, residency_affinity_id, now,
+                              soft_pin_request, std::move(replicas.value()),
+                              std::move(committed_soft_pin_timeout));
+    }
+
     // The key holds no object, so a remote fallback is safe here.
     auto allocation_result =
         AllocateReplicas(key, value_length, config, writer_host_id,
@@ -9725,6 +9756,48 @@ auto MasterService::AllocateAndInsertMetadata(
                           residency_affinity_id, now, soft_pin_request,
                           std::move(allocation_result.value()),
                           std::move(committed_soft_pin_timeout));
+}
+
+// With VSegment on, a write's memory replicas are reserved inside the key's
+// partition and never taken from the classic allocator: a VSegment is carved
+// from its segments' [used_bytes, capacity) ranges, which the classic
+// allocator does not know are taken, so a classic allocation could land on a
+// VSegment extent.
+auto MasterService::ReserveVSegmentReplicas(const TenantId& tenant_id,
+                                            const std::string& key,
+                                            uint64_t value_length,
+                                            const ReplicateConfig& config)
+    -> tl::expected<std::vector<Replica>, ErrorCode> {
+    if (config.replica_num == 0 || config.nof_replica_num != 0 ||
+        config.dfs_replica_num != 0) {
+        LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+                   << ", nof_replica_num=" << config.nof_replica_num
+                   << ", dfs_replica_num=" << config.dfs_replica_num
+                   << ", error=vsegment_supports_memory_replicas_only";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const std::string partition_id =
+        std::to_string(cvm::KeySlot(tenant_id, key));
+    if (const auto ready = CheckVSegmentServiceability(partition_id);
+        ready != ErrorCode::OK) {
+        return tl::make_unexpected(ready);
+    }
+    std::vector<std::string> operation_ids(config.replica_num);
+    for (auto& id : operation_ids) id = UuidToString(generate_uuid());
+    auto reservations = vsegment_service_->StartPutReplicasOwned(
+        partition_id, operation_ids, value_length,
+        config.vsegment_profile_name);
+    if (!reservations) {
+        return tl::make_unexpected(reservations.error());
+    }
+    // PROCESSING VSegment replicas carry their operation id, so popping one
+    // (a revoke, a timeout, a preempting upsert) aborts its reservation.
+    std::vector<Replica> replicas;
+    replicas.reserve(reservations->size());
+    for (const auto& reservation : *reservations) {
+        replicas.emplace_back(reservation.replica, ReplicaStatus::PROCESSING);
+    }
+    return replicas;
 }
 
 auto MasterService::PrepareWriteStart(
@@ -11028,8 +11101,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         return tl::make_unexpected(grown.error());
                     }
                     auto allocation_result =
-                        AllocateReplicas(key, slice_length, allocation_config,
-                                         writer_host_id, dfs_allocation_failed);
+                        vsegment_service_
+                            ? ReserveVSegmentReplicas(object_id.tenant_id, key,
+                                                      slice_length,
+                                                      allocation_config)
+                            : AllocateReplicas(
+                                  key, slice_length, allocation_config,
+                                  writer_host_id, dfs_allocation_failed);
                     if (!allocation_result) {
                         return tl::make_unexpected(allocation_result.error());
                     }
@@ -13467,6 +13545,32 @@ auto MasterService::NotifyOffloadSuccess(
                         MasterMetricManager::instance().inc_offload_completed(
                             UuidToString(client_id));
                         added_new_local_disk_replica = true;
+                    } else {
+                        // The object is on disk already: refresh this
+                        // client's copy (a re-offload or a restart only moves
+                        // its endpoint or size), or register this client's
+                        // copy beside another node's, so a key offloaded by
+                        // several nodes keeps one LOCAL_DISK replica each.
+                        const size_t updated = obj_metadata.VisitReplicas(
+                            [client_id](const Replica& rep) {
+                                return rep.type() == ReplicaType::LOCAL_DISK &&
+                                       rep.get_local_disk_client_id() ==
+                                           client_id;
+                            },
+                            [&metadata](Replica& rep) {
+                                rep.update_local_disk_location(
+                                    metadata.transport_endpoint,
+                                    metadata.data_size);
+                            });
+                        if (updated == 0) {
+                            std::vector<Replica> replicas;
+                            replicas.emplace_back(std::move(replica));
+                            obj_metadata.AddReplicas(std::move(replicas));
+                            SyncCacheTotalAccounting(obj_metadata);
+                            MasterMetricManager::instance()
+                                .inc_offload_completed(UuidToString(client_id));
+                            added_new_local_disk_replica = true;
+                        }
                     }
                     handled_existing_object = true;
                     SyncKvObjectState(request_object_id.user_key, obj_metadata,
@@ -16605,7 +16709,8 @@ KvEventConfig MasterService::BuildKvEventConfig(
 }
 
 // Every non-memory replica type, including DFS, is normalized to the "disk"
-// medium so subscribers see one logical tier per storage class.
+// medium so subscribers see one logical tier per storage class. A VSegment
+// extent is memory and is reported as "cpu".
 std::vector<std::string> MasterService::KvMediaForMetadata(
     const ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& should_include_invalid) {
@@ -16617,6 +16722,8 @@ std::vector<std::string> MasterService::KvMediaForMetadata(
             if (replica.is_memory_replica() &&
                 (!replica.has_invalid_mem_handle() ||
                  (should_include_invalid && should_include_invalid(replica)))) {
+                has_cpu = true;
+            } else if (replica.is_vsegment_replica()) {
                 has_cpu = true;
             } else if (replica.is_nof_replica() &&
                        (!replica.has_invalid_nof_handle() ||
@@ -16661,7 +16768,7 @@ std::vector<std::string> MasterService::KvMediaForRemoval(
                      replica.has_invalid_nof_handle()));
         },
         [&](const Replica& replica) {
-            if (replica.is_memory_replica()) {
+            if (replica.is_memory_replica() || replica.is_vsegment_replica()) {
                 has_cpu = true;
             } else if (replica.is_nof_replica() || replica.is_disk_replica() ||
                        replica.is_local_disk_replica() ||

@@ -2532,12 +2532,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         const uint64_t trace_id = mooncake::logging::CurrentTraceId();
         const bool breakdown_log =
             ShouldSampleStoreTransferDiagnostics(trace_id);
-#ifdef USE_NOF
-        const int64_t nof_slow_trace_threshold_us =
-            GetSpdkNofSlowTraceThresholdUs();
-#else
-        const int64_t nof_slow_trace_threshold_us = 0;
-#endif
         const auto batch_start = breakdown_log
                                      ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
@@ -2574,57 +2568,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         size_t ready_before_wait = 0;
         size_t blocked_futures = 0;
         int64_t max_future_wait_us = 0;
-        size_t nof_timing_count = 0;
-        uint64_t nof_sub_io_count = 0;
         uint32_t slowest_lane = 0;
         size_t slowest_task_index = 0;
         int64_t slowest_task_us = 0;
-        int64_t nof_dispatch_queue_sum_us = 0;
-        int64_t nof_dispatch_queue_max_us = 0;
-        int64_t nof_worker_setup_sum_us = 0;
-        int64_t nof_worker_setup_max_us = 0;
-        uint64_t nof_qos_tasks_ahead_sum = 0;
-        uint32_t nof_qos_tasks_ahead_max = 0;
-        int64_t nof_qos_fifo_wait_sum_us = 0;
-        int64_t nof_qos_fifo_wait_max_us = 0;
-        int64_t nof_qos_fifo_full_wait_sum_us = 0;
-        int64_t nof_qos_fifo_full_wait_max_us = 0;
-        int64_t nof_qos_fifo_partial_wait_sum_us = 0;
-        int64_t nof_qos_fifo_partial_wait_max_us = 0;
-        int64_t nof_qos_fifo_zero_wait_sum_us = 0;
-        int64_t nof_qos_fifo_zero_wait_max_us = 0;
-        int64_t nof_qos_fifo_unattributed_sum_us = 0;
-        int64_t nof_qos_fifo_unattributed_max_us = 0;
-        int64_t nof_head_to_submit_sum_us = 0;
-        int64_t nof_head_to_submit_max_us = 0;
-        int64_t nof_credit_wait_sum_us = 0;
-        int64_t nof_credit_wait_max_us = 0;
-        int64_t nof_first_credit_wait_sum_us = 0;
-        int64_t nof_first_credit_wait_max_us = 0;
-        int64_t nof_submit_credit_wait_sum_us = 0;
-        int64_t nof_submit_credit_wait_max_us = 0;
-        int64_t nof_qos_queue_sum_us = 0;
-        int64_t nof_qos_queue_max_us = 0;
-        int64_t nof_queue_to_submit_sum_us = 0;
-        int64_t nof_queue_to_submit_max_us = 0;
-        int64_t nof_submit_span_sum_us = 0;
-        int64_t nof_submit_span_max_us = 0;
-        int64_t nof_drain_sum_us = 0;
-        int64_t nof_drain_max_us = 0;
-        int64_t nof_first_completion_sum_us = 0;
-        int64_t nof_first_completion_max_us = 0;
-        int64_t nof_completion_submit_gap_sum_us = 0;
-        int64_t nof_completion_submit_gap_min_us =
-            std::numeric_limits<int64_t>::max();
-        int64_t nof_completion_submit_gap_max_us =
-            std::numeric_limits<int64_t>::min();
-        size_t nof_completion_before_last_submit = 0;
-        int64_t nof_completion_span_sum_us = 0;
-        int64_t nof_completion_span_max_us = 0;
-        int64_t nof_task_total_sum_us = 0;
-        int64_t nof_task_total_max_us = 0;
-        int64_t nof_observe_delay_sum_us = 0;
-        int64_t nof_observe_delay_max_us = 0;
 
         auto select_replica = MakeReadReplicaSelector();
         // One submit sample per batch; wait samples below are per future.
@@ -3020,29 +2966,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         if (metrics_) {
             metrics_->transfer_metric.batch_get_latency_us.observe(
                 us_batch_get);
-        }
-
-        if (nof_slow_trace_threshold_us > 0 &&
-            us_batch_get >= nof_slow_trace_threshold_us) {
-            size_t success_count = 0;
-            for (const auto& result : results) {
-                if (result.has_value()) {
-                    ++success_count;
-                }
-            }
-            const auto mono_ns = [](auto value) {
-                return std::chrono::duration_cast<std::chrono::nanoseconds>(
-                           value.time_since_epoch())
-                    .count();
-            };
-            MC_LOG(INFO) << "batch_get_slow_trace trace_id=" << trace_id
-                         << " keys=" << object_keys.size()
-                         << " pending=" << pending_transfers.size()
-                         << " start_mono_ns=" << mono_ns(t0_batch_get)
-                         << " end_mono_ns=" << mono_ns(t1_batch_get)
-                         << " total_us=" << us_batch_get
-                         << " success=" << success_count
-                         << " failed=" << (results.size() - success_count);
         }
 
         if (breakdown_log) {
@@ -4414,6 +4337,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                         ReplicaType::MEMORY, ErrorCode::TRANSFER_FAIL);
                     op->AppendFailureContext(
                         "Failed to submit batch transfer to " + endpoint);
+                    op->failed_endpoints.insert(endpoint);
                     continue;
                 }
                 op->pending_transfers.emplace_back(
@@ -7536,8 +7460,14 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
                     const std::vector<VSegmentLayoutEntry>* layouts) {
                     // Preserve concurrent submission for direct memory and NoF;
                     // VSegment uses its expanded layout-aware transfer plan.
-                    std::vector<std::pair<ReplicaType,
-                        tl::expected<TransferFuture, ErrorCode>>> pending;
+                    struct PendingWrite {
+                        ReplicaType type;
+                        // The replica's target, reported to the masters when
+                        // the write fails so they stop allocating on it.
+                        std::string endpoint;
+                        tl::expected<TransferFuture, ErrorCode> future;
+                    };
+                    std::vector<PendingWrite> pending;
                     std::vector<std::pair<ReplicaType, ErrorCode>> results;
                     for (const auto& replica : replicas) {
                         if (replica.is_vsegment_replica()) {
@@ -7548,15 +7478,29 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
                                              failed_endpoints, layouts));
                         } else if (replica.is_memory_replica() ||
                                    replica.is_nof_replica()) {
-                            pending.emplace_back(
-                                replica.is_memory_replica() ? ReplicaType::MEMORY
-                                                            : ReplicaType::NOF_SSD,
+                            const bool memory = replica.is_memory_replica();
+                            pending.push_back(PendingWrite{
+                                memory ? ReplicaType::MEMORY
+                                       : ReplicaType::NOF_SSD,
+                                memory
+                                    ? replica.get_memory_descriptor()
+                                          .buffer_descriptor.transport_endpoint_
+                                    : replica.get_nof_descriptor()
+                                          .buffer_descriptor
+                                          .transport_endpoint_,
                                 SubmitSingleTransfer(replica, slices,
-                                                     TransferRequest::WRITE));
+                                                     TransferRequest::WRITE)});
                         }
                     }
-                    for (auto& [type, future] : pending) {
-                        results.emplace_back(type, future ? future->get() : future.error());
+                    for (auto& write : pending) {
+                        const ErrorCode result = write.future
+                                                     ? write.future->get()
+                                                     : write.future.error();
+                        if (result != ErrorCode::OK && failed_endpoints &&
+                            !write.endpoint.empty()) {
+                            failed_endpoints->insert(write.endpoint);
+                        }
+                        results.emplace_back(write.type, result);
                     }
                     return results;
                 }

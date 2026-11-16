@@ -995,13 +995,9 @@ size_t HotStandbyService::GetMetadataCount() const {
 
 uint64_t HotStandbyService::GetLatestAppliedSequenceId() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (oplog_applier_) {
-        uint64_t expected_seq = oplog_applier_->GetExpectedSequenceId();
-        // GetExpectedSequenceId returns the next expected sequence_id,
-        // so the latest applied is expected_seq - 1
-        return expected_seq > 0 ? expected_seq - 1 : 0;
-    }
-    return applied_seq_id_.load();
+    // With several sources the single-source applier is an unused shell;
+    // the helper reports the furthest source instead.
+    return GetLocalLastAppliedSequenceIdLocked();
 }
 
 bool HotStandbyService::ExportMetadataSnapshot(

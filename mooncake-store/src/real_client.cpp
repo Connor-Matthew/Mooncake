@@ -1833,6 +1833,29 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                   << CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC << "="
                   << ssd_prefetch_dedup_ttl_sec_ << "s";
     }
+    // Optionally warm up transport connections to every segment the master
+    // has registered, so a burst of small-object traffic does not storm the
+    // listeners with on-demand RDMA QP handshakes (seen as TRANSFER_FAIL).
+    // MC_STORE_WARMUP enables it; it is off by default.
+    if (client_ && Environ::Get().GetStoreWarmupEnabled(false)) {
+        // The warmup transfers use a buffer from client_buffer_allocator_,
+        // which is registered with the transfer engine only when the local
+        // buffer is (not for cxl or a zero-sized buffer).
+        if (!local_buffer_region_.has_value() ||
+            local_buffer_region_->size == 0) {
+            LOG(WARNING) << "Warmup enabled but local buffer is not "
+                         << "registered (protocol=" << this->protocol
+                         << "), skipping warmup";
+        } else {
+            LOG(INFO) << "Warming up connections to all registered segments";
+            auto warmup_result = client_->warmup(client_buffer_allocator_);
+            if (!warmup_result) {
+                LOG(WARNING)
+                    << "Warmup failed: " << toString(warmup_result.error())
+                    << ", continuing setup (will connect on demand)";
+            }
+        }
+    }
     const bool should_start_http_server =
         enable_client_http_server || FLAGS_enable_http_server;
     const int selected_http_port =

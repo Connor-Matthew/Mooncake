@@ -1886,6 +1886,12 @@ class MasterService {
     // Helper: allocate replicas, publish the object under the key `accessor`
     // holds, which must hold none, and return descriptor list.  Shared by
     // PutStart and UpsertStart.
+    // Reserves `config.replica_num` VSegment replicas for `key` in its
+    // partition (VSegment mode only; see the definition).
+    auto ReserveVSegmentReplicas(const TenantId& tenant_id,
+                                 const std::string& key, uint64_t value_length,
+                                 const ReplicateConfig& config)
+        -> tl::expected<std::vector<Replica>, ErrorCode>;
     auto AllocateAndInsertMetadata(
         MetadataAccessorRW& accessor, const UUID& client_id,
         uint64_t value_length, const ReplicateConfig& config,
