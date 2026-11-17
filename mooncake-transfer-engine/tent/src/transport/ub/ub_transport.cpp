@@ -261,7 +261,11 @@ struct UbTransport::Impl {
                         std::min<uint64_t>(safe_slice_size, limit));
                 }
             };
-            clamp_slice(device_caps.max_message_size);
+            // The UB data path only issues URMA_OPC_READ / URMA_OPC_WRITE, so
+            // the per-operation read/write limits bound a slice.
+            // max_message_size (dev_cap.max_msg_size) caps SEND/RECV messages
+            // and is far smaller on some devices; clamping to it pinned
+            // slice_size regardless of configuration.
             clamp_slice(device_caps.max_read_size);
             clamp_slice(device_caps.max_write_size);
             if (device_caps.max_jetty_depth != 0) {
