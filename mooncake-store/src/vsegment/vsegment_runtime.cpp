@@ -331,11 +331,18 @@ ErrorCode LogicalRangeAllocator::ForgetCompleted(
 
 ResolveResult ResolveTransfer(const VSegmentView& view,
                               uint64_t logical_offset, uint64_t length,
-                              const std::vector<ClientSlice>& slices) {
-    std::string validation_detail;
-    const auto validation = ValidateViewStructure(view, &validation_detail);
-    if (validation != ErrorCode::OK) {
-        return ResolveError(validation, std::move(validation_detail));
+                              const std::vector<ClientSlice>& slices,
+                              bool prevalidated) {
+    if (!prevalidated) {
+        std::string validation_detail;
+        const auto validation = ValidateViewStructure(view, &validation_detail);
+        if (validation != ErrorCode::OK) {
+            return ResolveError(validation, std::move(validation_detail));
+        }
+    } else if (view.stripe_size == 0 || view.members.empty()) {
+        // Cheap invariants the loop below divides/modulos by: callers that skip
+        // the full validation must still never divide by zero.
+        return ResolveError(ErrorCode::INVALID_PARAMS, "view layout is empty");
     }
     if (length == 0 ||
         AddOverflows(logical_offset, length) ||

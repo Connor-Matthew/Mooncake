@@ -48,6 +48,19 @@ std::string PeerUrl(const NodeConfig &node) {
     return "http://" + node.host + ":" + std::to_string(node.port);
 }
 
+std::string PeerRpcAddress(const NodeConfig &node) {
+    return node.host + ":" + std::to_string(node.notify_rpc_port);
+}
+
+std::string NormalizeRpcAddress(std::string address) {
+    constexpr const char *http = "http://";
+    if (address.rfind(http, 0) == 0)
+        address.erase(0, std::char_traits<char>::length(http));
+    const auto slash = address.find('/');
+    if (slash != std::string::npos) address.resize(slash);
+    return address;
+}
+
 bool ParseCpuList(const std::string &spec, cpu_set_t *set,
                   std::string *error) {
     CPU_ZERO(set);
@@ -127,6 +140,10 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
         cfg.role = root.get("role", cfg.role).asString();
         cfg.instance_id = root.get("instance_id", cfg.instance_id).asInt();
         cfg.listen_port = root.get("listen_port", cfg.listen_port).asInt();
+        cfg.notify_rpc_port =
+            root.get("notify_rpc_port", cfg.listen_port + 10000).asInt();
+        cfg.notify_rpc_threads =
+            root.get("notify_rpc_threads", cfg.notify_rpc_threads).asInt();
         cfg.pipeline = StringArray(root, "pipeline", cfg.pipeline);
         cfg.notify_pipeline =
             StringArray(root, "notify_pipeline", cfg.notify_pipeline);
@@ -158,6 +175,15 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
             root.get("num_total_threads", cfg.num_total_threads).asInt();
         cfg.notify_threads =
             root.get("notify_threads", cfg.notify_threads).asInt();
+        cfg.notify_rpc_connections_per_peer = static_cast<size_t>(
+            root.get("notify_rpc_connections_per_peer",
+                     static_cast<Json::UInt64>(
+                         cfg.notify_rpc_connections_per_peer))
+                .asUInt64());
+        cfg.notify_rpc_reuse_limit = root.get(
+            "notify_rpc_reuse_limit", cfg.notify_rpc_reuse_limit).asInt();
+        cfg.notify_rpc_timeout_ms =
+            root.get("notify_rpc_timeout_ms", cfg.notify_rpc_timeout_ms).asInt();
         cfg.notify_count = root.get("notify_count", cfg.notify_count).asInt();
         cfg.batch_keys_count =
             root.get("batch_keys_count", cfg.batch_keys_count).asInt();
@@ -176,6 +202,8 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
             root.get("notify_overflow", cfg.notify_overflow).asString();
         cfg.notify_format =
             root.get("notify_format", cfg.notify_format).asString();
+        cfg.notify_transport =
+            root.get("notify_transport", cfg.notify_transport).asString();
         cfg.notify_read_format =
             root.get("notify_read_format", cfg.notify_read_format).asString();
 
@@ -240,11 +268,21 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
             }
         }
         cfg.peers = StringArray(root, "peers", {});
+        for (auto &peer : cfg.peers) {
+            if (cfg.notify_transport == "rpc") {
+                peer = NormalizeRpcAddress(peer);
+            } else if (peer.rfind("http://", 0) != 0 &&
+                       peer.rfind("https://", 0) != 0) {
+                peer = "http://" + peer;
+            }
+        }
         if (root.isMember("nodes")) {
             for (const auto &entry : root["nodes"]) {
                 NodeConfig node;
                 node.host = entry.get("host", "").asString();
                 node.port = entry.get("port", 9000).asInt();
+                node.notify_rpc_port =
+                    entry.get("notify_rpc_port", node.port + 10000).asInt();
                 node.instance_id = entry.get("instance_id", 0).asInt();
                 node.role = entry.get("role", "").asString();
                 if (!node.host.empty()) cfg.nodes.push_back(std::move(node));
@@ -304,7 +342,9 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
                     node.role != "dual") {
                     continue;
                 }
-                cfg.peers.push_back(PeerUrl(node));
+                cfg.peers.push_back(cfg.notify_transport == "rpc"
+                                        ? PeerRpcAddress(node)
+                                        : PeerUrl(node));
             }
         }
         if (cfg.mode != "pipeline") {
@@ -333,6 +373,9 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
         if (!OneOf(cfg.notify_format, {"json", "query"})) {
             throw std::runtime_error("notify_format must be json or query");
         }
+        if (!OneOf(cfg.notify_transport, {"http", "rpc"})) {
+            throw std::runtime_error("notify_transport must be http or rpc");
+        }
         if (!OneOf(cfg.notify_read_format, {"both", "json", "query"})) {
             throw std::runtime_error(
                 "notify_read_format must be both, json, or query");
@@ -349,8 +392,10 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
             cfg.num_total_threads < cfg.num_threads) {
             cfg.num_total_threads = cfg.num_threads;
         }
-        if (cfg.notify_threads <= 0 || cfg.notify_count < -1 ||
-            cfg.batch_keys_count <= 0) {
+        if (cfg.notify_threads <= 0 || cfg.notify_rpc_threads <= 0 ||
+            cfg.notify_rpc_connections_per_peer == 0 ||
+            cfg.notify_rpc_reuse_limit < 0 || cfg.notify_rpc_timeout_ms <= 0 ||
+            cfg.notify_count < -1 || cfg.batch_keys_count <= 0) {
             throw std::runtime_error("invalid notify/batch thread counts");
         }
         const uint64_t minimum_pool =
@@ -381,6 +426,15 @@ bool LoadConfig(const std::string &path, Config *config, std::string *error) {
         }
         if (cfg.listen_port <= 0 || cfg.listen_port > 65535) {
             throw std::runtime_error("listen_port is invalid");
+        }
+        if (cfg.notify_rpc_port <= 0 || cfg.notify_rpc_port > 65535 ||
+            cfg.notify_rpc_port == cfg.listen_port) {
+            throw std::runtime_error("notify_rpc_port is invalid");
+        }
+        for (const auto &node : cfg.nodes) {
+            if (node.notify_rpc_port <= 0 || node.notify_rpc_port > 65535) {
+                throw std::runtime_error("node notify_rpc_port is invalid");
+            }
         }
         if (cfg.store.local_hostname.empty() ||
             cfg.store.metadata_server.empty() ||

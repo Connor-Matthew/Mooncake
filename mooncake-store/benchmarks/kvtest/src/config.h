@@ -10,6 +10,7 @@ namespace mooncake::kvtest {
 struct NodeConfig {
     std::string host;
     int port{9000};
+    int notify_rpc_port{19000};
     int instance_id{0};
     std::string role;
 };
@@ -35,6 +36,8 @@ struct Config {
     std::string mode{"pipeline"};
     int instance_id{0};
     int listen_port{9000};
+    int notify_rpc_port{19000};
+    int notify_rpc_threads{4};
     std::string role{"writer"};
 
     // Pipeline operation lists (alias names accepted, canonicalised later).
@@ -61,6 +64,9 @@ struct Config {
     int num_threads{4};
     int num_total_threads{16};
     int notify_threads{100};
+    size_t notify_rpc_connections_per_peer{4};
+    int notify_rpc_reuse_limit{4};
+    int notify_rpc_timeout_ms{3000};
     int notify_count{1};
     int batch_keys_count{1};
 
@@ -68,6 +74,7 @@ struct Config {
     // for notifications). Set false for Python-client parity (wait per batch).
     bool notify_async{true};
     std::string notify_overflow{"drop"};  // drop | block
+    std::string notify_transport{"http"};  // http | rpc
     std::string notify_format{"json"};    // json | query
     std::string notify_read_format{"both"};
 

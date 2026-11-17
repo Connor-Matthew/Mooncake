@@ -8,6 +8,7 @@ add_executable(
   src/maintenance.cpp
   src/metrics.cpp
   src/notify_codec.cpp
+  src/notify_rpc_transport.cpp
   src/notify_sender.cpp
   src/operations.cpp
   src/pipeline.cpp
@@ -17,7 +18,7 @@ target_include_directories(mooncake_kvtest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/s
 target_link_libraries(
   mooncake_kvtest
   PRIVATE mooncake_store transfer_engine asio_shared JsonCpp::JsonCpp
-          glog::glog pthread)
+          glog::glog pthread yalantinglibs::yalantinglibs)
 
 if(BUILD_UNIT_TESTS)
   add_subdirectory(tests)

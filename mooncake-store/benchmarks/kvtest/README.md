@@ -2,8 +2,9 @@
 
 `mooncake_kvtest` is a C++ writer/reader pipeline benchmark modeled after the
 YuanRong DataSystem `tests/kvtest` process and configuration model. It keeps
-HTTP notification handling, the notification queue, Mooncake calls, and metric
-collection in C++; Python is not part of the request path.
+the notification queue, Mooncake calls, and metric collection in C++; Python is
+not part of the request path. Peer notifications can use either HTTP or YLT
+`coro_rpc` (`notify_transport=http|rpc`); the control plane always uses HTTP.
 
 ## Build
 
@@ -30,7 +31,12 @@ configuration without connecting to Mooncake:
 - Every process creates `num_total_threads - num_threads` C++ notification
   workers. An HTTP handler only parses and enqueues a notification; a worker
   runs `notify_pipeline` independently.
-- `notify_threads` controls the writer's outbound HTTP pool.
+- `notify_threads` controls the writer's bounded outbound task pool.
+- `notify_transport=rpc` uses YLT `coro_rpc` and `notify_rpc_port`; `http` uses
+  keep-alive GET/POST notifications. `notify_rpc_connections_per_peer`,
+  `notify_rpc_reuse_limit`, and `notify_rpc_timeout_ms` tune the RPC client.
+  RPC timing is reported as `notify_rpc_pool_lookup`,
+  `notify_rpc_pool_dispatch`, `notify_rpc_await_response`, and `notify_rpc`.
 
 The reader therefore accepts later notifications while earlier Mooncake reads
 are still running. There is no CPython GIL, but CPU scheduling, C++ locks,
@@ -55,44 +61,61 @@ configured.
 
 | Mooncake operation | Compatible aliases | SDK call |
 | --- | --- | --- |
+| `put` | — | `RealClient::put` |
+| `put_batch` | — | `RealClient::put_batch` |
+| `put_from` | — | `RealClient::put_from` with a registered buffer |
+| `batch_put_from` | — | `RealClient::batch_put_from` with registered buffers |
 | `upsert` | `setStringView` | `RealClient::upsert` |
-| `upsertFrom` | `upsert_from` | `RealClient::upsert_from` with a per-writer registered buffer |
-| `getBuffer` | `get_buffer` | `RealClient::get_buffer` |
+| `upsert_from` | `upsertFrom` | `RealClient::upsert_from` with a registered buffer |
+| `batch_upsert_from` | `mSet` | `RealClient::batch_upsert_from` |
+| `get` | — | `RealClient::get_buffer` + copy |
+| `get_buffer` | `getBuffer` | `RealClient::get_buffer` |
+| `get_batch` | `mGet` | `RealClient::batch_get_buffer` |
+| `get_into` | — | `RealClient::get_into` with a registered read buffer |
 | `exist` | `isExist` | `RealClient::isExist` |
-| `batchUpsertFrom` | `batch_upsert_from`, `mSet` | `RealClient::batch_upsert_from` |
-| `batchGetBuffer` | `batch_get_buffer`, `mGet` | `RealClient::batch_get_buffer` |
-| `remove` | `del` | `RealClient::batchRemove` |
+| `batch_exist` | `batchIsExist` | `RealClient::batchIsExist` |
+| `remove` | `del` | `RealClient::remove` |
+| `batch_remove` | `batchRemove` | `RealClient::batchRemove` |
 
 `createBuffer`, `memoryCopy`, and `setBuffer` are intentionally not emulated:
 Mooncake registered-memory ownership is different from DataSystem's published
-Buffer lifecycle. Use `upsertFrom` for the zero-copy writer path.
+Buffer lifecycle. Use `put_from`/`upsert_from` for the zero-copy writer path.
 
 ## Control endpoints
 
-- `POST /notify`: enqueue `{keys, sender, size}` for `notify_pipeline`.
-- `GET /stats`: cumulative JSON counters.
+- `POST /notify`、`GET /notify?...`: 接收 HTTP 通知；RPC 通知走
+  `notify_rpc_port`。
+- `GET /stats`: cumulative JSON counters (per-op busy throughput included).
 - `GET /health`: liveness response.
 - `POST /start`: reset metrics and release a `start_paused=true` workload;
   repeated calls are idempotent.
+- `POST /pause`: stop writer loops and drain outbound notifications.
+- `POST /drain`: wait until inbound notification work is complete.
+- `POST /reset`: clear warmup metrics while keeping recording paused.
+- `POST /arm`: start the measured metrics clock while workload remains paused.
+- `POST /resume`: restart writer loops for the measured phase.
 - `POST /summary`: write `summary.json` immediately.
-- `POST /stop`: stop accepting pipeline work and begin graceful shutdown.
+- `POST /stop` (alias `/shutdown`): graceful shutdown.
 
-The output directory contains `latency_samples.csv` and `summary.json`.
-`latency_samples.csv` has one row per measured operation;
-samples are retained in memory during the run and written in one batch during
-shutdown, so request-path file I/O does not contaminate latency. Interface
-latency surrounds only the corresponding Mooncake SDK call. Data verification
-is performed after the timed call. `notify_queue_wait` is reported separately.
-Summary JSON includes `elapsed_seconds` measured from the last metric reset;
-orchestrators should use this value for QPS and throughput. The legacy
+The output directory contains `latency_samples.csv` and `summary.json`;
+`metrics_<id>.csv` is optional (`metrics_interval_ms=0` by default). `latency_samples.csv`
+has one row per measured operation; samples are retained in memory during the run
+and written in one batch during shutdown, so request-path file I/O does not
+contaminate latency. Interface latency surrounds only the corresponding Mooncake
+SDK call. Data verification is performed after the timed call.
+`notify_queue_wait` is reported separately. Summary JSON includes
+`elapsed_seconds` measured from the last metric reset, per-operation
+`busy_ms`/`throughput_mb_s` (successful bytes / successful latency), and
+nearest-rank percentiles over successful requests. The legacy
 window-aggregated `latency_timeseries.csv` is no longer produced.
 
 ## Configuration
 
 Start readers before writers. `nodes` is compatible with YuanRong kvtest;
 writers automatically select entries whose `role` is `reader` or `dual`.
-Explicit `peers` values such as `http://10.0.0.2:9001` override node
-discovery.
+Explicit `peers` override node discovery. With `notify_transport=rpc`, peers are
+`host:notify_rpc_port`; with `notify_transport=http`, peers are
+`http://host:port` (a missing scheme defaults to HTTP).
 
 The Mooncake-specific `store` object maps directly to `RealClient::setup_real`.
 Environment variables such as `MC_WORKERS_PER_CTX` are still consumed by the

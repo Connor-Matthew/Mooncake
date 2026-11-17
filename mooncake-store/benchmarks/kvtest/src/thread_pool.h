@@ -61,6 +61,11 @@ class ThreadPool {
         });
     }
 
+    // Upstream-compatible name used by the YLT RPC writer path.
+    bool WaitIdle(std::chrono::milliseconds timeout) {
+        return WaitIdleFor(timeout);
+    }
+
     void StopNow() {
         {
             std::lock_guard<std::mutex> lock(mutex_);

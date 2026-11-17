@@ -264,5 +264,39 @@ TEST(ConfigTest, MetricsWindowIsOffByDefault) {
         << error;
     EXPECT_EQ(explicit_on.metrics_interval_ms, 3000);
 }
-}  // namespace mooncake::kvtest
+TEST(ConfigTest, RpcTransportDerivesRpcPeers) {
+    Config config;
+    std::string error;
+    ASSERT_TRUE(Load(
+        WithStore(
+            R"("mode":"pipeline","role":"writer","listen_port":9000,)"
+            R"("notify_transport":"rpc","pipeline":["put"],)"
+            R"("notify_pipeline":["get_buffer"],"num_threads":1,)"
+            R"("num_total_threads":2,"data_sizes":["8MB"],)"
+            R"("nodes":[{"host":"10.0.0.2","port":9001,)"
+            R"("notify_rpc_port":19001,"instance_id":1,"role":"reader"}])"),
+        "rpc_peers.json", &config, &error))
+        << error;
+    ASSERT_EQ(config.peers.size(), 1u);
+    EXPECT_EQ(config.peers[0], "10.0.0.2:19001");
+    EXPECT_EQ(config.notify_transport, "rpc");
+}
 
+TEST(ConfigTest, HttpTransportDerivesHttpPeers) {
+    Config config;
+    std::string error;
+    ASSERT_TRUE(Load(
+        WithStore(
+            R"("mode":"pipeline","role":"writer","listen_port":9000,)"
+            R"("pipeline":["put"],"notify_pipeline":["get_buffer"],)"
+            R"("num_threads":1,"num_total_threads":2,)"
+            R"("data_sizes":["8MB"],)"
+            R"("nodes":[{"host":"10.0.0.2","port":9001,)"
+            R"("instance_id":1,"role":"reader"}])"),
+        "http_peers.json", &config, &error))
+        << error;
+    ASSERT_EQ(config.peers.size(), 1u);
+    EXPECT_EQ(config.peers[0], "http://10.0.0.2:9001");
+    EXPECT_EQ(config.notify_transport, "http");
+}
+}  // namespace mooncake::kvtest

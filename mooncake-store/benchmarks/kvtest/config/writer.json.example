@@ -2,6 +2,8 @@
   "mode": "pipeline",
   "instance_id": 0,
   "listen_port": 9000,
+  "notify_rpc_port": 19000,
+  "notify_transport": "rpc",
   "role": "writer",
   "pipeline": ["upsertFrom"],
   "notify_pipeline": ["getBuffer"],
@@ -9,6 +11,9 @@
   "num_threads": 1,
   "num_total_threads": 2,
   "notify_threads": 10,
+  "notify_rpc_connections_per_peer": 4,
+  "notify_rpc_reuse_limit": 4,
+  "notify_rpc_timeout_ms": 3000,
   "notify_count": 1,
   "notify_queue_max": 8192,
   "batch_keys_count": 1,
@@ -20,12 +25,14 @@
     {
       "host": "10.0.0.1",
       "port": 9000,
+      "notify_rpc_port": 19000,
       "instance_id": 0,
       "role": "writer"
     },
     {
       "host": "10.0.0.2",
       "port": 9001,
+      "notify_rpc_port": 19001,
       "instance_id": 1,
       "role": "reader"
     }

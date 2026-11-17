@@ -1,4 +1,4 @@
-#include <gtest/gtest.h>
+﻿#include <gtest/gtest.h>
 
 #include <json/json.h>
 
@@ -147,4 +147,48 @@ TEST(MetricsWindowTest, DisabledWindowDoesNotCreateCsv) {
     EXPECT_TRUE(std::filesystem::exists(dir + "/summary.json"));
 }
 
+TEST(MetricsMeasurementTest, ResetPausedStopsRecordingUntilArmed) {
+    const std::string dir = MetricsDir("measurement_control");
+    std::filesystem::remove_all(dir);
+    MetricsCollector metrics(13, 0, dir);
+    metrics.Start();
+    metrics.Record("op", 1.0, RecordStatus::kOk, 10);
+    metrics.Freeze();
+    metrics.ResetPaused();
+    metrics.Record("op", 2.0, RecordStatus::kOk, 10);
+    auto snaps = metrics.SnapshotCounts();
+    ASSERT_EQ(snaps.size(), 1u);
+    EXPECT_EQ(snaps[0].total, 0u);
+
+    metrics.BeginMeasurement();
+    metrics.Record("op", 3.0, RecordStatus::kOk, 10);
+    snaps = metrics.SnapshotCounts();
+    EXPECT_EQ(snaps[0].total, 1u);
+    EXPECT_EQ(snaps[0].success, 1u);
+    metrics.Stop();
+}
+
+TEST(MetricsSummaryTest, PercentileUsesNearestRankRule) {
+    const std::string dir = MetricsDir("nearest_rank");
+    std::filesystem::remove_all(dir);
+    MetricsCollector metrics(14, 0, dir);
+    metrics.Start();
+    for (int i = 1; i <= 10; ++i) {
+        metrics.Record("op", static_cast<double>(i), RecordStatus::kOk, 1);
+    }
+    metrics.Stop();
+
+    std::ifstream input(dir + "/summary.json");
+    ASSERT_TRUE(input.good());
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    ASSERT_TRUE(Json::parseFromStream(builder, input, &root, &errors))
+        << errors;
+    const Json::Value &op = root["operations"]["op"];
+    // round(0.9 * (10-1)) = 8 -> sorted value 9; linear interpolation would
+    // have produced 9.1.
+    EXPECT_DOUBLE_EQ(op["p90_ms"].asDouble(), 9.0);
+    EXPECT_DOUBLE_EQ(op["max_ms"].asDouble(), 10.0);
+}
 }  // namespace mooncake::kvtest

@@ -7,6 +7,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -30,11 +31,9 @@ uint64_t NextGeneration() {
 
 double Percentile(const std::vector<double> &sorted, double percentile) {
     if (sorted.empty()) return 0;
-    const double rank = percentile * static_cast<double>(sorted.size() - 1);
-    const size_t lower = static_cast<size_t>(rank);
-    const size_t upper = std::min(lower + 1, sorted.size() - 1);
-    const double fraction = rank - lower;
-    return sorted[lower] + (sorted[upper] - sorted[lower]) * fraction;
+    const auto rank = static_cast<size_t>(std::llround(
+        percentile * static_cast<double>(sorted.size() - 1)));
+    return sorted[rank];
 }
 
 Json::Value LatencyJson(std::vector<double> values) {
@@ -137,6 +136,12 @@ void MetricsCollector::Start() {
 }
 
 void MetricsCollector::Reset() {
+    ResetPaused();
+    BeginMeasurement();
+}
+
+void MetricsCollector::ResetPaused() {
+    recording_.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> operations_lock(operations_mutex_);
     for (const auto &[name, metric] : operations_) {
         (void)name;
@@ -155,6 +160,11 @@ void MetricsCollector::Reset() {
         metric->stride = 1;
     }
     verify_failures_.store(0, std::memory_order_relaxed);
+    start_time_us_.store(0, std::memory_order_release);
+    end_time_us_.store(0, std::memory_order_release);
+}
+
+void MetricsCollector::BeginMeasurement() {
     last_flush_us_.store(SteadyNowUs(), std::memory_order_release);
     start_time_us_.store(SteadyNowUs(), std::memory_order_release);
     end_time_us_.store(0, std::memory_order_release);

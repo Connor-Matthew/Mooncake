@@ -4,6 +4,7 @@
 #include "maintenance.h"
 #include "metrics.h"
 #include "notify_codec.h"
+#include "notify_rpc_transport.h"
 #include "notify_sender.h"
 #include "operations.h"
 #include "pipeline.h"
@@ -72,6 +73,7 @@ std::string PipelineSummaryExtra(const Config &config,
         << ",\"batch_keys\":" << config.batch_keys_count
         << ",\"key_pool_size\":" << config.key_pool_size
         << ",\"notify_count\":" << config.notify_count
+        << ",\"notify_transport\":\"" << config.notify_transport << "\""
         << ",\"notify_async\":"
         << (config.notify_async ? "true" : "false")
         << ",\"warmup_duration\":" << config.warmup_duration
@@ -218,6 +220,8 @@ int main(int argc, char **argv) {
     std::unique_ptr<PipelineDispatcher> dispatcher;
     std::unique_ptr<NotifySender> notify_sender;
     std::unique_ptr<NotifyHttpClient> http_client;
+    std::unique_ptr<NotifyRpcClient> rpc_client;
+    std::unique_ptr<NotifyRpcServer> rpc_server;
     std::unique_ptr<BasicRunner> basic_runner;
 
     auto startup_failed = [&](const std::string &message) {
@@ -226,6 +230,25 @@ int main(int argc, char **argv) {
         client->tearDownAll();
         google::ShutdownGoogleLogging();
         return 1;
+    };
+
+    auto prepare_writer = [&]() -> bool {
+        writer = std::make_unique<PipelineWriter>(
+            config, store_adapter, metrics, notify_sender.get());
+        if (!writer->Prepare(&error)) {
+            LOG(ERROR) << "writer prepare failed: " << error;
+            return false;
+        }
+        return true;
+    };
+    auto prepare_basic = [&]() -> bool {
+        basic_runner =
+            std::make_unique<BasicRunner>(config, store_adapter, metrics);
+        if (!basic_runner->Prepare(&error)) {
+            LOG(ERROR) << "basic prepare failed: " << error;
+            return false;
+        }
+        return true;
     };
 
     if (config.IsPipeline()) {
@@ -241,28 +264,61 @@ int main(int argc, char **argv) {
         if (config.role == "writer" || config.role == "dual") {
             http_client = std::make_unique<NotifyHttpClient>(3);
             NotifyHttpClient *http = http_client.get();
-            const auto send_fn = [http, &config](
+            if (config.notify_transport == "rpc") {
+                rpc_client = std::make_unique<NotifyRpcClient>(
+                    config.notify_rpc_connections_per_peer,
+                    config.notify_rpc_reuse_limit,
+                    config.notify_rpc_timeout_ms);
+            }
+            NotifyRpcClient *rpc = rpc_client.get();
+            const auto send_fn = [http, rpc, &config, &metrics](
                                      const std::string &peer,
                                      const NotifyBatch &batch,
                                      double *latency_ms) -> bool {
-                std::string method = "POST";
-                std::string path = "/notify";
-                std::string body;
-                if (config.notify_format == "query") {
-                    method = "GET";
-                    path = EncodeNotifyQuery(batch);
-                } else {
-                    body = EncodeNotifyJson(batch);
-                }
                 const auto start = std::chrono::steady_clock::now();
+                bool ok = false;
                 std::string send_error;
-                const bool ok = http->Send(peer, method, path, body,
-                                           &send_error);
+                if (config.notify_transport == "rpc") {
+                    NotifyRpcRequest request;
+                    request.keys = batch.keys;
+                    request.size = batch.size;
+                    request.sender = batch.sender;
+                    request.warmup = batch.warmup;
+                    NotifyRpcTiming timing;
+                    ok = rpc->Notify(peer, request, &timing, &send_error);
+                    metrics.Record("notify_rpc_pool_lookup",
+                                   timing.pool_lookup_ms,
+                                   timing.pool_found ? RecordStatus::kOk
+                                                     : RecordStatus::kError,
+                                   0);
+                    metrics.Record("notify_rpc_pool_dispatch",
+                                   timing.pool_dispatch_ms,
+                                   timing.dispatched ? RecordStatus::kOk
+                                                     : RecordStatus::kError,
+                                   0);
+                    metrics.Record("notify_rpc_await_response",
+                                   timing.await_response_ms,
+                                   timing.responded ? RecordStatus::kOk
+                                                    : RecordStatus::kError,
+                                   0);
+                } else {
+                    std::string method = "POST";
+                    std::string path = "/notify";
+                    std::string body;
+                    if (config.notify_format == "query") {
+                        method = "GET";
+                        path = EncodeNotifyQuery(batch);
+                    } else {
+                        body = EncodeNotifyJson(batch);
+                    }
+                    ok = http->Send(peer, method, path, body, &send_error);
+                }
                 if (!ok) {
                     static std::atomic<int> warned{0};
                     if (warned.fetch_add(1, std::memory_order_relaxed) < 3) {
                         LOG(WARNING) << "notify send failed for " << peer
-                                     << ": " << send_error;
+                                     << " (" << config.notify_transport
+                                     << "): " << send_error;
                     }
                 }
                 if (latency_ms != nullptr) {
@@ -273,8 +329,11 @@ int main(int argc, char **argv) {
                 }
                 return ok;
             };
-            const auto record_fn = [&metrics](bool ok, double latency_ms) {
-                metrics.Record("notify_http", latency_ms,
+            const auto record_fn = [&metrics, &config](bool ok,
+                                                       double latency_ms) {
+                metrics.Record(config.notify_transport == "rpc" ? "notify_rpc"
+                                                                : "notify_http",
+                               latency_ms,
                                ok ? RecordStatus::kOk : RecordStatus::kError,
                                0);
             };
@@ -286,26 +345,41 @@ int main(int argc, char **argv) {
                 static_cast<size_t>(config.notify_threads),
                 config.notify_queue_max, overflow, config.notify_async,
                 send_fn, record_fn);
-            writer = std::make_unique<PipelineWriter>(
-                config, store_adapter, metrics, notify_sender.get());
-            if (!writer->Prepare(&error)) {
+            if (!prepare_writer()) {
                 return startup_failed("writer prepare failed: " + error);
             }
         }
         metrics.SetSummaryExtra(PipelineSummaryExtra(
             config, nullptr, nullptr, nullptr, http_client.get(), 0, 0));
     } else {
-        basic_runner =
-            std::make_unique<BasicRunner>(config, store_adapter, metrics);
-        if (!basic_runner->Prepare(&error)) {
+        if (!prepare_basic()) {
             return startup_failed("basic prepare failed: " + error);
         }
         metrics.SetSummaryExtra(
             BasicSummaryExtra(config, BasicRunner::Stats{}));
     }
 
+    if (config.IsPipeline() && config.notify_transport == "rpc" &&
+        (config.role == "reader" || config.role == "dual")) {
+        rpc_server = std::make_unique<NotifyRpcServer>(
+            config.notify_rpc_port, config.notify_rpc_threads,
+            [&](NotifyRpcRequest request) {
+                if (!dispatcher || !running.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                NotifyBatch batch;
+                batch.keys = std::move(request.keys);
+                batch.sender = request.sender;
+                batch.size = request.size;
+                batch.warmup = request.warmup;
+                return dispatcher->Dispatch(std::move(batch));
+            });
+    }
+
     std::mutex workload_mutex;
     bool workload_started = false;
+    bool workload_paused = false;
+    bool measurement_armed = false;
     std::thread workload_thread;
     std::atomic<bool> workload_failed{false};
 
@@ -400,7 +474,73 @@ int main(int argc, char **argv) {
                     return {500, "text/plain", start_error};
                 }
                 workload_started = true;
+                workload_paused = false;
+                measurement_armed = false;
                 return {200, "text/plain", "started"};
+            }
+            if (method == "POST" && route == "/pause") {
+                std::lock_guard<std::mutex> lock(workload_mutex);
+                if (!workload_started || workload_paused) {
+                    return {409, "text/plain", "not running or already paused"};
+                }
+                metrics.Freeze();
+                if (writer) writer->RequestStop();
+                if (basic_runner) basic_runner->RequestStop();
+                if (workload_thread.joinable()) workload_thread.join();
+                if (notify_sender) notify_sender->Drain();
+                workload_paused = true;
+                measurement_armed = false;
+                return {200, "text/plain", "paused"};
+            }
+            if (method == "POST" && route == "/drain") {
+                if (dispatcher) dispatcher->Drain(std::chrono::seconds(5));
+                return {200, "text/plain", "drained"};
+            }
+            if (method == "POST" && route == "/reset") {
+                std::lock_guard<std::mutex> lock(workload_mutex);
+                if (!workload_paused) {
+                    return {409, "text/plain", "workload is not paused"};
+                }
+                metrics.ResetPaused();
+                measurement_armed = false;
+                return {200, "text/plain", "reset"};
+            }
+            if (method == "POST" && route == "/arm") {
+                std::lock_guard<std::mutex> lock(workload_mutex);
+                if (!workload_paused) {
+                    return {409, "text/plain", "workload is not paused"};
+                }
+                if (!measurement_armed) {
+                    metrics.BeginMeasurement();
+                    measurement_armed = true;
+                }
+                return {200, "text/plain", "armed"};
+            }
+            if (method == "POST" && route == "/resume") {
+                std::lock_guard<std::mutex> lock(workload_mutex);
+                if (!workload_paused || !measurement_armed) {
+                    return {409, "text/plain", "pause/arm first"};
+                }
+                if (config.IsPipeline() &&
+                    (config.role == "writer" || config.role == "dual")) {
+                    writer.reset();
+                    if (!prepare_writer()) {
+                        return {500, "text/plain", error};
+                    }
+                }
+                if (config.IsBasic()) {
+                    basic_runner.reset();
+                    if (!prepare_basic()) {
+                        return {500, "text/plain", error};
+                    }
+                }
+                workload_failed.store(false, std::memory_order_release);
+                std::string resume_error;
+                if (!start_workload(&resume_error)) {
+                    return {500, "text/plain", resume_error};
+                }
+                workload_paused = false;
+                return {200, "text/plain", "resumed"};
             }
             if (method == "POST" && route == "/summary") {
                 metrics.WriteSummary();
@@ -420,6 +560,11 @@ int main(int argc, char **argv) {
     int exit_code = 0;
     if (!server.Start(&error)) {
         LOG(ERROR) << "HTTP server failed: " << error;
+        exit_code = 1;
+        running.store(false, std::memory_order_release);
+    }
+    if (exit_code == 0 && rpc_server && !rpc_server->Start(&error)) {
+        LOG(ERROR) << "RPC notify server failed: " << error;
         exit_code = 1;
         running.store(false, std::memory_order_release);
     }
@@ -531,6 +676,7 @@ int main(int argc, char **argv) {
     }
     metrics.Stop();
     LOG(INFO) << "mooncake_kvtest shutdown: metrics persisted";
+    if (rpc_server) rpc_server->Stop();
     server.Stop();
     LOG(INFO) << "mooncake_kvtest shutdown: HTTP server stopped";
     client->tearDownAll();

@@ -46,6 +46,8 @@ class MetricsCollector {
 
     void Start();
     void Reset();
+    void ResetPaused();
+    void BeginMeasurement();
     void Freeze();
     void Stop();
     // Backwards-compatible two-state recording (used by the legacy pipeline
