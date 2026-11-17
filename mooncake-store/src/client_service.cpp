@@ -2573,6 +2573,55 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         uint32_t slowest_lane = 0;
         size_t slowest_task_index = 0;
         int64_t slowest_task_us = 0;
+        size_t nof_timing_count = 0;
+        uint64_t nof_sub_io_count = 0;
+        int64_t nof_dispatch_queue_sum_us = 0;
+        int64_t nof_dispatch_queue_max_us = 0;
+        int64_t nof_worker_setup_sum_us = 0;
+        int64_t nof_worker_setup_max_us = 0;
+        uint64_t nof_qos_tasks_ahead_sum = 0;
+        uint32_t nof_qos_tasks_ahead_max = 0;
+        int64_t nof_qos_fifo_wait_sum_us = 0;
+        int64_t nof_qos_fifo_wait_max_us = 0;
+        int64_t nof_qos_fifo_full_wait_sum_us = 0;
+        int64_t nof_qos_fifo_full_wait_max_us = 0;
+        int64_t nof_qos_fifo_partial_wait_sum_us = 0;
+        int64_t nof_qos_fifo_partial_wait_max_us = 0;
+        int64_t nof_qos_fifo_zero_wait_sum_us = 0;
+        int64_t nof_qos_fifo_zero_wait_max_us = 0;
+        int64_t nof_qos_fifo_unattributed_sum_us = 0;
+        int64_t nof_qos_fifo_unattributed_max_us = 0;
+        int64_t nof_head_to_submit_sum_us = 0;
+        int64_t nof_head_to_submit_max_us = 0;
+        int64_t nof_credit_wait_sum_us = 0;
+        int64_t nof_credit_wait_max_us = 0;
+        int64_t nof_first_credit_wait_sum_us = 0;
+        int64_t nof_first_credit_wait_max_us = 0;
+        int64_t nof_submit_credit_wait_sum_us = 0;
+        int64_t nof_submit_credit_wait_max_us = 0;
+        int64_t nof_qos_queue_sum_us = 0;
+        int64_t nof_qos_queue_max_us = 0;
+        int64_t nof_queue_to_submit_sum_us = 0;
+        int64_t nof_queue_to_submit_max_us = 0;
+        int64_t nof_submit_span_sum_us = 0;
+        int64_t nof_submit_span_max_us = 0;
+        int64_t nof_drain_sum_us = 0;
+        int64_t nof_drain_max_us = 0;
+        int64_t nof_first_completion_sum_us = 0;
+        int64_t nof_first_completion_max_us = 0;
+        int64_t nof_completion_submit_gap_sum_us = 0;
+        int64_t nof_completion_submit_gap_min_us =
+            std::numeric_limits<int64_t>::max();
+        int64_t nof_completion_submit_gap_max_us =
+            std::numeric_limits<int64_t>::min();
+        size_t nof_completion_before_last_submit = 0;
+        int64_t nof_completion_span_sum_us = 0;
+        int64_t nof_completion_span_max_us = 0;
+        int64_t nof_task_total_sum_us = 0;
+        int64_t nof_task_total_max_us = 0;
+        int64_t nof_observe_delay_sum_us = 0;
+        int64_t nof_observe_delay_max_us = 0;
+        NofTransferTiming slowest_task_timing;
 
         auto select_replica = MakeReadReplicaSelector();
         // One submit sample per batch; wait samples below are per future.
@@ -2878,6 +2927,175 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 max_future_wait_us =
                     std::max(max_future_wait_us, future_wait_us);
 
+                if (auto timing = future.nofTiming();
+                    timing.has_value()) {
+                    ++nof_timing_count;
+                    nof_sub_io_count += timing->sub_io_count;
+                    nof_dispatch_queue_sum_us += timing->dispatch_queue_us;
+                    nof_dispatch_queue_max_us = std::max(
+                        nof_dispatch_queue_max_us,
+                        timing->dispatch_queue_us);
+                    nof_worker_setup_sum_us += timing->worker_setup_us;
+                    nof_worker_setup_max_us = std::max(
+                        nof_worker_setup_max_us, timing->worker_setup_us);
+                    nof_qos_tasks_ahead_sum +=
+                        timing->qos_tasks_ahead_at_enqueue;
+                    nof_qos_tasks_ahead_max = std::max(
+                        nof_qos_tasks_ahead_max,
+                        timing->qos_tasks_ahead_at_enqueue);
+                    nof_qos_fifo_wait_sum_us += timing->qos_fifo_wait_us;
+                    nof_qos_fifo_wait_max_us = std::max(
+                        nof_qos_fifo_wait_max_us, timing->qos_fifo_wait_us);
+                    nof_qos_fifo_full_wait_sum_us +=
+                        timing->qos_fifo_full_wait_us;
+                    nof_qos_fifo_full_wait_max_us = std::max(
+                        nof_qos_fifo_full_wait_max_us,
+                        timing->qos_fifo_full_wait_us);
+                    nof_qos_fifo_partial_wait_sum_us +=
+                        timing->qos_fifo_partial_wait_us;
+                    nof_qos_fifo_partial_wait_max_us = std::max(
+                        nof_qos_fifo_partial_wait_max_us,
+                        timing->qos_fifo_partial_wait_us);
+                    nof_qos_fifo_zero_wait_sum_us +=
+                        timing->qos_fifo_zero_wait_us;
+                    nof_qos_fifo_zero_wait_max_us = std::max(
+                        nof_qos_fifo_zero_wait_max_us,
+                        timing->qos_fifo_zero_wait_us);
+                    const int64_t qos_fifo_unattributed_us = std::max<int64_t>(
+                        0, timing->qos_fifo_wait_us -
+                               timing->qos_fifo_full_wait_us -
+                               timing->qos_fifo_partial_wait_us -
+                               timing->qos_fifo_zero_wait_us);
+                    nof_qos_fifo_unattributed_sum_us +=
+                        qos_fifo_unattributed_us;
+                    nof_qos_fifo_unattributed_max_us = std::max(
+                        nof_qos_fifo_unattributed_max_us,
+                        qos_fifo_unattributed_us);
+                    nof_head_to_submit_sum_us += timing->head_to_first_submit_us;
+                    nof_head_to_submit_max_us = std::max(
+                        nof_head_to_submit_max_us,
+                        timing->head_to_first_submit_us);
+                    nof_credit_wait_sum_us += timing->credit_wait_us;
+                    nof_credit_wait_max_us = std::max(
+                        nof_credit_wait_max_us, timing->credit_wait_us);
+                    nof_first_credit_wait_sum_us +=
+                        timing->first_credit_wait_us;
+                    nof_first_credit_wait_max_us = std::max(
+                        nof_first_credit_wait_max_us,
+                        timing->first_credit_wait_us);
+                    const int64_t submit_credit_wait_us =
+                        timing->credit_wait_us -
+                        timing->first_credit_wait_us;
+                    nof_submit_credit_wait_sum_us += submit_credit_wait_us;
+                    nof_submit_credit_wait_max_us = std::max(
+                        nof_submit_credit_wait_max_us,
+                        submit_credit_wait_us);
+                    nof_qos_queue_sum_us += timing->qos_queue_us;
+                    nof_qos_queue_max_us =
+                        std::max(nof_qos_queue_max_us, timing->qos_queue_us);
+                    nof_queue_to_submit_sum_us +=
+                        timing->queue_to_first_submit_us;
+                    nof_queue_to_submit_max_us = std::max(
+                        nof_queue_to_submit_max_us,
+                        timing->queue_to_first_submit_us);
+                    nof_submit_span_sum_us += timing->first_to_last_submit_us;
+                    nof_submit_span_max_us = std::max(
+                        nof_submit_span_max_us,
+                        timing->first_to_last_submit_us);
+                    nof_drain_sum_us += timing->last_submit_to_complete_us;
+                    nof_drain_max_us = std::max(
+                        nof_drain_max_us,
+                        timing->last_submit_to_complete_us);
+                    nof_first_completion_sum_us +=
+                        timing->first_submit_to_first_completion_us;
+                    nof_first_completion_max_us = std::max(
+                        nof_first_completion_max_us,
+                        timing->first_submit_to_first_completion_us);
+                    nof_completion_submit_gap_sum_us +=
+                        timing->first_completion_minus_last_submit_us;
+                    nof_completion_submit_gap_min_us = std::min(
+                        nof_completion_submit_gap_min_us,
+                        timing->first_completion_minus_last_submit_us);
+                    nof_completion_submit_gap_max_us = std::max(
+                        nof_completion_submit_gap_max_us,
+                        timing->first_completion_minus_last_submit_us);
+                    if (timing->first_completion_minus_last_submit_us < 0) {
+                        ++nof_completion_before_last_submit;
+                    }
+                    nof_completion_span_sum_us +=
+                        timing->first_completion_to_complete_us;
+                    nof_completion_span_max_us = std::max(
+                        nof_completion_span_max_us,
+                        timing->first_completion_to_complete_us);
+                    nof_task_total_sum_us += timing->total_us;
+                    nof_task_total_max_us =
+                        std::max(nof_task_total_max_us, timing->total_us);
+                    nof_observe_delay_sum_us += timing->complete_to_observe_us;
+                    nof_observe_delay_max_us = std::max(
+                        nof_observe_delay_max_us,
+                        timing->complete_to_observe_us);
+                    MC_LOG(INFO)
+                        << "batch_get_nof_task_breakdown trace_id="
+                        << trace_id << " task_index=" << index
+                        << " lane=" << timing->lane
+                        << " sub_io_count=" << timing->sub_io_count
+                        << " tasks_ahead_at_enqueue="
+                        << timing->qos_tasks_ahead_at_enqueue
+                        << " dispatch_queue_us=" << timing->dispatch_queue_us
+                        << " worker_setup_us=" << timing->worker_setup_us
+                        << " qos_fifo_wait_us=" << timing->qos_fifo_wait_us
+                        << " qos_fifo_full_wait_us="
+                        << timing->qos_fifo_full_wait_us
+                        << " qos_fifo_partial_wait_us="
+                        << timing->qos_fifo_partial_wait_us
+                        << " qos_fifo_zero_wait_us="
+                        << timing->qos_fifo_zero_wait_us
+                        << " qos_fifo_unattributed_us="
+                        << qos_fifo_unattributed_us
+                        << " head_to_submit_us="
+                        << timing->head_to_first_submit_us
+                        << " first_credit_wait_us="
+                        << timing->first_credit_wait_us
+                        << " submit_credit_wait_us=" << submit_credit_wait_us
+                        << " submit_span_us="
+                        << timing->first_to_last_submit_us
+                        << " drain_us="
+                        << timing->last_submit_to_complete_us
+                        << " first_completion_us="
+                        << timing->first_submit_to_first_completion_us
+                        << " completion_submit_gap_us="
+                        << timing->first_completion_minus_last_submit_us
+                        << " completion_span_us="
+                        << timing->first_completion_to_complete_us
+                        << " task_total_us=" << timing->total_us
+                        << " observe_delay_us="
+                        << timing->complete_to_observe_us
+                        << " worker_idx=" << timing->worker_index
+                        << " qpair_id=" << timing->qpair_id
+                        << " lane_task_seq=" << timing->lane_task_sequence
+                        << " lane_completion_seq="
+                        << timing->lane_completion_sequence
+                        << " max_subio_us="
+                        << timing->max_sub_io_latency_us
+                        << " max_subio_idx=" << timing->max_sub_io_index
+                        << " max_subio_cid=" << timing->max_sub_io_cid
+                        << " max_completion_gap_us="
+                        << timing->max_completion_gap_us
+                        << " max_poll_return_gap_us="
+                        << timing->max_poll_return_gap_us
+                        << " poll_calls=" << timing->poll_calls_during_task
+                        << " empty_polls="
+                        << timing->empty_polls_during_task
+                        << " polled_completions="
+                        << timing->polled_completions_during_task;
+                    if (timing->total_us > slowest_task_us) {
+                        slowest_task_us = timing->total_us;
+                        slowest_lane = timing->lane;
+                        slowest_task_index = index;
+                        slowest_task_timing = *timing;
+                    }
+                }
+
             }
 
 
@@ -2996,6 +3214,142 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                          << " lease_us=" << lease_us << " total_us=" << total_us
                          << " success=" << success_count
                          << " failed=" << (results.size() - success_count);
+
+            if (nof_timing_count > 0) {
+                auto average = [nof_timing_count](int64_t sum) {
+                    return sum / static_cast<int64_t>(nof_timing_count);
+                };
+                MC_LOG(INFO)
+                    << "batch_get_nof_wait_breakdown trace_id=" << trace_id
+                    << " nof_tasks=" << nof_timing_count
+                    << " sub_ios=" << nof_sub_io_count
+                    << " ready_before_wait=" << ready_before_wait
+                    << " blocked_futures=" << blocked_futures
+                    << " future_wait_sum_us=" << wait_blocked_us
+                    << " future_wait_max_us=" << max_future_wait_us
+                    << " dispatch_queue_avg_us="
+                    << average(nof_dispatch_queue_sum_us)
+                    << " dispatch_queue_max_us=" << nof_dispatch_queue_max_us
+                    << " worker_setup_avg_us="
+                    << average(nof_worker_setup_sum_us)
+                    << " worker_setup_max_us=" << nof_worker_setup_max_us
+                    << " tasks_ahead_avg="
+                    << (nof_qos_tasks_ahead_sum /
+                        static_cast<uint64_t>(nof_timing_count))
+                    << " tasks_ahead_max=" << nof_qos_tasks_ahead_max
+                    << " qos_fifo_wait_avg_us="
+                    << average(nof_qos_fifo_wait_sum_us)
+                    << " qos_fifo_wait_max_us=" << nof_qos_fifo_wait_max_us
+                    << " qos_fifo_full_wait_avg_us="
+                    << average(nof_qos_fifo_full_wait_sum_us)
+                    << " qos_fifo_full_wait_max_us="
+                    << nof_qos_fifo_full_wait_max_us
+                    << " qos_fifo_partial_wait_avg_us="
+                    << average(nof_qos_fifo_partial_wait_sum_us)
+                    << " qos_fifo_partial_wait_max_us="
+                    << nof_qos_fifo_partial_wait_max_us
+                    << " qos_fifo_zero_wait_avg_us="
+                    << average(nof_qos_fifo_zero_wait_sum_us)
+                    << " qos_fifo_zero_wait_max_us="
+                    << nof_qos_fifo_zero_wait_max_us
+                    << " qos_fifo_unattributed_avg_us="
+                    << average(nof_qos_fifo_unattributed_sum_us)
+                    << " qos_fifo_unattributed_max_us="
+                    << nof_qos_fifo_unattributed_max_us
+                    << " head_to_submit_avg_us="
+                    << average(nof_head_to_submit_sum_us)
+                    << " head_to_submit_max_us=" << nof_head_to_submit_max_us
+                    << " credit_wait_avg_us="
+                    << average(nof_credit_wait_sum_us)
+                    << " credit_wait_max_us=" << nof_credit_wait_max_us
+                    << " first_credit_wait_avg_us="
+                    << average(nof_first_credit_wait_sum_us)
+                    << " first_credit_wait_max_us="
+                    << nof_first_credit_wait_max_us
+                    << " submit_credit_wait_avg_us="
+                    << average(nof_submit_credit_wait_sum_us)
+                    << " submit_credit_wait_max_us="
+                    << nof_submit_credit_wait_max_us
+                    << " qos_queue_avg_us=" << average(nof_qos_queue_sum_us)
+                    << " qos_queue_max_us=" << nof_qos_queue_max_us
+                    << " queue_to_submit_avg_us="
+                    << average(nof_queue_to_submit_sum_us)
+                    << " queue_to_submit_max_us="
+                    << nof_queue_to_submit_max_us
+                    << " submit_span_avg_us="
+                    << average(nof_submit_span_sum_us)
+                    << " submit_span_max_us=" << nof_submit_span_max_us
+                    << " drain_avg_us=" << average(nof_drain_sum_us)
+                    << " drain_max_us=" << nof_drain_max_us
+                    << " first_completion_avg_us="
+                    << average(nof_first_completion_sum_us)
+                    << " first_completion_max_us="
+                    << nof_first_completion_max_us
+                    << " completion_submit_gap_avg_us="
+                    << average(nof_completion_submit_gap_sum_us)
+                    << " completion_submit_gap_min_us="
+                    << nof_completion_submit_gap_min_us
+                    << " completion_submit_gap_max_us="
+                    << nof_completion_submit_gap_max_us
+                    << " completion_before_last_submit_tasks="
+                    << nof_completion_before_last_submit
+                    << " completion_span_avg_us="
+                    << average(nof_completion_span_sum_us)
+                    << " completion_span_max_us=" << nof_completion_span_max_us
+                    << " task_total_avg_us="
+                    << average(nof_task_total_sum_us)
+                    << " task_total_max_us=" << nof_task_total_max_us
+                    << " observe_delay_avg_us="
+                    << average(nof_observe_delay_sum_us)
+                    << " observe_delay_max_us=" << nof_observe_delay_max_us
+                    << " slowest_lane=" << slowest_lane
+                    << " slowest_task_index=" << slowest_task_index
+                    << " slowest_task_us=" << slowest_task_us
+                    << " slowest_qos_queue_us="
+                    << slowest_task_timing.qos_queue_us
+                    << " slowest_dispatch_queue_us="
+                    << slowest_task_timing.dispatch_queue_us
+                    << " slowest_worker_setup_us="
+                    << slowest_task_timing.worker_setup_us
+                    << " slowest_qos_fifo_wait_us="
+                    << slowest_task_timing.qos_fifo_wait_us
+                    << " slowest_tasks_ahead_at_enqueue="
+                    << slowest_task_timing.qos_tasks_ahead_at_enqueue
+                    << " slowest_qos_fifo_full_wait_us="
+                    << slowest_task_timing.qos_fifo_full_wait_us
+                    << " slowest_qos_fifo_partial_wait_us="
+                    << slowest_task_timing.qos_fifo_partial_wait_us
+                    << " slowest_qos_fifo_zero_wait_us="
+                    << slowest_task_timing.qos_fifo_zero_wait_us
+                    << " slowest_qos_fifo_unattributed_us=" << std::max<int64_t>(
+                           0, slowest_task_timing.qos_fifo_wait_us -
+                                  slowest_task_timing.qos_fifo_full_wait_us -
+                                  slowest_task_timing.qos_fifo_partial_wait_us -
+                                  slowest_task_timing.qos_fifo_zero_wait_us)
+                    << " slowest_head_to_submit_us="
+                    << slowest_task_timing.head_to_first_submit_us
+                    << " slowest_credit_wait_us="
+                    << slowest_task_timing.credit_wait_us
+                    << " slowest_first_credit_wait_us="
+                    << slowest_task_timing.first_credit_wait_us
+                    << " slowest_submit_credit_wait_us="
+                    << (slowest_task_timing.credit_wait_us -
+                        slowest_task_timing.first_credit_wait_us)
+                    << " slowest_submit_span_us="
+                    << slowest_task_timing.first_to_last_submit_us
+                    << " slowest_drain_us="
+                    << slowest_task_timing.last_submit_to_complete_us
+                    << " slowest_first_completion_us="
+                    << slowest_task_timing
+                           .first_submit_to_first_completion_us
+                    << " slowest_completion_submit_gap_us="
+                    << slowest_task_timing
+                           .first_completion_minus_last_submit_us
+                    << " slowest_completion_span_us="
+                    << slowest_task_timing.first_completion_to_complete_us
+                    << " slowest_observe_delay_us="
+                    << slowest_task_timing.complete_to_observe_us;
+            }
 
         }
 
@@ -7089,6 +7443,14 @@ ErrorCode Client::TransferData(
     std::set<std::string>* failed_endpoints,
     const std::vector<VSegmentLayoutEntry>* layouts) {
     if (!transfer_submitter_) return ErrorCode::INVALID_PARAMS;
+    // NoF per-transfer breakdown is opt-in because emitting it before this
+    // function returns directly inflates caller-observed read latency.
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        ShouldSampleStoreTransferDiagnostics(trace_id);
+    const auto transfer_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     std::optional<TransferFuture> future;
     std::vector<std::string> endpoints;
     if (replica_descriptor.is_vsegment_replica()) {
@@ -7113,9 +7475,40 @@ ErrorCode Client::TransferData(
         if (failed_endpoints) failed_endpoints->insert(endpoints.begin(), endpoints.end());
         return ErrorCode::TRANSFER_FAIL;
     }
+    const auto submit_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    const TransferStrategy strategy = future->strategy();
     auto result = future->get();
+    const auto wait_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     if (result != ErrorCode::OK && failed_endpoints)
         failed_endpoints->insert(endpoints.begin(), endpoints.end());
+    if (breakdown_log) {
+        size_t bytes = 0;
+        for (const auto& slice : slices) bytes += slice.size;
+        const char* replica_kind = replica_descriptor.is_memory_replica()
+                                       ? "memory"
+                                   : replica_descriptor.is_nof_replica()
+                                       ? "nof"
+                                       : "other";
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(
+                       end - begin)
+                .count();
+        };
+        MC_LOG(INFO) << "transfer_data_breakdown trace_id=" << trace_id
+                     << " op="
+                     << (op_code == TransferRequest::WRITE ? "write" : "read")
+                     << " replica=" << replica_kind
+                     << " strategy=" << strategy
+                     << " slices=" << slices.size() << " bytes=" << bytes
+                     << " submit_us=" << elapsed_us(transfer_start, submit_end)
+                     << " wait_us=" << elapsed_us(submit_end, wait_end)
+                     << " total_us=" << elapsed_us(transfer_start, wait_end)
+                     << " status=" << static_cast<int>(result);
+    }
     return result;
 }
 

@@ -448,10 +448,70 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
-    auto load_result = LoadBatch(keys, sizes, false);
-    if (!load_result) return tl::make_unexpected(load_result.error());
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const uint64_t total_bytes =
+        std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
+    uint64_t alloc_us = 0;
+    StorageReadStats read_stats;
+    auto log_breakdown = [&](const char* fallback_status,
+                             ErrorCode fallback_error) {
+        if (!breakdown_log) return;
+        const auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start_time)
+                .count();
+        const char* status = read_stats.status == "ok" ? fallback_status
+                                                      : read_stats.status.c_str();
+        const ErrorCode error = read_stats.error_code == ErrorCode::OK
+                                    ? fallback_error
+                                    : read_stats.error_code;
+        MC_LOG(INFO) << "storage_read_breakdown num_keys=" << keys.size()
+                     << " total_bytes=" << total_bytes
+                     << " alloc_us=" << alloc_us
+                     << " plan_us=" << read_stats.plan_us
+                     << " file_open_us=" << read_stats.file_open_us
+                     << " disk_read_us=" << read_stats.disk_read_us
+                     << " total_us=" << total_us
+                     << " slowest_key=" << read_stats.slowest_key
+                     << " slowest_disk_read_us=" << read_stats.slowest_disk_read_us
+                     << " io_mode=" << read_stats.io_mode
+                     << " status=" << status
+                     << " error_key=" << read_stats.error_key
+                     << " error_code=" << static_cast<int>(error);
+    };
+    const auto alloc_start = std::chrono::steady_clock::now();
+    auto allocate_res = AllocateBatch(keys, sizes, *client_buffer_allocator_);
+    alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - alloc_start)
+                   .count();
+    if (!allocate_res) {
+        LOG(ERROR) << "Failed to allocate batch objects";
+        log_breakdown("alloc_fail", allocate_res.error());
+        return tl::make_unexpected(allocate_res.error());
+    }
+    auto allocated_batch = std::move(allocate_res.value());
 
-    auto allocated_batch = std::move(load_result.value());
+    ScopedStorageReadStats stats_scope(breakdown_log ? &read_stats : nullptr);
+    auto result = BatchLoad(allocated_batch->slices);
+    if (!result) {
+        LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
+        log_breakdown("read_fail", result.error());
+        return tl::make_unexpected(result.error());
+    }
+
+    // After BatchLoad, slice.ptr may have been adjusted by offset_in_buffer
+    // (for O_DIRECT aligned reads). Update pointers to reflect actual data
+    // positions.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto it = allocated_batch->slices.find(keys[i]);
+        if (it != allocated_batch->slices.end()) {
+            allocated_batch->pointers[i] =
+                reinterpret_cast<uintptr_t>(it->second.ptr);
+        }
+    }
+
     uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
 
@@ -464,6 +524,7 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
                             .count();
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
             << "us, key size: " << keys.size() << ", batch_id: " << batch_id;
+    log_breakdown("ok", ErrorCode::OK);
     return batch_result;
 }
 

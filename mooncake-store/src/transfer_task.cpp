@@ -18,6 +18,7 @@
 #include "config/fileread_worker_pool_config.h"
 #include "config/nof_worker_pool_config.h"
 #include "device/accelerator_registry.h"
+#include "store_diagnostics.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef USE_TENT
@@ -147,6 +148,44 @@ static int CountNofQueuedTasks(const mooncake::NofTask* head) {
     return count;
 }
 
+static inline int64_t ElapsedMicros(
+    std::chrono::steady_clock::time_point begin,
+    std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+        .count();
+}
+
+// Marks the moment a task becomes its lane's FIFO head, once. The 930
+// source additionally attributed lane-occupancy accumulators here; those
+// were not ported, so the qos_fifo_*_wait_us decomposition reports 0.
+static inline void MarkNofTaskAsQosHead(
+    mooncake::NofTask* task, std::chrono::steady_clock::time_point now) {
+    if (task && task->timing &&
+        task->timing->qos_head_at ==
+            std::chrono::steady_clock::time_point{}) {
+        task->timing->qos_head_at = now;
+    }
+}
+
+// The lane's block budget is exhausted while the task still has bytes to
+// submit: the wait span is attributed to the task's credit_wait_us.
+static inline void StartNofCreditWait(
+    mooncake::NofTask* task, std::chrono::steady_clock::time_point now) {
+    if (task && task->timing && !task->timing->credit_wait_active) {
+        task->timing->credit_wait_active = true;
+        task->timing->credit_wait_started_at = now;
+    }
+}
+
+static inline void StopNofCreditWait(
+    mooncake::NofTask* task, std::chrono::steady_clock::time_point now) {
+    if (task && task->timing && task->timing->credit_wait_active) {
+        task->timing->credit_wait_us +=
+            ElapsedMicros(task->timing->credit_wait_started_at, now);
+        task->timing->credit_wait_active = false;
+    }
+}
+
 // Completes the task once all bytes were submitted and all sub-I/O returned.
 // Idempotent: a failing sub-I/O can complete a task that is still queued at
 // the QoS head (on_chain); popping the head later calls this again. The task
@@ -160,10 +199,108 @@ static inline void NofTaskCompletion(mooncake::NofTask* task) {
         if (task->nof_qos) {
             task->nof_qos->live.erase(task);
         }
+        const uint64_t lane_completion_sequence =
+            task->nof_qos ? ++task->nof_qos->completed_task_sequence : 0;
+        // Publish only tasks whose full submit/completion timeline was
+        // observed: tasks failed before their first successful sub-I/O or
+        // stranded by lane isolation have no meaningful breakdown.
+        std::optional<NofTransferTiming> timing;
+        if (task->timing && task->first_sub_io_submitted &&
+            task->timing->submitted_sub_io_count > 0 &&
+            task->timing->completed_sub_io_count > 0 &&
+            task->timing->worker_dequeued_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->qos_enqueued_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->qos_head_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->last_submit_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->first_completion_at !=
+                std::chrono::steady_clock::time_point{}) {
+            const auto completed_at = std::chrono::steady_clock::now();
+            auto elapsed_us =
+                [](std::chrono::steady_clock::time_point begin,
+                   std::chrono::steady_clock::time_point end) {
+                    return std::chrono::duration_cast<
+                               std::chrono::microseconds>(end - begin)
+                        .count();
+                };
+            timing.emplace();
+            timing->worker_index = task->worker_index;
+            timing->lane = task->lane_index;
+            // The initiator interface exposes no qpair id; reported as 0.
+            timing->qpair_id = 0;
+            timing->sub_io_count = task->timing->submitted_sub_io_count;
+            timing->lane_task_sequence = task->timing->lane_task_sequence;
+            timing->lane_completion_sequence = lane_completion_sequence;
+            timing->qos_tasks_ahead_at_enqueue =
+                task->timing->qos_tasks_ahead_at_enqueue;
+            timing->dispatch_queue_us =
+                elapsed_us(task->queued_at, task->timing->worker_dequeued_at);
+            timing->worker_setup_us =
+                elapsed_us(task->timing->worker_dequeued_at,
+                           task->timing->qos_enqueued_at);
+            timing->qos_fifo_wait_us =
+                elapsed_us(task->timing->qos_enqueued_at,
+                           task->timing->qos_head_at);
+            // Lane-occupancy attribution was not ported; the
+            // qos_fifo_*_wait_us decomposition reports 0.
+            timing->head_to_first_submit_us =
+                elapsed_us(task->timing->qos_head_at,
+                           task->timing->first_submit_at);
+            timing->credit_wait_us = task->timing->credit_wait_us;
+            timing->first_credit_wait_us =
+                task->timing->first_credit_wait_us;
+            timing->qos_queue_us =
+                elapsed_us(task->timing->worker_dequeued_at,
+                           task->timing->first_submit_at);
+            timing->queue_to_first_submit_us =
+                elapsed_us(task->queued_at, task->timing->first_submit_at);
+            timing->first_to_last_submit_us =
+                elapsed_us(task->timing->first_submit_at,
+                           task->timing->last_submit_at);
+            timing->last_submit_to_complete_us =
+                elapsed_us(task->timing->last_submit_at, completed_at);
+            timing->first_submit_to_first_completion_us =
+                elapsed_us(task->timing->first_submit_at,
+                           task->timing->first_completion_at);
+            timing->first_completion_minus_last_submit_us =
+                elapsed_us(task->timing->last_submit_at,
+                           task->timing->first_completion_at);
+            timing->first_completion_to_complete_us =
+                elapsed_us(task->timing->first_completion_at, completed_at);
+            timing->total_us = elapsed_us(task->queued_at, completed_at);
+            timing->max_sub_io_latency_us =
+                task->timing->max_sub_io_latency_us;
+            timing->max_sub_io_index = task->timing->max_sub_io_index;
+            // NofIOCompletion carries no command id; reported as 0.
+            timing->max_sub_io_cid = 0;
+            timing->max_completion_gap_us =
+                task->timing->max_completion_gap_us;
+            timing->max_poll_return_gap_us =
+                task->timing->max_poll_return_gap_us;
+            if (task->nof_qos) {
+                const auto counter_delta = [](uint64_t current,
+                                              uint64_t start) {
+                    return current >= start ? current - start : 0;
+                };
+                timing->poll_calls_during_task =
+                    counter_delta(task->nof_qos->poll_calls,
+                                  task->timing->poll_calls_at_first_submit);
+                timing->empty_polls_during_task = counter_delta(
+                    task->nof_qos->empty_polls,
+                    task->timing->empty_polls_at_first_submit);
+                timing->polled_completions_during_task = counter_delta(
+                    task->nof_qos->polled_completions,
+                    task->timing->polled_completions_at_first_submit);
+            }
+        }
         task->state->set_completed(task->failed
                                        ? mooncake::ErrorCode::TRANSFER_FAIL
                                        : mooncake::ErrorCode::OK,
-                                   std::move(task->error_detail));
+                                   std::move(task->error_detail),
+                                   std::move(timing));
     }
     if (!task->on_chain) {
         delete task;
@@ -182,6 +319,52 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
     mooncake::NofQos* nof_qos = task->nof_qos;
     size_t op = static_cast<size_t>(task->op);
 
+    // Per-completion timing for sampled tasks. A lane head waiting for
+    // credit also needs the current time to stop its wait.
+    bool releases_sampled_credit = false;
+    for (size_t pending_op = 0;
+         pending_op < static_cast<size_t>(NofIOOp::kNum); ++pending_op) {
+        releases_sampled_credit =
+            releases_sampled_credit ||
+            (nof_qos->head[pending_op] &&
+             nof_qos->head[pending_op]->timing &&
+             nof_qos->head[pending_op]->timing->credit_wait_active);
+    }
+    const auto completion_now =
+        (task->timing || releases_sampled_credit)
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+    if (task->timing) {
+        const int64_t sub_io_latency_us =
+            ElapsedMicros(sub_task->submitted_at, completion_now);
+        if (sub_io_latency_us > task->timing->max_sub_io_latency_us) {
+            task->timing->max_sub_io_latency_us = sub_io_latency_us;
+            task->timing->max_sub_io_index = sub_task->sub_io_index;
+            // NofIOCompletion carries no command id; max_sub_io_cid stays 0.
+        }
+        if (task->timing->previous_completion_at !=
+            std::chrono::steady_clock::time_point{}) {
+            const int64_t completion_gap_us = ElapsedMicros(
+                task->timing->previous_completion_at, completion_now);
+            if (completion_gap_us > task->timing->max_completion_gap_us) {
+                task->timing->max_completion_gap_us = completion_gap_us;
+            }
+        }
+        task->timing->previous_completion_at = completion_now;
+        if (nof_qos->last_poll_return_at !=
+            std::chrono::steady_clock::time_point{}) {
+            const int64_t poll_return_gap_us =
+                ElapsedMicros(nof_qos->last_poll_return_at, completion_now);
+            if (poll_return_gap_us > task->timing->max_poll_return_gap_us) {
+                task->timing->max_poll_return_gap_us = poll_return_gap_us;
+            }
+        }
+        if (task->timing->completed_sub_io_count == 0) {
+            task->timing->first_completion_at = completion_now;
+        }
+        ++task->timing->completed_sub_io_count;
+    }
+
     if (task->io_count &&
         task->io_count->fetch_sub(1, std::memory_order_acq_rel) <= 0) {
         LOG(ERROR) << "total outstanding io < 0";
@@ -193,6 +376,16 @@ static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
 
     nof_qos->inflight_blocks[op] -=
         static_cast<int>(sub_task->submit_bytes / nof_qos->block_size);
+    // Credit became available for a lane head that was waiting for it.
+    for (size_t pending_op = 0;
+         pending_op < static_cast<size_t>(NofIOOp::kNum); ++pending_op) {
+        if (nof_qos->head[pending_op] &&
+            nof_qos->inflight_blocks_limit -
+                    nof_qos->inflight_blocks[pending_op] >
+                0) {
+            StopNofCreditWait(nof_qos->head[pending_op], completion_now);
+        }
+    }
     if (nof_qos->inflight_blocks[op] < 0) {
         LOG(ERROR) << "qos inflight blocks < 0";
     }
@@ -488,7 +681,9 @@ void NofWorkerPool::submitTask(NofTask task) {
         // Each task runs on one lane of its segment; the lane handle then
         // keys worker affinity and QoS exactly like a single-lane segment.
         uint32_t lane_count = 1;
-        NofSegmentHandle* lane = PickLaneLocked(task.seg_handle, &lane_count);
+        uint32_t lane_index = 0;
+        NofSegmentHandle* lane =
+            PickLaneLocked(task.seg_handle, &lane_count, &lane_index);
         if (lane == nullptr) {
             LOG(ERROR) << "No healthy NoF lane for segment "
                        << task.seg_handle;
@@ -498,6 +693,7 @@ void NofWorkerPool::submitTask(NofTask task) {
         }
         task.seg_handle = lane;
         task.lane_count = lane_count;
+        task.lane_index = lane_index;
         NofSegmentHandle* seg = lane;
         bool new_binding = false;
         if (seg_to_worker_.find(seg) != seg_to_worker_.end()) {
@@ -526,7 +722,8 @@ void NofWorkerPool::submitTask(NofTask task) {
 }
 
 NofSegmentHandle* NofWorkerPool::PickLaneLocked(NofSegmentHandle* segment,
-                                                uint32_t* lane_count) {
+                                                uint32_t* lane_count,
+                                                uint32_t* lane_index) {
     const size_t count = initiator_->GetLaneCount(segment);
     *lane_count = static_cast<uint32_t>(std::max<size_t>(count, 1));
     if (count == 0) {
@@ -534,8 +731,15 @@ NofSegmentHandle* NofWorkerPool::PickLaneLocked(NofSegmentHandle* segment,
     }
     uint64_t& next = seg_next_lane_[segment];
     for (size_t attempt = 0; attempt < count; ++attempt) {
-        NofSegmentHandle* lane = initiator_->GetLane(segment, next++ % count);
+        const uint64_t lane_selector = next++;
+        NofSegmentHandle* lane =
+            initiator_->GetLane(segment, lane_selector % count);
         if (lane != nullptr && initiator_->IsLaneHealthy(lane)) {
+            // The initiator exposes no qpair id; report the round-robin lane
+            // selector within the segment instead.
+            if (lane_index != nullptr) {
+                *lane_index = static_cast<uint32_t>(lane_selector % count);
+            }
             return lane;
         }
     }
@@ -735,10 +939,35 @@ void NofWorkerPool::workerThread(int work_idx) {
                     task_queue.pop();
                     continue;
                 }
+                if (task->timing) {
+                    task->timing->worker_dequeued_at =
+                        std::chrono::steady_clock::now();
+                }
+                task->worker_index = work_idx;
                 task->io_count = total_outstanding_io;
                 task->nof_qos = nof_qos;
                 task->on_chain = true;
+                const size_t task_op = static_cast<size_t>(task->op);
+                const bool lane_was_empty = nof_qos->head[task_op] == nullptr;
+                const uint32_t tasks_ahead =
+                    task->timing
+                        ? static_cast<uint32_t>(
+                              CountNofQueuedTasks(nof_qos->head[task_op]))
+                        : 0;
+                const auto qos_enqueue_now =
+                    task->timing ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+                if (task->timing) {
+                    task->timing->qos_enqueued_at = qos_enqueue_now;
+                    task->timing->lane_task_sequence =
+                        nof_qos->enqueued_task_sequence + 1;
+                    task->timing->qos_tasks_ahead_at_enqueue = tasks_ahead;
+                }
+                ++nof_qos->enqueued_task_sequence;
                 nof_qos->PushTask(task);
+                if (lane_was_empty) {
+                    MarkNofTaskAsQosHead(task, qos_enqueue_now);
+                }
                 task_queue.pop();
             }
         }
@@ -758,6 +987,20 @@ void NofWorkerPool::workerThread(int work_idx) {
                  ++i) {
                 int avail_blocks = nof_qos->inflight_blocks_limit -
                                    nof_qos->inflight_blocks[i];
+                if (nof_qos->head[i]) {
+                    // Track how long the lane head spends waiting for
+                    // inflight-block credit. Sampled tasks only; the
+                    // un-sampled majority pays one null check.
+                    const auto credit_state_now =
+                        nof_qos->head[i]->timing
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+                    if (avail_blocks <= 0) {
+                        StartNofCreditWait(nof_qos->head[i], credit_state_now);
+                    } else {
+                        StopNofCreditWait(nof_qos->head[i], credit_state_now);
+                    }
+                }
                 while (nof_qos->head[i] && avail_blocks > 0) {
                     NofTask* task = nof_qos->head[i];
                     NofSubTask* sub_task;
@@ -786,6 +1029,10 @@ void NofWorkerPool::workerThread(int work_idx) {
                         sub_task->task = task;
                         sub_task->submit_bytes = submit_bytes;
                         sub_task->adaptor = {&nof_io_complete, sub_task};
+                        const auto sub_io_submit_at =
+                            task->timing
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
 
                         // Host buffers take the classic path inside the
                         // initiator; device buffers use GPU Direct.
@@ -838,6 +1085,35 @@ void NofWorkerPool::workerThread(int work_idx) {
                                     std::chrono::steady_clock::now();
                             }
                             nof_qos->live.insert(task);
+                            if (task->timing) {
+                                sub_task->submitted_at = sub_io_submit_at;
+                                sub_task->sub_io_index =
+                                    static_cast<uint32_t>(task->idx);
+                                ++task->timing->submitted_sub_io_count;
+                                if (!task->first_sub_io_submitted) {
+                                    task->first_sub_io_submitted = true;
+                                    task->timing->first_submit_at =
+                                        sub_io_submit_at;
+                                    task->timing->poll_calls_at_first_submit =
+                                        nof_qos->poll_calls;
+                                    task->timing->empty_polls_at_first_submit =
+                                        nof_qos->empty_polls;
+                                    task->timing
+                                        ->polled_completions_at_first_submit =
+                                        nof_qos->polled_completions;
+                                    // Credit waited while at the head before
+                                    // this first successful submit. Submits
+                                    // only run with avail_blocks > 0, so any
+                                    // active wait was already stopped.
+                                    task->timing->first_credit_wait_us =
+                                        task->timing->credit_wait_us;
+                                }
+                                if (task->remaining_bytes - submit_bytes ==
+                                    0) {
+                                    task->timing->last_submit_at =
+                                        std::chrono::steady_clock::now();
+                                }
+                            }
                             task->idx++;
                             task->remaining_bytes -= submit_bytes;
                             nof_qos->inflight_blocks[i] += submit_blocks;
@@ -850,14 +1126,35 @@ void NofWorkerPool::workerThread(int work_idx) {
                                                  task->op == NofIOOp::kWrite,
                                                  submit_bytes);
 #endif
+                            if (task->timing && avail_blocks <= 0 &&
+                                task->remaining_bytes > 0) {
+                                // Credit exhausted mid-task: the head (this
+                                // task) starts waiting for credit release.
+                                StartNofCreditWait(
+                                    task, std::chrono::steady_clock::now());
+                            }
                         }
                     }
                     if (isolate_reason != nullptr) {
                         break;
                     }
                     if (task->remaining_bytes == 0) {
+                        const bool capture_pop_time =
+                            nof_qos->head[i] != nullptr &&
+                            nof_qos->head[i]->nxt != nullptr &&
+                            nof_qos->head[i]->nxt->timing != nullptr;
+                        const auto pop_now =
+                            capture_pop_time
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
                         nof_qos->PopTask(static_cast<NofIOOp>(i));
                         task->on_chain = false;
+                        MarkNofTaskAsQosHead(nof_qos->head[i], pop_now);
+                        if (nof_qos->head[i] && avail_blocks <= 0) {
+                            // The new head inherits a blocked lane: it starts
+                            // waiting for credit.
+                            StartNofCreditWait(nof_qos->head[i], pop_now);
+                        }
                         NofTaskCompletion(task);
                     }
                 }
@@ -877,6 +1174,15 @@ void NofWorkerPool::workerThread(int work_idx) {
                     continue;
                 }
                 const int64_t ret = initiator_->PollCompletion(lane, 0);
+                ++nof_qos->poll_calls;
+                if (ret == 0) {
+                    ++nof_qos->empty_polls;
+                } else if (ret > 0) {
+                    nof_qos->polled_completions +=
+                        static_cast<uint64_t>(ret);
+                }
+                nof_qos->last_poll_return_at =
+                    std::chrono::steady_clock::now();
                 if (ret == -ENXIO || ret == -ENODEV) {
                     IsolateNofLane(*initiator_, lane, nof_qos.get(),
                                    *total_outstanding_io, work_idx,
@@ -1009,6 +1315,9 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
             task.state->set_completed(ErrorCode::TRANSFER_FAIL);
             return;
         }
+        // Queue depth before this push: how many tasks this one waits
+        // behind. Needed by the memcpy_worker_breakdown queue_wait_us.
+        task.queued_ahead = task_queue_.size();
         task_queue_.push(std::move(task));
     }
     queue_cv_.notify_one();
@@ -1039,20 +1348,60 @@ void MemcpyWorkerPool::workerThread() {
 
         // Execute the task if we have one
         if (task.state) {
+            // Worker-pool breakdown is opt-in sampled: un-sampled tasks pay
+            // only the gate check.
+            mooncake::logging::ScopedTraceId trace(task.trace_id);
+            const bool breakdown_log =
+                ShouldSampleStoreTransferDiagnostics(task.trace_id);
+            const auto worker_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
+            auto registry_end = worker_start;
+            int64_t pointer_lookup_us = 0;
+            int64_t copy_us = 0;
+            uint64_t copied_bytes = 0;
             try {
                 bool ok = true;
                 auto runtime_accelerator =
                     device::GetAcceleratorRegistry().RuntimeAccelerators();
+                if (breakdown_log) {
+                    registry_end = std::chrono::steady_clock::now();
+                }
                 for (const auto& op : task.operations) {
+                    const auto lookup_start =
+                        breakdown_log
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
                     device::PointerInfo src_info;
                     device::PointerInfo dst_info;
                     auto* src_device = runtime_accelerator.FindDeviceForPointer(
                         op.src, &src_info);
                     auto* dst_device = runtime_accelerator.FindDeviceForPointer(
                         op.dest, &dst_info);
+                    if (breakdown_log) {
+                        pointer_lookup_us +=
+                            std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() -
+                                lookup_start)
+                                .count();
+                    }
 
                     if (!src_device && !dst_device) {
+                        const auto copy_start =
+                            breakdown_log
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
                         std::memcpy(op.dest, op.src, op.size);
+                        if (breakdown_log) {
+                            copy_us +=
+                                std::chrono::duration_cast<
+                                    std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() -
+                                    copy_start)
+                                    .count();
+                        }
+                        copied_bytes += op.size;
                     } else {
                         if (src_device && dst_device &&
                             src_device != dst_device) {
@@ -1082,8 +1431,22 @@ void MemcpyWorkerPool::workerThread() {
                             direction = device::CopyDirection::kHostToDevice;
                         }
                         accelerator->SetContext(device_id);
-                        if (!accelerator->Copy(op.dest, op.src, op.size,
-                                               direction)) {
+                        const auto copy_start =
+                            breakdown_log
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
+                        const bool copy_ok =
+                            accelerator->Copy(op.dest, op.src, op.size,
+                                             direction);
+                        if (breakdown_log && copy_ok) {
+                            copy_us +=
+                                std::chrono::duration_cast<
+                                    std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() -
+                                    copy_start)
+                                    .count();
+                        }
+                        if (!copy_ok) {
                             LOG(ERROR) << "GPU memcpy failed: src_dev="
                                        << src_info.device_id
                                        << " dst_dev=" << dst_info.device_id
@@ -1091,14 +1454,47 @@ void MemcpyWorkerPool::workerThread() {
                             ok = false;
                             break;
                         }
+                        copied_bytes += op.size;
                     }
                 }
+
+                const auto worker_end =
+                    breakdown_log ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
 
                 VLOG(2) << "Memcpy task completed with "
                         << task.operations.size() << " operations"
                         << (ok ? "" : " (with GPU copy failure)");
                 task.state->set_completed(ok ? ErrorCode::OK
                                              : ErrorCode::TRANSFER_FAIL);
+                if (breakdown_log) {
+                    auto elapsed_us =
+                        [](std::chrono::steady_clock::time_point begin,
+                           std::chrono::steady_clock::time_point end) {
+                            return std::chrono::duration_cast<
+                                       std::chrono::microseconds>(end - begin)
+                                .count();
+                        };
+                    MC_LOG(INFO)
+                        << "memcpy_worker_breakdown trace_id="
+                        << task.trace_id
+                        << " operations=" << task.operations.size()
+                        << " bytes=" << copied_bytes
+                        << " queued_ahead=" << task.queued_ahead
+                        << " queue_wait_us="
+                        << elapsed_us(task.submitted_at, worker_start)
+                        << " registry_us="
+                        << elapsed_us(worker_start, registry_end)
+                        << " pointer_lookup_us=" << pointer_lookup_us
+                        << " copy_us=" << copy_us
+                        << " execute_us="
+                        << elapsed_us(worker_start, worker_end)
+                        << " total_us="
+                        << elapsed_us(task.submitted_at, worker_end)
+                        << " status="
+                        << static_cast<int>(ok ? ErrorCode::OK
+                                               : ErrorCode::TRANSFER_FAIL);
+                }
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
                 task.state->set_completed(ErrorCode::TRANSFER_FAIL);
@@ -1375,6 +1771,10 @@ ErrorCode TransferFuture::get() { return wait(); }
 
 TransferStrategy TransferFuture::strategy() const {
     return state_->get_strategy();
+}
+
+std::optional<NofTransferTiming> TransferFuture::nofTiming() const {
+    return state_->nof_timing();
 }
 
 // ============================================================================
@@ -2159,12 +2559,38 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
         // Host-only batches are copied right here: queueing them costs a
         // thread handoff that dominates small copies. Any accelerator
         // pointer sends the whole batch to the pool.
+        //
+        // Inline-copy breakdown is opt-in sampled: the dice is rolled once
+        // here, and un-sampled copies pay nothing but the gate check.
+        const bool breakdown_log =
+            ShouldSampleStoreTransferDiagnostics(trace_id);
+        const auto inline_start =
+            breakdown_log ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
+        auto registry_end = inline_start;
+        int64_t pointer_lookup_us = 0;
+        int64_t copy_us = 0;
+        uint64_t copied_bytes = 0;
         try {
             bool host_only = true;
             auto runtime_accelerator =
                 device::GetAcceleratorRegistry().RuntimeAccelerators();
+            if (breakdown_log) {
+                registry_end = std::chrono::steady_clock::now();
+            }
             if (!runtime_accelerator.Devices().empty()) {
                 for (const auto& op : operations) {
+                    const auto lookup_start =
+                        breakdown_log ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+                    runtime_accelerator.FindDeviceForPointer(op.src);
+                    runtime_accelerator.FindDeviceForPointer(op.dest);
+                    if (breakdown_log) {
+                        pointer_lookup_us +=
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - lookup_start)
+                                .count();
+                    }
                     if (runtime_accelerator.FindDeviceForPointer(op.src) ||
                         runtime_accelerator.FindDeviceForPointer(op.dest)) {
                         host_only = false;
@@ -2173,10 +2599,43 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
                 }
             }
             if (host_only) {
+                const auto copy_start =
+                    breakdown_log ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
                 for (const auto& op : operations) {
                     std::memcpy(op.dest, op.src, op.size);
+                    copied_bytes += op.size;
+                }
+                const auto inline_end =
+                    breakdown_log ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+                if (breakdown_log) {
+                    copy_us = std::chrono::duration_cast<
+                                  std::chrono::microseconds>(inline_end -
+                                                             copy_start)
+                                  .count();
                 }
                 state->set_completed(ErrorCode::OK);
+                if (breakdown_log) {
+                    auto elapsed_us =
+                        [](std::chrono::steady_clock::time_point begin,
+                           std::chrono::steady_clock::time_point end) {
+                            return std::chrono::duration_cast<
+                                       std::chrono::microseconds>(end - begin)
+                                .count();
+                        };
+                    MC_LOG(INFO)
+                        << "memcpy_inline_breakdown trace_id=" << trace_id
+                        << " operations=" << operations.size()
+                        << " bytes=" << copied_bytes
+                        << " registry_us="
+                        << elapsed_us(inline_start, registry_end)
+                        << " pointer_lookup_us=" << pointer_lookup_us
+                        << " copy_us=" << copy_us
+                        << " total_us=" << elapsed_us(inline_start, inline_end)
+                        << " status="
+                        << static_cast<int>(ErrorCode::OK);
+                }
                 return TransferFuture(state);
             }
         } catch (const std::exception& e) {
@@ -2476,7 +2935,13 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
 
     const NofIOOp op =
         (op_code == TransferRequest::READ) ? NofIOOp::kRead : NofIOOp::kWrite;
-    auto state = std::make_shared<NofOperationState>();
+    // NoF task breakdown is opt-in sampled: the dice is rolled once here,
+    // and every layer (worker, QoS, completion) re-checks only the
+    // task-local flag.
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool track_timing = ShouldSampleStoreTransferDiagnostics(trace_id);
+    auto state =
+        std::make_shared<NofOperationState>(trace_id, track_timing);
     NofTask task(seg_handle, ptr, handle.buffer_address_, size, op, state);
     task.metric = nof_metric_;
     nof_pool_->submitTask(std::move(task));

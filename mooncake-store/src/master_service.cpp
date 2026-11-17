@@ -5087,6 +5087,8 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    // 低频端点，不加采样门控：拆解一次 mount RPC 在各阶段的耗时。
+    const auto mount_t0 = std::chrono::steady_clock::now();
     InvalidateVSegmentLayoutCache();
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
@@ -5144,6 +5146,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         }
     }
 
+    const auto t_registry = std::chrono::steady_clock::now();
     if (mount_result == ErrorCode::OK && enable_oplog_ &&
         ordered_oplog_writer_) {
         SegmentMountOp op;
@@ -5157,10 +5160,12 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                               segment.te_endpoint,
                               std::string(bytes.begin(), bytes.end()));
     }
+    const auto t_oplog = std::chrono::steady_clock::now();
     if (mount_result == ErrorCode::OK) {
         UpdateClientHostId(client_id, segment.host_id);
         NotifyPolicyCapacityChanged();
     }
+    const auto t_quota = std::chrono::steady_clock::now();
     // segment（重）挂载成功后，该 endpoint 不再视为 invalid。升主恢复
     // （RestoreFromStandbySnapshot）在 client 尚未重挂时会把 segment 的
     // transport_endpoint/name 标记进 invalid_replica_endpoints_，若此处不清除，
@@ -5175,6 +5180,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         invalid_replica_endpoints_.erase(UuidToString(segment.id));
     }
     PublishSegmentOwnerForCvm(segment);
+    const auto t_publish = std::chrono::steady_clock::now();
     // P2-8-2：补登该 client 的 LOCAL_DISK segment_name（首次内存段挂载
     // 时记录），供代际驱逐做 name 级 co-tenant 过滤。LOCAL_DISK-only
     // client 无 name 上下文，保持空值（退化为 host 级归并）。
@@ -5186,6 +5192,20 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     // （30s 卡顿两大主因）。「不等 TTL reaper」语义不变：drain debounce
     // 仅秒级延迟。
     EnqueueStaleGenerationEvict(segment, client_id);
+    const auto t_stale = std::chrono::steady_clock::now();
+    const auto ms = [](std::chrono::steady_clock::time_point begin,
+                       std::chrono::steady_clock::time_point end) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(end -
+                                                                     begin)
+            .count();
+    };
+    LOG(INFO) << "mount_segment_breakdown segment_name=" << segment.name
+              << ", registry_ms=" << ms(mount_t0, t_registry)
+              << ", oplog_ms=" << ms(t_registry, t_oplog)
+              << ", quota_ms=" << ms(t_oplog, t_quota)
+              << ", publish_ms=" << ms(t_quota, t_publish)
+              << ", stale_evict_enqueue_ms=" << ms(t_publish, t_stale)
+              << ", total_ms=" << ms(mount_t0, t_stale);
     // vsegment auto-plan 加速触发点（低频端点）：配额快照尚未发布时立即重试一次
     // 「发现→规划→发布」（W6 静默期门控下通常静默返回，由心跳兜底在
     // mount 流静默后发布）。发布后的 VSegment 拉起仍由下一次心跳的

@@ -739,7 +739,9 @@ class RealClient : public PyClient {
     tl::expected<RangedReadMetadata, ErrorCode>
     build_ranged_read_metadata_from_query_result(
         const std::string &key,
-        tl::expected<QueryResult, ErrorCode> query_result);
+        tl::expected<QueryResult, ErrorCode> query_result,
+        std::chrono::steady_clock::time_point t_query,
+        std::chrono::steady_clock::time_point t0);
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key,
@@ -779,13 +781,24 @@ class RealClient : public PyClient {
     using LocalDiskOffloadReader = std::function<tl::expected<void, ErrorCode>(
         const std::string &, LocalDiskOffloadObjects &)>;
 
+    // Sampling/observation state shared between the two internal
+    // batch_get_into overloads so that a single sampling decision covers the
+    // query (3-arg overload) and the read phases (5-arg overload).
+    struct BatchGetIntoBreakdownContext {
+        bool sampled = false;
+        std::chrono::steady_clock::time_point t0;
+        std::chrono::steady_clock::time_point t_query;
+        std::chrono::system_clock::time_point t0_wall;
+    };
+
     // Dependency-injected overload used to verify routing decisions without
     // requiring multiple live SSD offload servers.
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
-        const LocalDiskOffloadReader &local_disk_reader);
+        const LocalDiskOffloadReader &local_disk_reader,
+        BatchGetIntoBreakdownContext *breakdown_ctx = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
