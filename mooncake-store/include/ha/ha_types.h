@@ -122,14 +122,15 @@ struct MasterSource {
 
 using MasterSources = std::vector<MasterSource>;
 
-// OpLog source namespace written by a producer. Only multi-submaster (CVM)
-// clusters partition the OpLog per master; single-leader HA keeps the
-// unpartitioned layout so batch snapshots, compaction and leader failover
-// all continue on one stream. Producer and standby must both derive the
-// namespace through this function.
+// OpLog source namespace written by a producer. CVM deployments (etcd HA
+// with a cluster id and master id) partition the OpLog per master whatever
+// the submaster count, so a new owner can take over a dead master's stream
+// by master id. Non-CVM single-leader HA keeps the unpartitioned layout that
+// batch snapshots and compaction require. Producer and standby must both
+// derive the namespace through this function.
 inline std::string OpLogSourceId(const std::string& master_id,
-                                 uint32_t submaster_count) {
-    return submaster_count > 1 ? master_id : std::string();
+                                 bool per_master_streams) {
+    return per_master_streams ? master_id : std::string();
 }
 
 // Replay source set for a single-leader standby: the observed leader on the

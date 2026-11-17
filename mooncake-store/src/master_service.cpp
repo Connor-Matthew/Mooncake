@@ -7944,15 +7944,15 @@ tl::expected<void, ErrorCode> MasterService::MaterializeReplayedState(
     // earlier partial attempt, so existing keys are skipped rather than
     // treated as conflicts.
     //
-    // Multi-submaster replay covers every source stream, so filter materialized
-    // objects to the slots this master currently owns; other masters replay
-    // their own share. Single-source deployments have no slot partition and
-    // keep the full set.
+    // CVM replay covers every source stream, so filter materialized objects to
+    // the slots this master currently owns; other masters replay their own
+    // share. This applies to every submaster count, including one. Non-CVM
+    // deployments have no slot partition and keep the full set.
     std::vector<StandbyObjectEntry> owned_objects;
     const std::vector<StandbyObjectEntry>* objects_to_install = &objects;
     const bool kv_partition_enabled =
-        enable_ha_ && ha_backend_type_ == "etcd" && submaster_count_ > 1 &&
-        !master_id_.empty() && !cluster_id_.empty();
+        enable_ha_ && ha_backend_type_ == "etcd" && !master_id_.empty() &&
+        !cluster_id_.empty();
     if (kv_partition_enabled) {
         const std::vector<uint16_t> owned_slots = ResolveOwnedSlotsForCvm();
         if (!owned_slots.empty()) {
@@ -17151,11 +17151,15 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    // Single-leader HA keeps the unpartitioned stream (batch snapshots,
-    // compaction, failover); only multi-submaster clusters write per-master
-    // streams. Standbys derive the same namespace (ha::OpLogSourceId).
+    // CVM deployments write per-master streams whatever the submaster count;
+    // non-CVM single-leader HA keeps the unpartitioned stream (batch
+    // snapshots, compaction). Standbys derive the same namespace
+    // (ha::OpLogSourceId).
+    const bool per_master_streams = enable_ha_ && ha_backend_type_ == "etcd" &&
+                                    !master_id_.empty() && !cluster_id_.empty();
     auto storage = std::make_unique<OpLogBatchStorage>(
-        cluster_id_, *backend, ha::OpLogSourceId(master_id_, submaster_count_));
+        cluster_id_, *backend,
+        ha::OpLogSourceId(master_id_, per_master_streams));
     DurablePrefix durable_prefix;
     ErrorCode err = storage->InitDurablePrefix(durable_prefix);
     if (err != ErrorCode::OK) {
@@ -17341,10 +17345,12 @@ tl::expected<bool, ErrorCode> MasterService::TrySelfRecoverFromOpLog() {
     if (!enable_oplog_) {
         return false;
     }
-    // Self-recovery replays this master's own per-master stream, which only
-    // exists in multi-submaster clusters. Single-leader HA writes the
+    // Self-recovery replays this master's own per-master stream, which exists
+    // in every CVM deployment. Non-CVM single-leader HA writes the
     // unpartitioned stream and recovers through standby promotion instead.
-    if (ha::OpLogSourceId(master_id_, submaster_count_).empty()) {
+    const bool per_master_streams = enable_ha_ && ha_backend_type_ == "etcd" &&
+                                    !master_id_.empty() && !cluster_id_.empty();
+    if (ha::OpLogSourceId(master_id_, per_master_streams).empty()) {
         return false;
     }
     std::vector<StandbyObjectEntry> objects;

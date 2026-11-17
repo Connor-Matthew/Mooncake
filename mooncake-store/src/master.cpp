@@ -2108,15 +2108,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 #ifdef STORE_USE_ETCD
-        // VSegment ownership, routes and initialization come from the CVM
-        // controller, which only multi-submaster clusters run; a single
-        // leader serves through the community election path without it.
-        if (FLAGS_vsegment_auto_plan && master_config.submaster_count <= 1) {
-            LOG(ERROR) << "--vsegment_auto_plan requires --submaster_count > 1 "
-                          "(CVM mode); single-leader HA does not run "
-                          "VSegment. Refusing to start";
-            return 1;
-        }
         // vsegment 配额自动规划（--vsegment_auto_plan）：supervisor 启动前
         // 一次性 bootstrap（仅当快照不存在时执行，详见函数注释）；同时把
         // 策略注入 supervisor → MasterService，供心跳/mount 触发点在快照

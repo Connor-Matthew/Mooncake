@@ -1026,14 +1026,18 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                           CvmMembershipCoordinator cvm_membership_coordinator(
                               config.cluster_id, config.local_hostname);
                           std::unique_ptr<cvm::CvmController> cvm_controller;
-                          // Only multi-submaster clusters run CVM. A single
-                          // leader keeps the community election, producer
-                          // view fencing and the unpartitioned OpLog stream
-                          // that ha::OpLogSourceId selects for it.
-                          if (spec.type == HABackendType::ETCD &&
-                              config.submaster_count > 1 &&
+                          // etcd HA with a cluster id and hostname runs CVM
+                          // for every submaster count, matching
+                          // MasterService's cvm_enabled check and the
+                          // per-master OpLog streams ha::OpLogSourceId
+                          // selects. CVM has no producer view fencing
+                          // (MR-1113-03/04), so single-submaster etcd HA is
+                          // not production-ready either.
+                          const bool cvm_required =
+                              spec.type == HABackendType::ETCD &&
                               !config.local_hostname.empty() &&
-                              !config.cluster_id.empty()) {
+                              !config.cluster_id.empty();
+                          if (cvm_required) {
                               ErrorCode connect_err =
                                   EtcdHelper::ConnectToEtcdStoreClient(
                                       ResolveHABackendConnstring(config));
@@ -1086,9 +1090,11 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                           // 内跟随被指派 rank 的流。声明序在 cvm_controller
                           // 之后 → 析构先于它（裸指针 安全）；开关 OFF / 无 CVM
                           // 时 Start/Stop 均为 no-op。
-                          if (config.submaster_count > 1 && !cvm_controller) {
-                              LOG(ERROR) << "Multi-submaster mode requires a running "
-                                            "CVM controller; refusing single-leader fallback";
+                          if ((cvm_required || config.submaster_count > 1) &&
+                              !cvm_controller) {
+                              LOG(ERROR) << "CVM mode requires a running CVM "
+                                            "controller; refusing single-leader "
+                                            "fallback";
                               return -1;
                           }
 
