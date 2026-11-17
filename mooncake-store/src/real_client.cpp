@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "gpu_direct_read.h"
 #ifdef USE_UB
 #include "ub_allocator.h"
 #endif

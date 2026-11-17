@@ -2517,6 +2517,7 @@ class MasterService {
     std::atomic<uint64_t> tier_down_skipped_paved_{0};
 
     const std::string ha_backend_type_;
+    const std::string ha_backend_connstring_;
 
     const bool enable_oplog_;
     const bool weight_management_mutations_enabled_;

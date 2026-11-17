@@ -610,6 +610,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
                            config.dynamic_replication_heat_window_seconds,
                            config.dynamic_replication_admission_qps_threshold,
                            config.dynamic_replication_max_memory_replicas),
+      ha_backend_type_(config.ha_backend_type),
+      ha_backend_connstring_(config.ha_backend_connstring),
       enable_oplog_(config.enable_ha && config.enable_oplog &&
                     ha::HaBackendSupportsOpLog(config.ha_backend_type)),
       weight_management_mutations_enabled_(
@@ -3841,8 +3843,7 @@ ErrorCode MasterService::InstallSlotMetadataExport(
             standby_meta.residency_affinity_id.value_or(std::string{}));
         auto& metadata = accessor.Get();
         metadata.session_id = standby_meta.session_id.value_or(std::string{});
-        metadata.MutablePart(0).set_checksum(
-            standby_meta.object_checksum.value_or(0));
+        metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         accessor.GetState().is_processing = processing;
         SyncCacheTotalAccounting(metadata);
         PublishKvStored(user_key, metadata, tenant_id);
