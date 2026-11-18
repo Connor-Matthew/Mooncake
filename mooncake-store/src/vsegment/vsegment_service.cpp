@@ -116,18 +116,29 @@ void VSegmentService::RefreshMetrics(bool force) {
             managers.push_back(manager);
         }
     }
-    uint64_t total = 0, free = 0, reservations = 0, committed = 0,
-             pending = 0;
+    VSegmentGaugeValues values;
     for (const auto& manager : managers) {
         const auto stats = manager->Stats();
-        total += stats.logical_capacity_bytes;
-        free += stats.logical_free_bytes;
-        reservations += stats.reservations;
-        committed += stats.committed_allocations;
-        pending += stats.pending_creations;
+        // Committed plus in-flight reservations: everything outside free is
+        // allocated.
+        const uint64_t allocated =
+            stats.logical_capacity_bytes - stats.logical_free_bytes;
+        values.quota_bytes += stats.quota_bytes;
+        values.total_capacity_bytes += stats.capacity_bytes;
+        values.formed_capacity_bytes += stats.logical_capacity_bytes;
+        values.formed_free_bytes += stats.logical_free_bytes;
+        values.allocated_bytes += allocated;
+        values.reserved_bytes += stats.reserved_bytes;
+        // Clamp per manager before summing so one Partition cannot mask
+        // another's anomaly.
+        values.available_bytes +=
+            stats.capacity_bytes > allocated ? stats.capacity_bytes - allocated
+                                             : 0;
+        values.reservations += stats.reservations;
+        values.committed_allocations += stats.committed_allocations;
+        values.pending_creations += stats.pending_creations;
     }
-    VSegmentMetrics::Instance().SetCapacity(total, free, reservations,
-                                            committed, pending);
+    VSegmentMetrics::Instance().SetGauges(values);
     last_metrics_refresh_ns_.store(SteadyClockNowNs(),
                                    std::memory_order_relaxed);
 }

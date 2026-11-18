@@ -345,6 +345,10 @@ class WrappedMasterService {
     // quota generation/profiles, installed partitions, vsegment count and
     // pool composition). Forwarded for the periodic VSegment Status log.
     std::string GetVSegmentStatusLogLine() const;
+    // One-line capacity summary (used / capacity (pct), available, formed,
+    // quota). Forwarded for the periodic VSegment Storage log; empty when
+    // vsegment is disabled.
+    std::string GetVSegmentStorageLogLine() const;
 
     // Inter-master allocation forwarding (CVM plan B): allocate memory
     // replicas in this submaster's locally mounted segments on behalf of a

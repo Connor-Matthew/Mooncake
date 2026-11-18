@@ -191,6 +191,10 @@ class MasterService {
     // installed partitions/vsegment count/池组成），供 admin 周期日志线程
     // 输出独立的 "VSegment Status" 行。
     std::string GetVSegmentStatusLogLine() const;
+    // One-line capacity summary (used / capacity (pct), available, formed,
+    // quota) for the periodic "VSegment Storage" log line; returns an empty
+    // string when vsegment is disabled.
+    std::string GetVSegmentStorageLogLine() const;
     void SetVSegmentService(std::shared_ptr<vsegment::VSegmentService> service) {
         vsegment_service_ = std::move(service);
     }

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <iomanip>
 #include <map>
 #include <sstream>
 #include <string_view>
@@ -22,6 +23,7 @@
 #include "vsegment/vsegment_metrics.h"
 #include "rpc_service.h"
 #include "types.h"
+#include "utils.h"
 
 namespace mooncake {
 
@@ -322,6 +324,9 @@ bool MasterAdminServer::Start() {
                 // Metrics 巨行；enabled=0 时同样输出以显式表达"未启用"）。
                 if (snapshot.service) {
                     LOG(INFO) << snapshot.service->GetVSegmentStatusLogLine();
+                    const auto storage_line =
+                        snapshot.service->GetVSegmentStorageLogLine();
+                    if (!storage_line.empty()) LOG(INFO) << storage_line;
                 }
                 if (metric_report_stop_sem_.try_acquire_for(
                         std::chrono::seconds(metrics_log_interval_sec_))) {
@@ -493,6 +498,23 @@ std::string MasterAdminServer::BuildMetricsSummaryText() const {
         << ", service_ready=" << (snapshot.service_available ? "true" : "false")
         << ", master={" << MasterMetricManager::instance().get_summary_string()
         << "}, ha={" << HAMetricManager::instance().get_summary_string() << "}";
+    // Skip this section when vsegment is disabled (no writable capacity) to
+    // avoid empty noise. Field order matches the periodic "VSegment Storage"
+    // log line.
+    const auto& vsegment_metrics = vsegment::VSegmentMetrics::Instance();
+    const auto vsegment_capacity = vsegment_metrics.total_capacity_bytes();
+    if (vsegment_capacity > 0) {
+        oss << ", vsegment={"
+            << byte_size_to_string(vsegment_metrics.allocated_bytes()) << " / "
+            << byte_size_to_string(vsegment_capacity) << " (" << std::fixed
+            << std::setprecision(1) << vsegment_metrics.used_ratio() * 100.0
+            << "%), available="
+            << byte_size_to_string(vsegment_metrics.available_bytes())
+            << ", formed="
+            << byte_size_to_string(vsegment_metrics.formed_capacity_bytes())
+            << ", quota=" << byte_size_to_string(vsegment_metrics.quota_bytes())
+            << "}";
+    }
     if (snapshot.leader_view.has_value()) {
         oss << ", leader=" << snapshot.leader_view->leader_address
             << ", view_version=" << snapshot.leader_view->view_version;
