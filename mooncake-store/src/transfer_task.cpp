@@ -74,6 +74,31 @@ static bool ParseBoolEnv(const char* name, bool default_value) {
     return default_value;
 }
 
+// Batches of at least this many bytes log a transfer_trace line on completion.
+// 0 (the default) disables tracing. TENT UB reads the same variable for its
+// per-slice ub_task_trace line.
+static uint64_t TransferTraceMinBytes() {
+    static const uint64_t value = [] {
+        const char* raw = std::getenv("MC_TRANSFER_TRACE_MIN_BYTES");
+        if (raw == nullptr || *raw == '\0') return uint64_t{0};
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(raw, &end, 10);
+        if (*end != '\0') {
+            LOG(WARNING) << "Invalid MC_TRANSFER_TRACE_MIN_BYTES: " << raw
+                         << ", transfer tracing is disabled";
+            return uint64_t{0};
+        }
+        return static_cast<uint64_t>(parsed);
+    }();
+    return value;
+}
+
+static int64_t ElapsedUs(std::chrono::steady_clock::time_point begin,
+                         std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+        .count();
+}
+
 // Used by the polling loop, which also serves TENT batches in
 // USE_EVENT_DRIVEN_COMPLETION builds, so not compiled out there.
 // UB has dedicated posting/polling workers. Long Store-side busy waits can
@@ -1536,6 +1561,7 @@ void TransferEngineOperationState::check_task_status() {
     // could cause issues when freeBatchID is called in the destructor.
     bool all_terminated = true;
     std::vector<size_t> failed_task_ids;
+    if (trace_) ++trace_->polls;
 
     for (size_t i = 0; i < batch_size_; ++i) {
         TransferStatus status;
@@ -1632,9 +1658,47 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
     VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
             << static_cast<int>(error_code);
     result_.emplace(error_code);
+    if (trace_) log_trace(error_code);
+}
+
+void TransferEngineOperationState::log_trace(ErrorCode error_code) const {
+    const auto done = std::chrono::steady_clock::now();
+    const auto wait_start =
+        trace_->wait_start == std::chrono::steady_clock::time_point{}
+            ? trace_->submit_end
+            : trace_->wait_start;
+    const int64_t submit_us = trace_->open_segment_us + trace_->alloc_batch_us +
+                              trace_->build_requests_us +
+                              trace_->engine_submit_us;
+    const int64_t wait_us = ElapsedUs(wait_start, done);
+    const int64_t total_us = submit_us + ElapsedUs(trace_->submit_end, done);
+    const double mbps = total_us > 0 ? static_cast<double>(trace_->bytes) /
+                                           static_cast<double>(total_us)
+                                     : 0.0;
+    MC_LOG(INFO) << "transfer_trace trace_id=" << trace_->trace_id
+                 << " batch=0x" << std::hex << batch_id_ << std::dec
+                 << " op=" << (trace_->is_read ? "read" : "write")
+                 << " engine=" << (trace_->is_tent ? "tent" : "classic")
+                 << " requests=" << trace_->requests
+                 << " bytes=" << trace_->bytes
+                 << " open_segment_us=" << trace_->open_segment_us
+                 << " alloc_batch_us=" << trace_->alloc_batch_us
+                 << " build_requests_us=" << trace_->build_requests_us
+                 << " engine_submit_us=" << trace_->engine_submit_us
+                 << " submit_us=" << submit_us << " wait_start_delay_us="
+                 << ElapsedUs(trace_->submit_end, wait_start)
+                 << " wait_us=" << wait_us << " polls=" << trace_->polls
+                 << " total_us=" << total_us << " MBps=" << mbps
+                 << " status=" << static_cast<int>(error_code);
 }
 
 void TransferEngineOperationState::wait_for_completion() {
+    if (trace_) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (trace_->wait_start == std::chrono::steady_clock::time_point{}) {
+            trace_->wait_start = std::chrono::steady_clock::now();
+        }
+    }
     if (is_completed()) {
         return;
     }
@@ -2656,19 +2720,46 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests, TransferIntent intent) {
+    std::vector<TransferRequest>& requests, TransferIntent intent,
+    int64_t open_segment_us) {
     const size_t batch_size = requests.size();
 
     BatchID batch_id = INVALID_BATCH_ID;
     Status s;
 
+    std::unique_ptr<TransferEngineTrace> trace;
+    if (const uint64_t min_bytes = TransferTraceMinBytes(); min_bytes > 0) {
+        uint64_t bytes = 0;
+        for (const auto& request : requests) bytes += request.length;
+        if (bytes >= min_bytes) {
+            trace = std::make_unique<TransferEngineTrace>();
+            trace->trace_id = mooncake::logging::CurrentTraceId();
+            trace->bytes = bytes;
+            trace->requests = batch_size;
+            trace->is_read = !requests.empty() &&
+                             requests.front().opcode == TransferRequest::READ;
+            trace->open_segment_us = open_segment_us;
+        }
+    }
+    // Advances the phase clock; a no-op for batches that are not traced.
+    auto phase_start = trace ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
+    const auto end_phase = [&](int64_t TransferEngineTrace::* field) {
+        if (!trace) return;
+        const auto now = std::chrono::steady_clock::now();
+        (*trace).*field = ElapsedUs(phase_start, now);
+        phase_start = now;
+    };
+
 #ifdef USE_TENT
     if (tent_engine_) {
+        if (trace) trace->is_tent = true;
         batch_id = tent_engine_->allocateBatch(batch_size);
         if (batch_id == 0) {
             LOG(ERROR) << "Failed to allocate batch ID";
             return std::nullopt;
         }
+        end_phase(&TransferEngineTrace::alloc_batch_us);
         std::vector<tent::Request> tent_reqs;
         tent_reqs.reserve(requests.size());
         auto tent_intent = ToTentIntent(intent);
@@ -2697,6 +2788,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             tr.intent_type = *tent_intent;
             tent_reqs.push_back(tr);
         }
+        end_phase(&TransferEngineTrace::build_requests_us);
         auto tent_status = tent_engine_->submitTransfer(batch_id, tent_reqs);
         if (!tent_status.ok()) {
             LOG(ERROR) << "Failed to submit all transfers, error: "
@@ -2704,6 +2796,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             tent_engine_->freeBatch(batch_id);
             return std::nullopt;
         }
+        end_phase(&TransferEngineTrace::engine_submit_us);
     } else
 #endif
     {
@@ -2712,6 +2805,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             LOG(ERROR) << "Failed to allocate batch ID";
             return std::nullopt;
         }
+        end_phase(&TransferEngineTrace::alloc_batch_us);
         s = engine_.submitTransfer(batch_id, requests);
         if (!s.ok()) {
             LOG(ERROR) << "Failed to submit all transfers, error code is "
@@ -2719,10 +2813,15 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             engine_.freeBatchID(batch_id);
             return std::nullopt;
         }
+        end_phase(&TransferEngineTrace::engine_submit_us);
     }
 
     auto state = std::make_shared<TransferEngineOperationState>(
         engine_, batch_id, batch_size);
+    if (trace) {
+        trace->submit_end = std::chrono::steady_clock::now();
+        state->set_trace(std::move(trace));
+    }
 
     return TransferFuture(state);
 }
@@ -2736,6 +2835,10 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
                    << handle.buffer_address_;
         return std::nullopt;
     }
+    const bool trace_open = TransferTraceMinBytes() > 0;
+    const auto open_start = trace_open
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
     SegmentHandle seg = 0;
 #ifdef USE_TENT
     if (tent_engine_) {
@@ -2758,6 +2861,9 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
             return std::nullopt;
         }
     }
+    const int64_t open_segment_us =
+        trace_open ? ElapsedUs(open_start, std::chrono::steady_clock::now())
+                   : 0;
 
     // Create transfer requests
     std::vector<TransferRequest> requests;
@@ -2779,7 +2885,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         offset += slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests, intent);
+    return submitTransfer(requests, intent, open_segment_us);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(

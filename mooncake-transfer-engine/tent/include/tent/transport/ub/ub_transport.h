@@ -15,11 +15,14 @@ namespace mooncake::tent {
 namespace ub {
 class UrmaAdapter;
 struct UbTask;
+class UbTaskTraceReporter;
 }  // namespace ub
 
 struct UbSubBatch final : public Transport::SubBatch {
     std::vector<std::shared_ptr<ub::UbTask>> task_list;
     size_t max_size{0};
+    // Set only while MC_TRANSFER_TRACE_MIN_BYTES enables task tracing.
+    std::shared_ptr<ub::UbTaskTraceReporter> trace_reporter;
 
     size_t size() const override { return task_list.size(); }
 };

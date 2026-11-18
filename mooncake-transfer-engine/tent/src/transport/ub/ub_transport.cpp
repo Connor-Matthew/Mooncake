@@ -30,6 +30,7 @@
 #include "tent/transport/ub/params.h"
 #include "tent/transport/ub/quota.h"
 #include "tent/transport/ub/rail_monitor.h"
+#include "tent/transport/ub/task_trace.h"
 #include "tent/transport/ub/slice.h"
 #include "tent/transport/ub/urma_adapter.h"
 #include "tent/transport/ub/workers.h"
@@ -352,6 +353,12 @@ struct UbTransport::Impl {
         status = workers->start();
         if (!status.ok()) return failInstall(status);
 
+        if (ub::ubTaskTraceMinBytes() > 0) {
+            trace_reporter =
+                std::make_shared<ub::UbTaskTraceReporter>(local_topology);
+            LOG(INFO) << "UB task tracing enabled for requests of at least "
+                      << ub::ubTaskTraceMinBytes() << " bytes";
+        }
         installed.store(true, std::memory_order_release);
         return Status::OK();
     }
@@ -397,6 +404,7 @@ struct UbTransport::Impl {
             }
             workers.reset();
         }
+        trace_reporter.reset();
         if (endpoints) {
             auto status = endpoints->clear();
             if (!status.ok()) return status;
@@ -615,6 +623,7 @@ struct UbTransport::Impl {
     std::unique_ptr<ub::RailMonitor> rails;
     std::unique_ptr<ub::QuotaManager> quota;
     std::unique_ptr<ub::UbWorkers> workers;
+    std::shared_ptr<ub::UbTaskTraceReporter> trace_reporter;
 };
 
 UbTransport::UbTransport(std::shared_ptr<ub::UrmaAdapter> adapter)
@@ -667,6 +676,7 @@ Status UbTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     }
     ub_batch->max_size = max_size;
     ub_batch->task_list.reserve(max_size);
+    ub_batch->trace_reporter = impl_->trace_reporter;
     batch = ub_batch;
     return Status::OK();
 }
@@ -675,6 +685,13 @@ Status UbTransport::freeSubBatch(SubBatchRef& batch) {
     auto* ub_batch = dynamic_cast<UbSubBatch*>(batch);
     if (!ub_batch) {
         return Status::InvalidArgument("Invalid UB sub-batch" LOC_MARK);
+    }
+    // Uses the batch's own reporter reference: the engine calls this with its
+    // batch lock held, so taking lifecycle_mutex here could deadlock against
+    // the progress notification issued by submitTransferTasks().
+    if (ub_batch->trace_reporter) {
+        ub_batch->trace_reporter->submit(ub_batch->task_list,
+                                         ub_batch->progress_batch_id);
     }
     ub_batch->task_list.clear();
     delete ub_batch;
@@ -730,6 +747,10 @@ Status UbTransport::submitTransferTasks(
                     notify_progress(progress_batch_id);
                 }
             });
+        if (impl_->trace_reporter &&
+            request.length >= ub::ubTaskTraceMinBytes()) {
+            task->enableTrace();
+        }
         size_t offset = 0;
         while (offset < request.length) {
             const size_t length =

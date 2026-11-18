@@ -509,6 +509,9 @@ void UbWorkers::deferPending(const PendingSlice& pending) {
         if (pending.slice) pending.slice->requestCancellation();
         return;
     }
+    if (pending.task && pending.task->traceEnabled()) {
+        pending.slice->noteDeferred();
+    }
     // Capacity pressure is not a transfer failure. A short bounded backoff
     // prevents a posting lane from exhausting CPU while completions release
     // quota; releaseInflight() also wakes the queue condition variable.
@@ -861,6 +864,8 @@ void UbWorkers::processPending(const PendingSlice& pending,
         pending.slice->requestCancellation();
         return;
     }
+    const bool traced = pending.task && pending.task->traceEnabled();
+    if (traced) pending.slice->noteDequeued(steadyNowNs());
     Route route;
     auto status = buildRoute(pending, route);
     if (!status.ok()) {
@@ -870,6 +875,13 @@ void UbWorkers::processPending(const PendingSlice& pending,
             enqueueRetry(pending);
         }
         return;
+    }
+    if (traced && pending.slice->spec().request_offset == 0) {
+        const auto locations = Platform::getLoader().getLocation(
+            pending.slice->spec().local_address, 1, true);
+        pending.task->noteTraceLocations(
+            locations.empty() ? std::string() : locations.front().location,
+            route.remote_buffer->location);
     }
 
     std::shared_ptr<UbEndpoint> endpoint;
@@ -971,6 +983,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
     size_t posted_count = 0;
     status = jetty ? adapter_->post(jetty, {work}, posted_count)
                    : Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
+    if (traced) pending.slice->notePostReturned(steadyNowNs());
     if (posted_count == 1) {
         rail_monitor_->registerPath(path);
         if (!status.ok()) {

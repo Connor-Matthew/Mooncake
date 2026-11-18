@@ -363,6 +363,26 @@ class FilereadOperationState : public OperationState {
 /**
  * @brief Operation state for transfer engine operations
  */
+/**
+ * @brief Store-side timing of one transfer engine batch.
+ *
+ * Attached only to batches of at least MC_TRANSFER_TRACE_MIN_BYTES bytes.
+ */
+struct TransferEngineTrace {
+    uint64_t trace_id = 0;
+    uint64_t bytes = 0;
+    size_t requests = 0;
+    bool is_read = false;
+    bool is_tent = false;
+    int64_t open_segment_us = 0;
+    int64_t alloc_batch_us = 0;
+    int64_t build_requests_us = 0;
+    int64_t engine_submit_us = 0;
+    std::chrono::steady_clock::time_point submit_end;
+    std::chrono::steady_clock::time_point wait_start;
+    uint64_t polls = 0;
+};
+
 class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
@@ -384,6 +404,11 @@ class TransferEngineOperationState : public OperationState {
         return TransferStrategy::TRANSFER_ENGINE;
     }
 
+    // Must be called before the state is shared with any waiter.
+    void set_trace(std::unique_ptr<TransferEngineTrace> trace) {
+        trace_ = std::move(trace);
+    }
+
    private:
     /**
      * @brief Check the current completion status of the task, make sure to lock
@@ -394,11 +419,14 @@ class TransferEngineOperationState : public OperationState {
 
     void set_result_internal(ErrorCode error_code);
 
+    void log_trace(ErrorCode error_code) const;
+
     TransferEngine& engine_;
     mooncake::tent::TransferEngine* tent_engine_;
     BatchID batch_id_;
     size_t batch_size_;
     const int64_t start_ts_;
+    std::unique_ptr<TransferEngineTrace> trace_;
 };
 
 /**
@@ -1012,7 +1040,8 @@ class TransferSubmitter {
 
     std::optional<TransferFuture> submitTransfer(
         std::vector<TransferRequest>& requests,
-        TransferIntent intent = TransferIntent::kUnspecified);
+        TransferIntent intent = TransferIntent::kUnspecified,
+        int64_t open_segment_us = 0);
 };
 
 }  // namespace mooncake
