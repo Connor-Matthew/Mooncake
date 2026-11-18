@@ -1451,6 +1451,7 @@ int UrmaEndpoint::submitPostSend(
         for (int i = 0; i < wr_count; ++i) {
             fill_common(wr_list[i].base, slice_list[i], l_sge_list[i], r_sge_list[i]);
             wr_list[i].base.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1].base;
+            wr_list[i].base.flag.bs.has_drv_ext = 1;
             const auto chip_ids = selectBondingChipIds(
                 context_->electrical_network(),
                 slice_list[i]->ub.src_chip_id,
