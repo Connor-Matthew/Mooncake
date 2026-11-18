@@ -788,6 +788,7 @@ class RealClient : public PyClient {
         bool sampled = false;
         std::chrono::steady_clock::time_point t0;
         std::chrono::steady_clock::time_point t_query;
+        std::chrono::steady_clock::time_point t_prep;
         std::chrono::system_clock::time_point t0_wall;
     };
 
