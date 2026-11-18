@@ -159,9 +159,30 @@ static const char* transModeToString(urma_transport_mode_t mode) {
 static const char* bondingModeToString(int mode) {
     switch (mode) {
         case BONDP_BONDING_MODE_STANDALONE: return "STANDALONE";
+        case BONDP_BONDING_MODE_ACTIVE_BACKUP: return "ACTIVE-BACKUP";
         case BONDP_BONDING_MODE_BALANCE:    return "BALANCE";
         default:                            return "UNKNOWN";
     }
+}
+
+static bondp_bonding_mode_t resolveBondingMode(UrmaBondingMode mode,
+                                               bool multipath) {
+    switch (mode) {
+        case UrmaBondingMode::kBalance: return BONDP_BONDING_MODE_BALANCE;
+        case UrmaBondingMode::kStandalone:
+            return BONDP_BONDING_MODE_STANDALONE;
+        case UrmaBondingMode::kActiveBackup:
+            return BONDP_BONDING_MODE_ACTIVE_BACKUP;
+        case UrmaBondingMode::kAuto:
+            return multipath ? BONDP_BONDING_MODE_BALANCE
+                             : BONDP_BONDING_MODE_STANDALONE;
+    }
+    return BONDP_BONDING_MODE_STANDALONE;
+}
+
+static bondp_bonding_level_t resolveBondingLevel(UrmaBondingLevel level) {
+    return level == UrmaBondingLevel::kIodie ? BONDP_BONDING_LEVEL_IODIE
+                                             : BONDP_BONDING_LEVEL_PORT;
 }
 
 static const char* bondingLevelToString(int level) {
@@ -686,9 +707,8 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
         // bare UDMA devices. Match the bonding-device guard used by YLT.
         if (strncmp(devices[i]->name, "bonding", 7) == 0) {
             bondp_set_bonding_mode_in_t mode{
-                .bonding_mode = multipath() ? BONDP_BONDING_MODE_BALANCE
-                                           : BONDP_BONDING_MODE_STANDALONE,
-                .bonding_level = BONDP_BONDING_LEVEL_PORT};
+                .bonding_mode = resolveBondingMode(bondingMode(), multipath()),
+                .bonding_level = resolveBondingLevel(bondingLevel())};
             urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
                                   .len = sizeof(mode),
                                   .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
@@ -702,8 +722,8 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
                 urma_free_device_list(devices);
                 return ERR_CONTEXT;
             }
-            LOG(INFO) << "[multipath " << (multipath() ? "ON" : "OFF")
-                      << "] bonding mode set on " << device_name
+            LOG(INFO) << "[bonding] mode set on " << device_name
+                      << " multipath=" << (multipath() ? "ON" : "OFF")
                       << " bonding_mode=" << bondingModeToString(mode.bonding_mode)
                       << " bonding_level="
                       << bondingLevelToString(mode.bonding_level);

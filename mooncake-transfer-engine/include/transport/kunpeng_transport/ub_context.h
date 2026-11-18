@@ -170,6 +170,8 @@ class UbContext {
           active_(true),
           show_work_request_flushed_error_(false),
           multipath_(globalConfig().urma_bonding_multipath),
+          bonding_mode_(globalConfig().urma_bonding_mode),
+          bonding_level_(globalConfig().urma_bonding_level),
           numa_affinity_(globalConfig().ub_numa_affinity),
           electrical_network_(globalConfig().ub_electrical_network) {}
 
@@ -253,6 +255,10 @@ class UbContext {
     void set_active(bool flag) { active_ = flag; }
 
     bool multipath() const { return multipath_; }
+
+    UrmaBondingMode bondingMode() const { return bonding_mode_; }
+
+    UrmaBondingLevel bondingLevel() const { return bonding_level_; }
 
     bool numa_affinity() const { return numa_affinity_; }
 
@@ -415,6 +421,10 @@ class UbContext {
     bool show_work_request_flushed_error_;
 
     bool multipath_ = false;
+
+    UrmaBondingMode bonding_mode_ = UrmaBondingMode::kAuto;
+
+    UrmaBondingLevel bonding_level_ = UrmaBondingLevel::kPort;
 
     bool numa_affinity_ = false;
 

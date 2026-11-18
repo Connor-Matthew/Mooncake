@@ -60,6 +60,34 @@ bool parseBoolConfigEnv(const char* value, const char* env_name, bool& output) {
     return false;
 }
 
+std::string normalizeBondingToken(const char* value) {
+    std::string token = trimConfigToken(value);
+    std::transform(token.begin(), token.end(), token.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::toupper(c));
+                   });
+    std::replace(token.begin(), token.end(), '_', '-');
+    return token;
+}
+
+const char* bondingModeName(UrmaBondingMode mode) {
+    switch (mode) {
+        case UrmaBondingMode::kAuto: return "AUTO";
+        case UrmaBondingMode::kBalance: return "BALANCE";
+        case UrmaBondingMode::kStandalone: return "STANDALONE";
+        case UrmaBondingMode::kActiveBackup: return "ACTIVE-BACKUP";
+    }
+    return "UNKNOWN";
+}
+
+const char* bondingLevelName(UrmaBondingLevel level) {
+    switch (level) {
+        case UrmaBondingLevel::kIodie: return "IODIE";
+        case UrmaBondingLevel::kPort: return "PORT";
+    }
+    return "UNKNOWN";
+}
+
 void parseNicPeerAffinity(
     const char* env,
     std::unordered_map<std::string, std::vector<std::string>>& affinity) {
@@ -716,6 +744,42 @@ void loadGlobalConfig(GlobalConfig& config) {
                    "MC_URMA_BONDING_MULTIPATH_ENABLE, it should be true|1|on";
     }
 
+    const char* urma_bonding_mode = std::getenv("MC_URMA_BONDING_MODE");
+    if (urma_bonding_mode && *urma_bonding_mode) {
+        const auto val = normalizeBondingToken(urma_bonding_mode);
+        if (val == "BALANCE") {
+            config.urma_bonding_mode = UrmaBondingMode::kBalance;
+        } else if (val == "STANDALONE") {
+            config.urma_bonding_mode = UrmaBondingMode::kStandalone;
+        } else if (val == "ACTIVE-BACKUP") {
+            config.urma_bonding_mode = UrmaBondingMode::kActiveBackup;
+        } else {
+            LOG(WARNING) << "Ignore MC_URMA_BONDING_MODE='"
+                         << urma_bonding_mode
+                         << "': expected BALANCE|STANDALONE|ACTIVE-BACKUP";
+        }
+        if (val == "BALANCE" || val == "STANDALONE" ||
+            val == "ACTIVE-BACKUP") {
+            LOG(INFO) << "MC_URMA_BONDING_MODE is " << val;
+        }
+    }
+
+    const char* urma_bonding_level = std::getenv("MC_URMA_BONDING_LEVEL");
+    if (urma_bonding_level && *urma_bonding_level) {
+        const auto val = normalizeBondingToken(urma_bonding_level);
+        if (val == "IODIE") {
+            config.urma_bonding_level = UrmaBondingLevel::kIodie;
+        } else if (val == "PORT") {
+            config.urma_bonding_level = UrmaBondingLevel::kPort;
+        } else {
+            LOG(WARNING) << "Ignore MC_URMA_BONDING_LEVEL='"
+                         << urma_bonding_level << "': expected IODIE|PORT";
+        }
+        if (val == "IODIE" || val == "PORT") {
+            LOG(INFO) << "MC_URMA_BONDING_LEVEL is " << val;
+        }
+    }
+
     const char* ub_numa_affinity_enable =
         std::getenv("MC_UB_NUMA_AFFINITY_ENABLE");
     if (ub_numa_affinity_enable && *ub_numa_affinity_enable) {
@@ -846,6 +910,10 @@ void dumpGlobalConfig() {
               << (config.urma_bonding_balance ? "true" : "false");
     LOG(INFO) << "urma_bonding_multipath = "
               << (config.urma_bonding_multipath ? "true" : "false");
+    LOG(INFO) << "urma_bonding_mode = "
+              << bondingModeName(config.urma_bonding_mode);
+    LOG(INFO) << "urma_bonding_level = "
+              << bondingLevelName(config.urma_bonding_level);
     LOG(INFO) << "ub_numa_affinity = "
               << (config.ub_numa_affinity ? "true" : "false");
     LOG(INFO) << "ub_electrical_network = "

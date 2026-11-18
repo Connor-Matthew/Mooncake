@@ -28,6 +28,18 @@
 
 namespace mooncake {
 
+enum class UrmaBondingMode {
+    kAuto,
+    kBalance,
+    kStandalone,
+    kActiveBackup,
+};
+
+enum class UrmaBondingLevel {
+    kIodie,
+    kPort,
+};
+
 enum class EndpointStoreType {
     FIFO = 0,
     SIEVE = 1,
@@ -147,6 +159,13 @@ struct GlobalConfig {
     // enable bonding multipath mode; default off (STANDALONE); override via
     // MC_URMA_BONDING_MULTIPATH_ENABLE
     bool urma_bonding_multipath = false;
+    // Device bonding mode. kAuto preserves the legacy behavior derived from
+    // urma_bonding_multipath. Override via MC_URMA_BONDING_MODE with
+    // BALANCE, STANDALONE, or ACTIVE-BACKUP.
+    UrmaBondingMode urma_bonding_mode = UrmaBondingMode::kAuto;
+    // Device bonding level; override via MC_URMA_BONDING_LEVEL with IODIE or
+    // PORT. PORT preserves the current default.
+    UrmaBondingLevel urma_bonding_level = UrmaBondingLevel::kPort;
     // enable UB NUMA affinity: store splits the global segment into one
     // segment per NIC-NUMA node, and transfers pin src/dst chip by NUMA.
     // Independent from urma_bonding_multipath; default off; override via
