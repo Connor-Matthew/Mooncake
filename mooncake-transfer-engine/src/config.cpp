@@ -728,6 +728,22 @@ void loadGlobalConfig(GlobalConfig& config) {
                             "MC_UB_NUMA_AFFINITY_ENABLE, it should be true|1|on";
     }
 
+    const char* ub_electrical_network_enable =
+        std::getenv("MC_UB_ELECTRICAL_NETWORK_ENABLE");
+    if (ub_electrical_network_enable && *ub_electrical_network_enable) {
+        std::string val(ub_electrical_network_enable);
+        if (val == "true" || val == "1" || val == "on") {
+            config.ub_electrical_network = true;
+        } else if (val == "false" || val == "0" || val == "off") {
+            config.ub_electrical_network = false;
+        } else {
+            LOG(WARNING)
+                << "Ignore value from environment variable "
+                   "MC_UB_ELECTRICAL_NETWORK_ENABLE, it should be "
+                   "true|1|on|false|0|off";
+        }
+    }
+
     const char* mlx5_qp_lag_port_balance_env =
         std::getenv("MC_MLX5_QP_LAG_PORT_BALANCE");
     if (mlx5_qp_lag_port_balance_env && *mlx5_qp_lag_port_balance_env) {
@@ -828,6 +844,12 @@ void dumpGlobalConfig() {
     LOG(INFO) << "urma_trans_mode = " << config.urma_trans_mode;
     LOG(INFO) << "urma_bonding_balance = "
               << (config.urma_bonding_balance ? "true" : "false");
+    LOG(INFO) << "urma_bonding_multipath = "
+              << (config.urma_bonding_multipath ? "true" : "false");
+    LOG(INFO) << "ub_numa_affinity = "
+              << (config.ub_numa_affinity ? "true" : "false");
+    LOG(INFO) << "ub_electrical_network = "
+              << (config.ub_electrical_network ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {

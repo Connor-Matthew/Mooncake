@@ -297,6 +297,13 @@ add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME config_test COMMAND config_test)
 
+add_executable(ub_bonding_policy_test
+               ${WORKSPACE}/ub_bonding_policy_test.cpp)
+target_link_libraries(ub_bonding_policy_test PUBLIC gtest gtest_main)
+target_include_directories(
+  ub_bonding_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME ub_bonding_policy_test COMMAND ub_bonding_policy_test)
+
 add_executable(rdma_gid_probe_test ${WORKSPACE}/rdma_gid_probe_test.cpp)
 target_link_libraries(rdma_gid_probe_test PUBLIC transfer_engine gtest
                                                  gtest_main)

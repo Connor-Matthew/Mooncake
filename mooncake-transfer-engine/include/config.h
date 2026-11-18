@@ -152,6 +152,11 @@ struct GlobalConfig {
     // Independent from urma_bonding_multipath; default off; override via
     // MC_UB_NUMA_AFFINITY_ENABLE
     bool ub_numa_affinity = false;
+    // Electrical networking routes both ends through the remote segment chip;
+    // optical networking keeps the local/remote segment chip pair. Default to
+    // electrical for backward compatibility; override via
+    // MC_UB_ELECTRICAL_NETWORK_ENABLE.
+    bool ub_electrical_network = true;
 };
 
 struct RpcCommunicatorConfig {

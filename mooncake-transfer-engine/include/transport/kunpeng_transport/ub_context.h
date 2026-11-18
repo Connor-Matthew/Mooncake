@@ -170,7 +170,8 @@ class UbContext {
           active_(true),
           show_work_request_flushed_error_(false),
           multipath_(globalConfig().urma_bonding_multipath),
-          numa_affinity_(globalConfig().ub_numa_affinity) {}
+          numa_affinity_(globalConfig().ub_numa_affinity),
+          electrical_network_(globalConfig().ub_electrical_network) {}
 
     virtual ~UbContext() = default;
 
@@ -254,6 +255,8 @@ class UbContext {
     bool multipath() const { return multipath_; }
 
     bool numa_affinity() const { return numa_affinity_; }
+
+    bool electrical_network() const { return electrical_network_; }
 
     // EndPoint Management
     std::shared_ptr<UbEndPoint> endpoint() {
@@ -414,6 +417,8 @@ class UbContext {
     bool multipath_ = false;
 
     bool numa_affinity_ = false;
+
+    bool electrical_network_ = true;
 };
 }  // namespace mooncake
 

@@ -26,6 +26,7 @@
 #include "common/serialization.h"
 #include "mooncake_logging.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
+#include "transport/kunpeng_transport/urma/bonding_policy.h"
 #include "transport/kunpeng_transport/urma/urma_eid.h"
 #define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
 #define SPDIAG_PROGRAM_NAME "mooncake_store"
@@ -687,8 +688,7 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
             bondp_set_bonding_mode_in_t mode{
                 .bonding_mode = multipath() ? BONDP_BONDING_MODE_BALANCE
                                            : BONDP_BONDING_MODE_STANDALONE,
-                .bonding_level = multipath() ? BONDP_BONDING_LEVEL_IODIE
-                                            : BONDP_BONDING_LEVEL_PORT};
+                .bonding_level = BONDP_BONDING_LEVEL_PORT};
             urma_user_ctl_in_t in{.addr = reinterpret_cast<uint64_t>(&mode),
                                   .len = sizeof(mode),
                                   .opcode = BONDP_USER_CTL_SET_BONDING_MODE};
@@ -1427,6 +1427,10 @@ int UrmaEndpoint::submitPostSend(
             numa_log_counter.fetch_add(1, std::memory_order_relaxed) %
                     kNumaAffinitySampleInterval ==
                 0) {
+            const auto sample_chip_ids = selectBondingChipIds(
+                context_->electrical_network(),
+                slice_list[0]->ub.src_chip_id,
+                slice_list[0]->ub.dst_chip_id);
             VLOG(2) << "[numa_affinity] wr_sample nic=" << peer_nic_path_
                     << " trace_id=" << slice_list[0]->trace_id
                     << " target_id=" << slice_list[0]->target_id
@@ -1436,18 +1440,23 @@ int UrmaEndpoint::submitPostSend(
                             ? "READ"
                             : "WRITE")
                     << " wr_count=" << wr_count
-                    << " src_chip=" << (int)slice_list[0]->ub.src_chip_id
-                    << " dst_chip=" << (int)slice_list[0]->ub.dst_chip_id;
+                    << " network="
+                    << (context_->electrical_network() ? "electrical"
+                                                       : "optical")
+                    << " src_chip=" << (int)sample_chip_ids.src
+                    << " dst_chip=" << (int)sample_chip_ids.dst;
         }
         bondp_jfs_wr_t wr_list[wr_count];
         memset(wr_list, 0, sizeof(bondp_jfs_wr_t) * wr_count);
         for (int i = 0; i < wr_count; ++i) {
             fill_common(wr_list[i].base, slice_list[i], l_sge_list[i], r_sge_list[i]);
             wr_list[i].base.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1].base;
-            // src/dst 均使用远端 segment 所在 chip，避免跨 chip 传输。
-            const uint8_t remote_chip_id = slice_list[i]->ub.dst_chip_id;
-            wr_list[i].src_chip_id = remote_chip_id;
-            wr_list[i].dst_chip_id = remote_chip_id;
+            const auto chip_ids = selectBondingChipIds(
+                context_->electrical_network(),
+                slice_list[i]->ub.src_chip_id,
+                slice_list[i]->ub.dst_chip_id);
+            wr_list[i].src_chip_id = chip_ids.src;
+            wr_list[i].dst_chip_id = chip_ids.dst;
         }
         rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0].base, &bad_wr);
         if (rc) {

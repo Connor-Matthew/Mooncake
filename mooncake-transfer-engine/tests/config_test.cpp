@@ -24,6 +24,59 @@
 namespace mooncake {
 namespace {
 
+class UbElectricalNetworkEnvTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        if (const char* value =
+                std::getenv("MC_UB_ELECTRICAL_NETWORK_ENABLE")) {
+            saved_ = value;
+        }
+        ::unsetenv("MC_UB_ELECTRICAL_NETWORK_ENABLE");
+    }
+    void TearDown() override {
+        if (saved_) {
+            ::setenv("MC_UB_ELECTRICAL_NETWORK_ENABLE", saved_->c_str(), 1);
+        } else {
+            ::unsetenv("MC_UB_ELECTRICAL_NETWORK_ENABLE");
+        }
+    }
+    std::optional<std::string> saved_;
+};
+
+TEST_F(UbElectricalNetworkEnvTest, DefaultsToElectricalNetwork) {
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_TRUE(config.ub_electrical_network);
+}
+
+TEST_F(UbElectricalNetworkEnvTest, AcceptsElectricalValues) {
+    for (const char* value : {"true", "1", "on"}) {
+        ASSERT_EQ(::setenv("MC_UB_ELECTRICAL_NETWORK_ENABLE", value, 1), 0);
+        GlobalConfig config;
+        config.ub_electrical_network = false;
+        loadGlobalConfig(config);
+        EXPECT_TRUE(config.ub_electrical_network);
+    }
+}
+
+TEST_F(UbElectricalNetworkEnvTest, AcceptsOpticalValues) {
+    for (const char* value : {"false", "0", "off"}) {
+        ASSERT_EQ(::setenv("MC_UB_ELECTRICAL_NETWORK_ENABLE", value, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_FALSE(config.ub_electrical_network);
+    }
+}
+
+TEST_F(UbElectricalNetworkEnvTest, InvalidValuePreservesConfiguration) {
+    ASSERT_EQ(
+        ::setenv("MC_UB_ELECTRICAL_NETWORK_ENABLE", "invalid", 1), 0);
+    GlobalConfig config;
+    config.ub_electrical_network = false;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.ub_electrical_network);
+}
+
 class EidIndexEnvTest : public ::testing::Test {
    protected:
     void SetUp() override {
