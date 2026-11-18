@@ -267,8 +267,9 @@ struct UbTransport::Impl {
             // max_message_size (dev_cap.max_msg_size) caps SEND/RECV messages
             // and is far smaller on some devices; clamping to it pinned
             // slice_size regardless of configuration.
-            clamp_slice(device_caps.max_read_size);
-            clamp_slice(device_caps.max_write_size);
+            // [TEST] skip device-limit clamp so slice_size=1M takes effect
+            // clamp_slice(device_caps.max_read_size);
+            // clamp_slice(device_caps.max_write_size);
             if (device_caps.max_jetty_depth != 0) {
                 jetty_options.depth =
                     std::min(jetty_options.depth, device_caps.max_jetty_depth);
