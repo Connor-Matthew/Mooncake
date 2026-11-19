@@ -494,6 +494,89 @@ TEST(UbTeardown, FailedPartialImportIsRetainedUntilClear) {
     EXPECT_TRUE(context->shutdown().ok());
 }
 
+TEST(UbBuffers, LocalLocationReusesSingleLocationRegistration) {
+    auto adapter = std::make_shared<FailOnceAdapter>();
+    auto context = makeActiveContext(adapter, 0);
+    UbBufferManager manager(adapter, {context});
+
+    auto single = makeLocalBuffer(0x10000);
+    single.location = "cpu:1";
+    auto wildcard = makeLocalBuffer(0x20000);
+    wildcard.location = kWildcardLocation;
+    auto spanning = makeLocalBuffer(0x30000);
+    spanning.regions = {Region{2048, "cpu:0"}, Region{2048, "cpu:1"}};
+    ASSERT_TRUE(manager.addBuffer(single, MemoryOptions{}).ok());
+    ASSERT_TRUE(manager.addBuffer(wildcard, MemoryOptions{}).ok());
+    ASSERT_TRUE(manager.addBuffer(spanning, MemoryOptions{}).ok());
+
+    EXPECT_EQ(manager.localLocation(0x10000), "cpu:1");
+    EXPECT_EQ(manager.localLocation(0x10000 + 4095), "cpu:1");
+    // Unregistered, wildcard and multi-location buffers make the caller probe.
+    EXPECT_EQ(manager.localLocation(0x10000 + 4096), "");
+    EXPECT_EQ(manager.localLocation(0x100), "");
+    EXPECT_EQ(manager.localLocation(0x20000), "");
+    EXPECT_EQ(manager.localLocation(0x30000), "");
+
+    ASSERT_TRUE(manager.removeBuffer(single).ok());
+    EXPECT_EQ(manager.localLocation(0x10000), "");
+    EXPECT_TRUE(manager.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
+}
+
+TEST(UbBuffers, ImportRemoteWithDecodedMetadataMatchesEncodedPath) {
+    auto adapter = std::make_shared<FailOnceAdapter>();
+    auto context = makeActiveContext(adapter, 0);
+    UbBufferManager manager(adapter, {context});
+
+    UbBufferMetadata metadata;
+    metadata.generation = 7;
+    metadata.base = 0x1000;
+    metadata.length = 0x1000;
+    metadata.permission = kGlobalReadWrite;
+    metadata.segments.push_back(UbBufferSegmentMetadata{
+        9, "remote", makeDevice(9).eid, 9,
+        makeDescriptor(metadata.base, metadata.length)});
+    BufferDesc remote;
+    remote.addr = metadata.base;
+    remote.length = metadata.length;
+    ASSERT_TRUE(encodeBufferMetadata(metadata,
+                                     remote.transport_attrs[TransportType::UB])
+                    .ok());
+
+    ImportedSegmentRef decoded;
+    ASSERT_TRUE(manager
+                    .importRemote(123, 0, 9, remote, metadata, Request::READ,
+                                  metadata.base, 64, decoded)
+                    .ok());
+    EXPECT_EQ(decoded.generation, 7u);
+    // Both overloads share one import cache entry.
+    ImportedSegmentRef encoded;
+    ASSERT_TRUE(manager
+                    .importRemote(123, 0, 9, remote, Request::READ,
+                                  metadata.base, 64, encoded)
+                    .ok());
+    EXPECT_EQ(encoded.segment, decoded.segment);
+    EXPECT_EQ(manager.importedSegmentCount(), 1u);
+
+    // The decoded overload keeps the BufferDesc consistency and range checks.
+    auto mismatched = metadata;
+    mismatched.length = 0x800;
+    ImportedSegmentRef rejected;
+    EXPECT_TRUE(manager
+                    .importRemote(123, 0, 9, remote, mismatched, Request::READ,
+                                  metadata.base, 64, rejected)
+                    .IsNeedsRefreshCache());
+    EXPECT_FALSE(manager
+                     .importRemote(123, 0, 9, remote, metadata, Request::READ,
+                                   metadata.base + 0x1000 - 32, 64, rejected)
+                     .ok());
+
+    decoded.segment.reset();
+    encoded.segment.reset();
+    EXPECT_TRUE(manager.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
+}
+
 TEST(UbTeardown, ContextShutdownRetainsFailedJfcBeforeClosingContext) {
     auto adapter = std::make_shared<FailOnceAdapter>();
     auto context = makeActiveContext(adapter, 0);

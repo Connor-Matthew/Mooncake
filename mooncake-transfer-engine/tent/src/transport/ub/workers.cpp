@@ -64,8 +64,10 @@ inline void cpuRelax() {
 struct UbWorkers::Route {
     SegmentDescRef pin;
     BufferDesc* remote_buffer{nullptr};
+    // Decoded once per slice and reused by device ordering and the import.
     UbBufferMetadata metadata;
     std::vector<Topology::NicID> remote_devices;
+    std::string local_location{kWildcardLocation};
 };
 
 struct UbWorkers::Inflight {
@@ -627,7 +629,8 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
             if (!status.ok()) return status;
             route.remote_buffer = buffer;
             route.metadata = std::move(metadata);
-            route.remote_devices = orderedRemoteDevices(*segment, *buffer);
+            route.remote_devices =
+                orderedRemoteDevices(*segment, *buffer, route.metadata);
             if (route.remote_devices.empty()) {
                 return Status::DeviceNotFound(
                     "UB target has no active advertised device" LOC_MARK);
@@ -636,15 +639,23 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
         });
 }
 
+std::string UbWorkers::localLocationOf(const PendingSlice& pending) const {
+    // The registration already probed the buffer; reuse that unless it
+    // spanned several locations, so the common path makes no NUMA syscall.
+    auto location = buffers_->localLocation(
+        reinterpret_cast<uint64_t>(pending.slice->spec().local_address));
+    if (!location.empty()) return location;
+    auto locations = Platform::getLoader().getLocation(
+        pending.slice->spec().local_address, 1, true);
+    if (!locations.empty()) return locations.front().location;
+    return kWildcardLocation;
+}
+
 std::vector<UbWorkers::LocalDeviceCandidate> UbWorkers::orderedLocalDevices(
-    const PendingSlice& pending) const {
+    const PendingSlice& pending, const std::string& location) const {
     std::vector<LocalDeviceCandidate> ordered;
     std::unordered_set<Topology::NicID> seen;
     std::unordered_map<Topology::NicID, size_t> device_rank;
-    std::string location = kWildcardLocation;
-    auto locations = Platform::getLoader().getLocation(
-        pending.slice->spec().local_address, 1, true);
-    if (!locations.empty()) location = locations.front().location;
 
     auto append = [&](Topology::NicID id) {
         auto found = context_by_topology_id_.find(id);
@@ -692,12 +703,9 @@ std::vector<UbWorkers::LocalDeviceCandidate> UbWorkers::orderedLocalDevices(
 }
 
 std::vector<Topology::NicID> UbWorkers::orderedRemoteDevices(
-    const SegmentDesc& segment, const BufferDesc& buffer) {
+    const SegmentDesc& segment, const BufferDesc& buffer,
+    const UbBufferMetadata& metadata) {
     std::vector<Topology::NicID> ordered;
-    auto attr = buffer.transport_attrs.find(TransportType::UB);
-    if (attr == buffer.transport_attrs.end()) return ordered;
-    UbBufferMetadata metadata;
-    if (!decodeBufferMetadata(attr->second, metadata).ok()) return ordered;
     std::unordered_set<Topology::NicID> advertised;
     for (const auto& item : metadata.segments) {
         advertised.insert(item.topology_id);
@@ -743,7 +751,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
         QuotaAvailability capacity;
     };
 
-    const auto local_devices = orderedLocalDevices(pending);
+    const auto local_devices =
+        orderedLocalDevices(pending, route.local_location);
     if (route.remote_devices.empty()) {
         return Status::DeviceNotFound("No usable UB posting path" LOC_MARK);
     }
@@ -945,13 +954,14 @@ void UbWorkers::processPending(const PendingSlice& pending,
         }
         return;
     }
+    route.local_location = localLocationOf(pending);
     if (traced && pending.slice->spec().request_offset == 0) {
-        const auto locations = Platform::getLoader().getLocation(
-            pending.slice->spec().local_address, 1, true);
         pending.task->noteTraceLocations(
-            locations.empty() ? std::string() : locations.front().location,
+            route.local_location == kWildcardLocation ? std::string()
+                                                      : route.local_location,
             route.remote_buffer->location);
     }
+    const uint64_t route_ready_ns = traced ? steadyNowNs() : 0;
 
     std::shared_ptr<UbEndpoint> endpoint;
     UbPostPath path;
@@ -970,6 +980,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
         }
         return;
     }
+    const uint64_t path_selected_ns = traced ? steadyNowNs() : 0;
 
     LocalSegmentRef local;
     status = buffers_->findLocal(
@@ -983,7 +994,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
     ImportedSegmentRef remote;
     status = buffers_->importRemote(pending.target_id, path.local_topology_id,
                                     path.remote_device_id, *route.remote_buffer,
-                                    pending.opcode,
+                                    route.metadata, pending.opcode,
                                     pending.slice->spec().remote_address,
                                     pending.slice->spec().length, remote);
     if (!status.ok()) {
@@ -999,6 +1010,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
         }
         return;
     }
+    const uint64_t segments_ready_ns = traced ? steadyNowNs() : 0;
 
     if (!endpoint->tryAcquireOutstanding(pending.slice->spec().length)) {
         (void)quota_->release(reservation);
@@ -1028,6 +1040,10 @@ void UbWorkers::processPending(const PendingSlice& pending,
         inflight->posted_ns,
         static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL);
 
+    if (traced) {
+        pending.slice->notePrepareCheckpoints(route_ready_ns, path_selected_ns,
+                                              segments_ready_ns);
+    }
     if (!pending.slice->tryCommitPost(*attempt, inflight->posted_ns)) {
         endpoint->releaseOutstanding(pending.slice->spec().length);
         (void)quota_->release(reservation);

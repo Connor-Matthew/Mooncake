@@ -211,10 +211,14 @@ class UbWorkers final {
     void failUnposted(const PendingSlice& pending,
                       TransferStatusEnum outcome = FAILED);
     uint64_t nextCompletionToken();
+    // `location` is the local buffer's location as resolved by
+    // localLocationOf().
     std::vector<LocalDeviceCandidate> orderedLocalDevices(
-        const PendingSlice& pending) const;
+        const PendingSlice& pending, const std::string& location) const;
+    std::string localLocationOf(const PendingSlice& pending) const;
     static std::vector<Topology::NicID> orderedRemoteDevices(
-        const SegmentDesc& segment, const BufferDesc& buffer);
+        const SegmentDesc& segment, const BufferDesc& buffer,
+        const UbBufferMetadata& metadata);
 
     std::shared_ptr<UrmaAdapter> adapter_;
     std::vector<UbContextPtr> contexts_;

@@ -68,6 +68,10 @@ inline UbTraceLatency summarizeUbTraceLatency(std::vector<uint64_t> samples) {
 // Formats one finished task as a single key=value line. Phases of a slice:
 //   queue_us   enqueued -> taken by a posting worker (includes quota deferrals)
 //   prepare_us taken -> ready to post (route, endpoint, quota, segment lookup)
+//     prep_route_us    taken -> route and local location resolved
+//     prep_select_us   -> endpoint, rail and quota selected
+//     prep_segments_us -> local segment found and remote segment imported
+//     prep_commit_us   -> attempt committed, ready to post
 //   post_us    duration of the URMA post call
 //   device_us  post returned -> completion handled (device time plus poller
 //              wake-up delay)
@@ -84,6 +88,7 @@ inline std::string formatUbTaskTrace(
 
     const auto snapshot = task.snapshot();
     std::vector<uint64_t> queue, prepare, post, device;
+    std::vector<uint64_t> prep_route, prep_select, prep_segments, prep_commit;
     uint64_t first_queued = 0, first_post = 0, last_post = 0;
     uint64_t first_complete = 0, last_complete = 0;
     uint64_t retries = 0, defers = 0;
@@ -97,6 +102,15 @@ inline std::string formatUbTaskTrace(
         if (item.state != UbSliceState::kCompleted) continue;
         queue.push_back(delta(item.queued_ns, item.dequeued_ns));
         prepare.push_back(delta(item.dequeued_ns, item.posted_ns));
+        if (item.segments_ready_ns != 0) {
+            prep_route.push_back(delta(item.dequeued_ns, item.route_ready_ns));
+            prep_select.push_back(
+                delta(item.route_ready_ns, item.path_selected_ns));
+            prep_segments.push_back(
+                delta(item.path_selected_ns, item.segments_ready_ns));
+            prep_commit.push_back(
+                delta(item.segments_ready_ns, item.posted_ns));
+        }
         post.push_back(delta(item.posted_ns, item.post_returned_ns));
         device.push_back(delta(item.post_returned_ns, item.terminal_ns));
         first_queued = first_queued == 0
@@ -145,6 +159,10 @@ inline std::string formatUbTaskTrace(
         << " last_complete_us=" << since_start(last_complete);
     write_latency("queue_us", queue);
     write_latency("prepare_us", prepare);
+    write_latency("prep_route_us", prep_route);
+    write_latency("prep_select_us", prep_select);
+    write_latency("prep_segments_us", prep_segments);
+    write_latency("prep_commit_us", prep_commit);
     write_latency("post_us", post);
     write_latency("device_us", device);
     out << " retries=" << retries << " defers=" << defers << " rails=";
