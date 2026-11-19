@@ -292,6 +292,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
                      "ACTIVE-BACKUP");
     setBondingConfig(config, "MC_URMA_BONDING_LEVEL",
                      "transports/ub/bonding_level", "IODIE", "PORT");
+    setBondingConfig(config, "MC_URMA_TRANS_MODE", "transports/ub/trans_mode",
+                     "RC", "RM", "UM");
     // Classic TE custom topology file path. Maps into TENT config so the same
     // MC_CUSTOM_TOPO_JSON works under MC_USE_TENT. Inline
     // topology/priority_matrix in MC_TENT_CONF still takes precedence.

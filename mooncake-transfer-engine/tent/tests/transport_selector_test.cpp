@@ -399,7 +399,7 @@ TEST(TopologyTest, UbDeviceAttributesRoundTripThroughJson) {
 
 TEST(ControlPlaneTest, UbBootstrapJsonRoundTripsNativeIdentity) {
     UbBootstrapDesc source;
-    source.protocol_version = 1;
+    source.protocol_version = UbBootstrapDesc::kProtocolVersion;
     source.segment_name = "peer-segment";
     source.local_nic_path = "local/ub-device-0/eid-2";
     source.peer_nic_path = "peer/ub-device-1/eid-3";
@@ -409,6 +409,8 @@ TEST(ControlPlaneTest, UbBootstrapJsonRoundTripsNativeIdentity) {
     source.local_eid = "e1:02:03:04:05:06:07:08";
     source.jetty_ids = {11, 12};
     source.jetty_uasids = {21, 22};
+    source.jetty_contexts = {"context-11", "context-12"};
+    source.trans_mode = "RM";
     source.endpoint_generation = 41;
     source.segment_generation = 42;
     source.capabilities = {"read", "write"};
@@ -425,6 +427,8 @@ TEST(ControlPlaneTest, UbBootstrapJsonRoundTripsNativeIdentity) {
     EXPECT_EQ(parsed.local_eid, source.local_eid);
     EXPECT_EQ(parsed.jetty_ids, source.jetty_ids);
     EXPECT_EQ(parsed.jetty_uasids, source.jetty_uasids);
+    EXPECT_EQ(parsed.jetty_contexts, source.jetty_contexts);
+    EXPECT_EQ(parsed.trans_mode, source.trans_mode);
     EXPECT_EQ(parsed.endpoint_generation, source.endpoint_generation);
     EXPECT_EQ(parsed.segment_generation, source.segment_generation);
     EXPECT_EQ(parsed.capabilities, source.capabilities);
@@ -432,8 +436,10 @@ TEST(ControlPlaneTest, UbBootstrapJsonRoundTripsNativeIdentity) {
 }
 
 TEST(ControlPlaneTest, UbBootstrapJsonDefaultsOptionalFields) {
-    const auto parsed = json{{"protocol_version", 1}}.get<UbBootstrapDesc>();
-    EXPECT_EQ(parsed.protocol_version, 1u);
+    const auto parsed =
+        json{{"protocol_version", UbBootstrapDesc::kProtocolVersion}}
+            .get<UbBootstrapDesc>();
+    EXPECT_EQ(parsed.protocol_version, UbBootstrapDesc::kProtocolVersion);
     EXPECT_TRUE(parsed.segment_name.empty());
     EXPECT_TRUE(parsed.local_nic_path.empty());
     EXPECT_TRUE(parsed.peer_nic_path.empty());
@@ -443,6 +449,8 @@ TEST(ControlPlaneTest, UbBootstrapJsonDefaultsOptionalFields) {
     EXPECT_TRUE(parsed.local_eid.empty());
     EXPECT_TRUE(parsed.jetty_ids.empty());
     EXPECT_TRUE(parsed.jetty_uasids.empty());
+    EXPECT_TRUE(parsed.jetty_contexts.empty());
+    EXPECT_TRUE(parsed.trans_mode.empty());
     EXPECT_EQ(parsed.endpoint_generation, 0u);
     EXPECT_EQ(parsed.segment_generation, 0u);
     EXPECT_TRUE(parsed.capabilities.empty());
@@ -452,7 +460,7 @@ TEST(ControlPlaneTest, UbBootstrapJsonDefaultsOptionalFields) {
 TEST(ControlPlaneTest, UbBootstrapJsonRejectsMissingOrUnknownVersion) {
     EXPECT_THROW((void)json::object().get<UbBootstrapDesc>(),
                  std::invalid_argument);
-    const json unknown_version{{"protocol_version", 2}};
+    const json unknown_version{{"protocol_version", 1}};
     EXPECT_THROW((void)unknown_version.get<UbBootstrapDesc>(),
                  std::invalid_argument);
 }

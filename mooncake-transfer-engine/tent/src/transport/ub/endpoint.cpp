@@ -34,6 +34,8 @@ bool samePeer(const UbBootstrapDesc& lhs, const UbBootstrapDesc& rhs) {
     return lhs.protocol_version == rhs.protocol_version &&
            lhs.local_eid == rhs.local_eid && lhs.jetty_ids == rhs.jetty_ids &&
            lhs.jetty_uasids == rhs.jetty_uasids &&
+           lhs.jetty_contexts == rhs.jetty_contexts &&
+           lhs.trans_mode == rhs.trans_mode &&
            lhs.endpoint_generation == rhs.endpoint_generation;
 }
 
@@ -261,7 +263,7 @@ Status UbEndpoint::bind(const UbBootstrapDesc& peer) {
         return failLocked(Status::RpcServiceError(
             std::string("Peer rejected UB bootstrap: ") + peer.reply_msg));
     }
-    if (peer.protocol_version != 1) {
+    if (peer.protocol_version != UbBootstrapDesc::kProtocolVersion) {
         return failLocked(Status::InvalidArgument(
             "Unsupported UB bootstrap protocol version" LOC_MARK));
     }
@@ -275,11 +277,22 @@ Status UbEndpoint::bind(const UbBootstrapDesc& peer) {
             Status::InvalidArgument("Peer UB bootstrap Jetty count does not "
                                     "match local endpoint" LOC_MARK));
     }
-    if (!peer.jetty_uasids.empty() &&
-        peer.jetty_uasids.size() != jetties_.size()) {
+    if (peer.jetty_uasids.size() != jetties_.size()) {
         return failLocked(
             Status::InvalidArgument("Peer UB bootstrap UASID count does not "
                                     "match local endpoint" LOC_MARK));
+    }
+    if (peer.jetty_contexts.size() != jetties_.size()) {
+        return failLocked(Status::InvalidArgument(
+            "Peer UB bootstrap rjetty context count does not match local "
+            "endpoint" LOC_MARK));
+    }
+    const std::string local_mode =
+        transportModeName(context_->transportMode());
+    if (peer.trans_mode != local_mode) {
+        return failLocked(Status::InvalidArgument(
+            "Peer UB bootstrap transport mode does not match local mode: " +
+            peer.trans_mode + " != " + local_mode + LOC_MARK));
     }
 
     for (size_t index = 0; index < jetties_.size(); ++index) {
@@ -290,8 +303,12 @@ Status UbEndpoint::bind(const UbBootstrapDesc& peer) {
         RemoteJettyInfo remote;
         remote.eid = peer.local_eid;
         remote.id = peer.jetty_ids[index];
-        if (!peer.jetty_uasids.empty()) {
-            remote.uasid = peer.jetty_uasids[index];
+        remote.uasid = peer.jetty_uasids[index];
+        remote.transport_mode = context_->transportMode();
+        remote.context = peer.jetty_contexts[index];
+        if (remote.context.empty()) {
+            return failLocked(Status::InvalidArgument(
+                "Peer UB bootstrap contains an empty rjetty context" LOC_MARK));
         }
         auto status = adapter_->bindJetty(jetties_[index], remote);
         if (!status.ok()) return failLocked(std::move(status));
@@ -317,7 +334,7 @@ Status UbEndpoint::makeBootstrapDesc(const std::string& segment_name,
     }
 
     output = UbBootstrapDesc{};
-    output.protocol_version = 1;
+    output.protocol_version = UbBootstrapDesc::kProtocolVersion;
     output.segment_name = segment_name;
     output.local_nic_path = local_nic_path.empty()
                                 ? context_->deviceInfo().native_device_path
@@ -330,6 +347,8 @@ Status UbEndpoint::makeBootstrapDesc(const std::string& segment_name,
     output.local_eid = context_->deviceInfo().eid;
     output.jetty_ids.reserve(jetties_.size());
     output.jetty_uasids.reserve(jetties_.size());
+    output.jetty_contexts.reserve(jetties_.size());
+    output.trans_mode = transportModeName(context_->transportMode());
     for (const auto& jetty : jetties_) {
         if (!jetty || !jetty->valid() || jetty->id() == 0) {
             return Status::InternalError(
@@ -337,6 +356,14 @@ Status UbEndpoint::makeBootstrapDesc(const std::string& segment_name,
         }
         output.jetty_ids.push_back(jetty->id());
         output.jetty_uasids.push_back(jetty->uasid());
+        std::string jetty_context;
+        auto status = adapter_->exportJettyContext(jetty, jetty_context);
+        if (!status.ok()) return status;
+        if (jetty_context.empty()) {
+            return Status::InternalError(
+                "URMA adapter returned an empty rjetty context" LOC_MARK);
+        }
+        output.jetty_contexts.push_back(std::move(jetty_context));
     }
     output.endpoint_generation = generation_;
     output.segment_generation = segment_generation;

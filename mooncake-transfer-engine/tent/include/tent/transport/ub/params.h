@@ -63,6 +63,8 @@ struct UbParams {
         CHECK_STATUS(readDeviceFilter(config, parsed.device_filter));
         CHECK_STATUS(readBondingMode(config, parsed.bonding.mode));
         CHECK_STATUS(readBondingLevel(config, parsed.bonding.level));
+        CHECK_STATUS(readTransportMode(config,
+                                       parsed.bonding.transport_mode));
         CHECK_STATUS(readPositive(config, "transports/ub/worker_count",
                                   parsed.worker_count, parsed.worker_count));
         CHECK_STATUS(readPositive(config, "transports/ub/poller_count",
@@ -168,6 +170,29 @@ struct UbParams {
         } else {
             return Status::InvalidArgument(std::string(kKey) +
                                            " must be IODIE or PORT");
+        }
+        return Status::OK();
+    }
+
+    static Status readTransportMode(const Config& config,
+                                    TransportMode& output) {
+        static constexpr const char* kKey = "transports/ub/trans_mode";
+        const json value = config.get<json>(kKey, json());
+        if (value.is_null()) return Status::OK();
+        if (!value.is_string()) {
+            return Status::InvalidArgument(std::string(kKey) +
+                                           " must be a string");
+        }
+        const auto token = normalizeBondingToken(value.get<std::string>());
+        if (token == "RC") {
+            output = TransportMode::kRc;
+        } else if (token == "RM") {
+            output = TransportMode::kRm;
+        } else if (token == "UM") {
+            output = TransportMode::kUm;
+        } else {
+            return Status::InvalidArgument(std::string(kKey) +
+                                           " must be UM, RC, or RM");
         }
         return Status::OK();
     }

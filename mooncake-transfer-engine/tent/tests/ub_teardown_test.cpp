@@ -257,6 +257,14 @@ class FailOnceAdapter final : public UrmaAdapter {
         jetty.reset();
         return Status::OK();
     }
+    Status exportJettyContext(const JettyPtr& jetty,
+                              std::string& context) override {
+        if (!jetty || !jetty->valid()) {
+            return Status::InvalidArgument("bad Jetty");
+        }
+        context = "fake-rjetty";
+        return Status::OK();
+    }
     Status bindJetty(const JettyPtr&, const RemoteJettyInfo&) override {
         return Status::OK();
     }
@@ -586,10 +594,13 @@ TEST(UbTeardown, EndpointStoreUnpublishesEveryEndpointForFailedDevice) {
     ASSERT_EQ(store.size(), 2u);
 
     UbBootstrapDesc peer;
-    peer.protocol_version = 1;
+    peer.protocol_version = UbBootstrapDesc::kProtocolVersion;
     peer.local_eid = makeDevice(8).eid;
     peer.endpoint_generation = 7;
     peer.jetty_ids = {11};
+    peer.jetty_uasids = {0};
+    peer.jetty_contexts = {"fake-peer-rjetty"};
+    peer.trans_mode = "RC";
     ASSERT_TRUE(first->bind(peer).ok());
     ASSERT_TRUE(first->tryAcquireOutstanding(64));
 

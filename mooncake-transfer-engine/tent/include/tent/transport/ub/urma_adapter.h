@@ -70,17 +70,34 @@ enum class BondingLevel : uint8_t {
     kPort,
 };
 
+enum class TransportMode : uint8_t {
+    kRc,
+    kRm,
+    kUm,
+};
+
+inline constexpr const char* transportModeName(TransportMode mode) noexcept {
+    switch (mode) {
+        case TransportMode::kRc: return "RC";
+        case TransportMode::kRm: return "RM";
+        case TransportMode::kUm: return "UM";
+    }
+    return "UNKNOWN";
+}
+
 struct BondingOptions {
     BondingMode mode = BondingMode::kStandalone;
     BondingLevel level = BondingLevel::kIodie;
+    // RC preserves the original TENT behavior. MC_URMA_TRANS_MODE can select
+    // RM or UM through transports/ub/trans_mode.
+    TransportMode transport_mode = TransportMode::kRc;
 };
 
-// The segment descriptor is intentionally an explicit envelope. Raw
-// urma_seg_t bytes are ABI-specific; import must reject a different API
-// version, structure size, schema, or malformed hex instead of copying an
-// arbitrary byte sequence into a native structure.
+// The segment descriptor is an explicit envelope for the variable-length
+// provider context. It is ABI-specific and must be validated before import.
 struct SegmentDescriptor {
-    static constexpr uint32_t kSchemaVersion = 1;
+    // Version 2 carries the provider's complete delegated segment context.
+    static constexpr uint32_t kSchemaVersion = 2;
 
     uint32_t schema_version = kSchemaVersion;
     uint32_t urma_api_version = 0;
@@ -178,6 +195,9 @@ struct RemoteJettyInfo {
     uint32_t id = 0;
     uint32_t uasid = 0;
     uint32_t token = 0xACFE;
+    TransportMode transport_mode = TransportMode::kRc;
+    // Hex-encoded variable-length urma_get_rjetty provider context.
+    std::string context;
 };
 
 enum class Operation : uint8_t {
@@ -265,6 +285,8 @@ class UrmaAdapter {
                                const JettyOptions& options,
                                JettyPtr& jetty) = 0;
     virtual Status deleteJetty(JettyPtr& jetty) = 0;
+    virtual Status exportJettyContext(const JettyPtr& jetty,
+                                      std::string& context) = 0;
     virtual Status bindJetty(const JettyPtr& jetty,
                              const RemoteJettyInfo& remote) = 0;
     virtual Status unbindJetty(const JettyPtr& jetty) = 0;

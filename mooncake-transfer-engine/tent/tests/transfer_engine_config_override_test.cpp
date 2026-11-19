@@ -458,6 +458,24 @@ TEST(TransferEngineConfigOverrideTest, ClassicUrmaBondingEnvLoadsTentConfig) {
     EXPECT_EQ(config.get("transports/ub/bonding_level", ""), "PORT");
 }
 
+TEST(TransferEngineConfigOverrideTest, ClassicUrmaTransModeEnvLoadsTentConfig) {
+    EnvVarGuard mode_guard("MC_URMA_TRANS_MODE", "UM");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+    EXPECT_EQ(config.get("transports/ub/trans_mode", ""), "UM");
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     InvalidClassicUrmaTransModeEnvPreservesTentConfig) {
+    EnvVarGuard mode_guard("MC_URMA_TRANS_MODE", "UD");
+
+    Config config;
+    config.set("transports/ub/trans_mode", "RC");
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+    EXPECT_EQ(config.get("transports/ub/trans_mode", ""), "RC");
+}
+
 TEST(TransferEngineConfigOverrideTest,
      InvalidClassicUrmaBondingEnvPreservesTentConfig) {
     EnvVarGuard mode_guard("MC_URMA_BONDING_MODE", "invalid");

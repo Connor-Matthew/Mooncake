@@ -261,9 +261,19 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         jetty.reset();
         return Status::OK();
     }
-    Status bindJetty(const JettyPtr& jetty, const RemoteJettyInfo&) override {
+    Status exportJettyContext(const JettyPtr& jetty,
+                              std::string& context) override {
         auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
-        if (!fake || !fake->valid())
+        if (!fake || !fake->valid()) {
+            return Status::InvalidArgument("bad Jetty");
+        }
+        context = "fake-rjetty-" + std::to_string(fake->id());
+        return Status::OK();
+    }
+    Status bindJetty(const JettyPtr& jetty,
+                     const RemoteJettyInfo& remote) override {
+        auto fake = std::dynamic_pointer_cast<FakeJetty>(jetty);
+        if (!fake || !fake->valid() || remote.context.empty())
             return Status::InvalidArgument("bad Jetty");
         fake->bind();
         return Status::OK();
@@ -548,6 +558,9 @@ TEST(UbNativeDataPathTest,
         peer.local_eid = fakeDevice().eid;
         peer.endpoint_generation = 100;
         peer.jetty_ids = {777};
+        peer.jetty_uasids = {0};
+        peer.jetty_contexts = {"fake-peer-rjetty"};
+        peer.trans_mode = "RC";
         return endpoint->bind(peer);
     };
     UbWorkers workers(adapter, contexts, topology, &manager, &buffers, &rails,
@@ -710,6 +723,9 @@ TEST(UbNativeDataPathTest,
         peer.local_eid = fakeDevice().eid;
         peer.endpoint_generation = 100;
         peer.jetty_ids = {777};
+        peer.jetty_uasids = {0};
+        peer.jetty_contexts = {"fake-peer-rjetty"};
+        peer.trans_mode = "RC";
         return endpoint->bind(peer);
     };
     UbWorkers workers(adapter, contexts, topology, &manager, &buffers, &rails,
@@ -824,6 +840,67 @@ TEST(UbNativeDataPathTest, EndpointStoreNeverReusesRetiredGeneration) {
 }
 
 TEST(UbNativeDataPathTest,
+     BootstrapCarriesProviderContextsAndConfiguredTransportMode) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    BondingOptions options;
+    options.transport_mode = TransportMode::kUm;
+    auto context =
+        std::make_shared<UbContext>(0, fakeDevice(), adapter, options);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    EndpointStore store(adapter, 1, 1);
+    std::shared_ptr<UbEndpoint> endpoint;
+    ASSERT_TRUE(store
+                    .getOrCreate(
+                        UbEndpointKey{0, 9, 0, "peer@ub:fake0:eid0"},
+                        context, endpoint)
+                    .ok());
+
+    UbBootstrapDesc bootstrap;
+    ASSERT_TRUE(endpoint
+                    ->makeBootstrapDesc("segment", "local", "peer", 7,
+                                        bootstrap)
+                    .ok());
+    EXPECT_EQ(bootstrap.protocol_version,
+              UbBootstrapDesc::kProtocolVersion);
+    EXPECT_EQ(bootstrap.trans_mode, "UM");
+    ASSERT_EQ(bootstrap.jetty_contexts.size(), 1U);
+    EXPECT_FALSE(bootstrap.jetty_contexts.front().empty());
+    EXPECT_TRUE(endpoint->bind(bootstrap).ok());
+
+    EXPECT_TRUE(store.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbNativeDataPathTest, BootstrapRejectsPeerTransportModeMismatch) {
+    auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
+    ASSERT_TRUE(adapter->initialize().ok());
+    auto context = std::make_shared<UbContext>(0, fakeDevice(), adapter);
+    ASSERT_TRUE(context->initialize(1, JfcOptions{}).ok());
+    EndpointStore store(adapter, 1, 1);
+    std::shared_ptr<UbEndpoint> endpoint;
+    ASSERT_TRUE(store
+                    .getOrCreate(
+                        UbEndpointKey{0, 9, 0, "peer@ub:fake0:eid0"},
+                        context, endpoint)
+                    .ok());
+
+    UbBootstrapDesc bootstrap;
+    ASSERT_TRUE(endpoint
+                    ->makeBootstrapDesc("segment", "local", "peer", 7,
+                                        bootstrap)
+                    .ok());
+    bootstrap.trans_mode = "RM";
+    EXPECT_TRUE(endpoint->bind(bootstrap).IsInvalidArgument());
+    EXPECT_TRUE(endpoint->failed());
+
+    EXPECT_TRUE(store.clear().ok());
+    EXPECT_TRUE(context->shutdown().ok());
+    EXPECT_TRUE(adapter->shutdown().ok());
+}
+
+TEST(UbNativeDataPathTest,
      EndpointStoreDoesNotReplaceEndpointWhenCleanupCannotComplete) {
     auto adapter = std::make_shared<FakeUrmaAdapter>(fakeDevice());
     ASSERT_TRUE(adapter->initialize().ok());
@@ -837,6 +914,9 @@ TEST(UbNativeDataPathTest,
     peer.local_eid = fakeDevice().eid;
     peer.endpoint_generation = 100;
     peer.jetty_ids = {777};
+    peer.jetty_uasids = {0};
+    peer.jetty_contexts = {"fake-peer-rjetty"};
+    peer.trans_mode = "RC";
     ASSERT_TRUE(endpoint->bind(peer).ok());
 
     adapter->failResets();

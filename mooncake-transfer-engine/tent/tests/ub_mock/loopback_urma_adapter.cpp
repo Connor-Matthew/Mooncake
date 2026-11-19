@@ -280,9 +280,19 @@ class LoopbackUrmaAdapter final : public UrmaAdapter {
         jetty.reset();
         return Status::OK();
     }
-    Status bindJetty(const JettyPtr& jetty, const RemoteJettyInfo&) override {
+    Status exportJettyContext(const JettyPtr& jetty,
+                              std::string& context) override {
         auto loopback = std::dynamic_pointer_cast<LoopbackJetty>(jetty);
-        if (!loopback || !loopback->valid())
+        if (!loopback || !loopback->valid()) {
+            return Status::InvalidArgument("bad loopback Jetty");
+        }
+        context = "loopback-rjetty-" + std::to_string(loopback->id());
+        return Status::OK();
+    }
+    Status bindJetty(const JettyPtr& jetty,
+                     const RemoteJettyInfo& remote) override {
+        auto loopback = std::dynamic_pointer_cast<LoopbackJetty>(jetty);
+        if (!loopback || !loopback->valid() || remote.context.empty())
             return Status::InvalidArgument("bad loopback Jetty");
         loopback->setBound(true);
         return Status::OK();

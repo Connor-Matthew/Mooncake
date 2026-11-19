@@ -122,6 +122,12 @@ class UnavailableUrmaAdapter final : public UrmaAdapter {
         return Status::OK();
     }
 
+    Status exportJettyContext(const JettyPtr&,
+                              std::string& context) override {
+        context.clear();
+        return unavailable();
+    }
+
     Status bindJetty(const JettyPtr&, const RemoteJettyInfo&) override {
         return unavailable();
     }
@@ -295,6 +301,15 @@ bondp_bonding_level_t nativeBondingLevel(BondingLevel level) {
                                          : BONDP_BONDING_LEVEL_PORT;
 }
 
+urma_transport_mode_t nativeTransportMode(TransportMode mode) {
+    switch (mode) {
+        case TransportMode::kRc: return URMA_TM_RC;
+        case TransportMode::kRm: return URMA_TM_RM;
+        case TransportMode::kUm: return URMA_TM_UM;
+    }
+    return URMA_TM_RC;
+}
+
 const char* bondingModeName(BondingMode mode) {
     switch (mode) {
         case BondingMode::kBalance: return "BALANCE";
@@ -395,11 +410,13 @@ class RuntimeLease {
 class RealContext final : public Context {
    public:
     RealContext(std::shared_ptr<RuntimeLease> runtime, DeviceInfo info,
-                urma_context_t* native, uint32_t ctp_priority)
+                urma_context_t* native, uint32_t ctp_priority,
+                TransportMode transport_mode)
         : runtime_(std::move(runtime)),
           info_(std::move(info)),
           native_(native),
-          ctp_priority_(ctp_priority) {}
+          ctp_priority_(ctp_priority),
+          transport_mode_(transport_mode) {}
 
     ~RealContext() override { (void)close(); }
 
@@ -416,6 +433,10 @@ class RealContext final : public Context {
     }
 
     uint32_t ctpPriority() const noexcept { return ctp_priority_; }
+    TransportMode transportMode() const noexcept { return transport_mode_; }
+    urma_transport_mode_t nativeTransportMode() const noexcept {
+        return ::mooncake::tent::ub::nativeTransportMode(transport_mode_);
+    }
 
     Status close() {
         if (native_ == nullptr) return Status::OK();
@@ -430,6 +451,7 @@ class RealContext final : public Context {
     DeviceInfo info_;
     urma_context_t* native_ = nullptr;
     uint32_t ctp_priority_ = 15;
+    TransportMode transport_mode_ = TransportMode::kRc;
 };
 
 class RealJfc final : public Jfc {
@@ -462,7 +484,7 @@ class RealJfc final : public Jfc {
         urma_jfr_cfg_t receiver_cfg{};
         receiver_cfg.depth = options.receiver_depth;
         receiver_cfg.flag.bs.tag_matching = 0;
-        receiver_cfg.trans_mode = URMA_TM_RC;
+        receiver_cfg.trans_mode = context_->nativeTransportMode();
         receiver_cfg.max_sge = 1;
         receiver_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
         receiver_cfg.jfc = receive_jfc_;
@@ -709,7 +731,7 @@ class RealJetty final : public Jetty {
         urma_jetty_cfg_t config{};
         config.flag.bs.share_jfr = 1;
         config.jfs_cfg.depth = options.depth;
-        config.jfs_cfg.trans_mode = URMA_TM_RC;
+        config.jfs_cfg.trans_mode = context_->nativeTransportMode();
         config.jfs_cfg.priority = context_->isBondingDevice()
                                       ? context_->ctpPriority()
                                       : options.priority;
@@ -789,7 +811,7 @@ class RealJetty final : public Jetty {
             return Status::InvalidArgument("cannot bind a reset Jetty");
         }
         if (remote_ != nullptr) {
-            if (!needs_native_unbind_ || state_ != State::BOUND) {
+            if (state_ != State::BOUND) {
                 return Status::TooManyRequests(
                     "Jetty has an imported peer pending cleanup");
             }
@@ -802,22 +824,51 @@ class RealJetty final : public Jetty {
                               "Jetty is already bound to another peer");
         }
 
-        urma_rjetty_t descriptor{};
-        descriptor.jetty_id.eid = remote_eid;
-        descriptor.jetty_id.uasid = remote_info.uasid;
-        descriptor.jetty_id.id = remote_info.id;
-        descriptor.trans_mode = URMA_TM_RC;
-        descriptor.type = URMA_JETTY;
-        descriptor.tp_type = URMA_CTP;
+        constexpr size_t kMaxRjettyContextSize = 1U << 20;
+        if (remote_info.context.size() % 2 != 0 ||
+            remote_info.context.size() / 2 < sizeof(urma_rjetty_t) ||
+            remote_info.context.size() / 2 > kMaxRjettyContextSize) {
+            return Status::InvalidArgument(
+                "invalid remote rjetty context size");
+        }
+        const size_t descriptor_size = remote_info.context.size() / 2;
+        std::vector<uint64_t> descriptor_storage(
+            (descriptor_size + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+        if (!decodeHex(remote_info.context, descriptor_storage.data(),
+                       descriptor_size)) {
+            return Status::InvalidArgument(
+                "malformed remote rjetty context hex");
+        }
+        auto* descriptor =
+            reinterpret_cast<urma_rjetty_t*>(descriptor_storage.data());
+        const urma_transport_mode_t expected_mode =
+            context_->nativeTransportMode();
+        if (remote_info.transport_mode != context_->transportMode() ||
+            descriptor->trans_mode != expected_mode ||
+            descriptor->type != URMA_JETTY ||
+            descriptor->jetty_id.id != remote_info.id ||
+            descriptor->jetty_id.uasid != remote_info.uasid ||
+            std::memcmp(descriptor->jetty_id.eid.raw, remote_eid.raw,
+                        URMA_EID_SIZE) != 0) {
+            return Status::InvalidArgument(
+                "remote rjetty context does not match bootstrap metadata");
+        }
+        // Match classic TE: providers using a bonding device resolve the
+        // imported path through CTP, while all opaque trailing bytes remain
+        // exactly as exported by urma_get_rjetty.
+        descriptor->tp_type = URMA_CTP;
 
         urma_token_t token{.token = remote_info.token};
         urma_target_jetty_t* imported =
-            urma_import_jetty(context_->native(), &descriptor, &token);
+            urma_import_jetty(context_->native(), descriptor, &token);
         if (imported == nullptr) {
             return nativePointerError("urma_import_jetty");
         }
 
-        const int rc = urma_bind_jetty(native_, imported);
+        int rc = URMA_SUCCESS;
+        if (context_->transportMode() == TransportMode::kRc) {
+            rc = urma_bind_jetty(native_, imported);
+        }
         if (rc != URMA_SUCCESS && rc != URMA_EEXIST) {
             const int rollback_rc = urma_unimport_jetty(imported);
             if (rollback_rc != URMA_SUCCESS) {
@@ -844,8 +895,14 @@ class RealJetty final : public Jetty {
         remote_eid_ = remote_eid;
         remote_id_ = remote_info.id;
         remote_uasid_ = remote_info.uasid;
-        needs_native_unbind_ = true;
+        needs_native_unbind_ =
+            context_->transportMode() == TransportMode::kRc;
         state_ = State::BOUND;
+        LOG(INFO) << "TENT UB rjetty ready local_jetty=" << id()
+                  << " remote_jetty=" << remote_info.id
+                  << " mode="
+                  << transportModeName(context_->transportMode())
+                  << " native_bind=" << needs_native_unbind_;
         return Status::OK();
     }
 
@@ -1238,7 +1295,11 @@ class RealUrmaAdapter final : public UrmaAdapter {
             }
             output = std::make_shared<RealContext>(
                 std::move(runtime), std::move(current), native_context,
-                ctp_priority);
+                ctp_priority, bonding.transport_mode);
+            LOG(INFO) << "Configured TENT UB transport mode="
+                      << transportModeName(bonding.transport_mode)
+                      << " device=" << requested.native_device_name
+                      << " eid_index=" << requested.eid_index;
             return Status::OK();
         }
         return Status::DeviceNotFound("URMA device not found: " +
@@ -1334,11 +1395,30 @@ class RealUrmaAdapter final : public UrmaAdapter {
             return nativePointerError("urma_register_seg");
         }
 
-        urma_seg_t wire_descriptor{};
-        wire_descriptor.ubva = native_segment->seg.ubva;
-        wire_descriptor.len = native_segment->seg.len;
-        wire_descriptor.attr = native_segment->seg.attr;
-        wire_descriptor.token_id = native_segment->seg.token_id;
+        urma_seg_t* segment_context = nullptr;
+        uint32_t segment_context_size = 0;
+        const int export_rc = urma_get_seg_ctx(native_segment, &segment_context,
+                                               &segment_context_size);
+        if (export_rc != URMA_SUCCESS || segment_context == nullptr ||
+            segment_context_size < sizeof(urma_seg_t)) {
+            if (segment_context != nullptr) urma_put_seg_ctx(segment_context);
+            // Adopt native resources before reporting failure so the caller
+            // can retry cleanup if the provider refuses to release them.
+            output = std::make_shared<RealLocalSegment>(
+                std::move(real_context), native_segment, address, length,
+                SegmentDescriptor{}, token_id);
+            return Status::InternalError(
+                "urma_get_seg_ctx failed or returned an incomplete context");
+        }
+        constexpr uint32_t kMaxSegmentContextSize = 1U << 20;
+        if (segment_context_size > kMaxSegmentContextSize) {
+            urma_put_seg_ctx(segment_context);
+            output = std::make_shared<RealLocalSegment>(
+                std::move(real_context), native_segment, address, length,
+                SegmentDescriptor{}, token_id);
+            return Status::InvalidArgument(
+                "URMA segment context exceeds the wire size limit");
+        }
 
         LOG(INFO) << "UB_SEG_TOKEN_ID token_id_valid=1"
                   << " va=0x" << std::hex << address << " len=0x" << length
@@ -1347,7 +1427,8 @@ class RealUrmaAdapter final : public UrmaAdapter {
         SegmentDescriptor descriptor;
         descriptor.urma_api_version = URMA_API_VERSION;
         descriptor.urma_abi_size = sizeof(urma_seg_t);
-        descriptor.hex = encodeHex(&wire_descriptor, sizeof(wire_descriptor));
+        descriptor.hex = encodeHex(segment_context, segment_context_size);
+        urma_put_seg_ctx(segment_context);
         output = std::make_shared<RealLocalSegment>(
             std::move(real_context), native_segment, address, length,
             std::move(descriptor), token_id);
@@ -1382,12 +1463,23 @@ class RealUrmaAdapter final : public UrmaAdapter {
                 "URMA segment descriptor ABI size mismatch");
         }
 
-        urma_seg_t native_descriptor{};
-        if (!decodeHex(descriptor.hex, &native_descriptor,
-                       sizeof(native_descriptor))) {
+        constexpr size_t kMaxSegmentContextSize = 1U << 20;
+        if (descriptor.hex.size() % 2 != 0 ||
+            descriptor.hex.size() / 2 < sizeof(urma_seg_t) ||
+            descriptor.hex.size() / 2 > kMaxSegmentContextSize) {
+            return Status::InvalidArgument(
+                "invalid URMA segment context size");
+        }
+        const size_t context_size = descriptor.hex.size() / 2;
+        std::vector<uint64_t> context_storage(
+            (context_size + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+        if (!decodeHex(descriptor.hex, context_storage.data(), context_size)) {
             return Status::InvalidArgument(
                 "malformed URMA segment descriptor hex");
         }
+        auto* native_context =
+            reinterpret_cast<urma_seg_t*>(context_storage.data());
+        const urma_seg_t& native_descriptor = *native_context;
         if (native_descriptor.len == 0 ||
             native_descriptor.len > std::numeric_limits<uint64_t>::max() -
                                         native_descriptor.ubva.va ||
@@ -1403,7 +1495,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
         flags.bs.mapping = URMA_SEG_NOMAP;
         urma_token_t token{.token = options.token};
         urma_target_seg_t* imported = urma_import_seg(
-            real_context->native(), &native_descriptor, &token, 0, flags);
+            real_context->native(), native_context, &token, 0, flags);
         if (imported == nullptr) return nativePointerError("urma_import_seg");
 
         // urma_ubva_t is packed; copy its fields before passing them through
@@ -1464,6 +1556,36 @@ class RealUrmaAdapter final : public UrmaAdapter {
 
     Status deleteJetty(JettyPtr& jetty) override {
         return releaseTypedHandle<RealJetty>(jetty, "Jetty");
+    }
+
+    Status exportJettyContext(const JettyPtr& jetty,
+                              std::string& context) override {
+        context.clear();
+        std::shared_ptr<RuntimeLease> runtime;
+        CHECK_STATUS(getRuntime(runtime));
+        auto real_jetty = std::dynamic_pointer_cast<RealJetty>(jetty);
+        if (!real_jetty || !real_jetty->valid()) return invalidHandle("Jetty");
+
+        std::lock_guard<std::mutex> lock(real_jetty->mutex());
+        urma_rjetty_t* descriptor = nullptr;
+        uint32_t descriptor_size = 0;
+        const int rc = urma_get_rjetty(real_jetty->native(), &descriptor,
+                                       &descriptor_size);
+        if (rc != URMA_SUCCESS || descriptor == nullptr ||
+            descriptor_size < sizeof(urma_rjetty_t)) {
+            if (descriptor != nullptr) urma_put_rjetty(descriptor);
+            return nativeError("urma_get_rjetty",
+                               rc == URMA_SUCCESS ? URMA_FAIL : rc);
+        }
+        constexpr uint32_t kMaxRjettyContextSize = 1U << 20;
+        if (descriptor_size > kMaxRjettyContextSize) {
+            urma_put_rjetty(descriptor);
+            return Status::InvalidArgument(
+                "URMA rjetty context exceeds the wire size limit");
+        }
+        context = encodeHex(descriptor, descriptor_size);
+        urma_put_rjetty(descriptor);
+        return Status::OK();
     }
 
     Status bindJetty(const JettyPtr& jetty,

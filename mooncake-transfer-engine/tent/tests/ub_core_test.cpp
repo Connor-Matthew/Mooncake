@@ -60,11 +60,32 @@ TEST(UbParamsTest, ParsesBondingPolicyUsingClassicTeValues) {
     EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
 }
 
+TEST(UbParamsTest, ParsesUmRcAndRmTransportModes) {
+    Config config;
+    config.set("transports/ub/trans_mode", "rm");
+
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.bonding.transport_mode, TransportMode::kRm);
+
+    config.set("transports/ub/trans_mode", "RC");
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.bonding.transport_mode, TransportMode::kRc);
+
+    config.set("transports/ub/trans_mode", "UM");
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.bonding.transport_mode, TransportMode::kUm);
+
+    config.set("transports/ub/trans_mode", "UD");
+    EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
+}
+
 TEST(UbParamsTest, BondingDefaultsPreserveExistingTentBehavior) {
     UbParams params;
     ASSERT_TRUE(UbParams::FromConfig(Config{}, params).ok());
     EXPECT_EQ(params.bonding.mode, BondingMode::kStandalone);
     EXPECT_EQ(params.bonding.level, BondingLevel::kIodie);
+    EXPECT_EQ(params.bonding.transport_mode, TransportMode::kRc);
 }
 
 Request makeRequest(size_t length) {

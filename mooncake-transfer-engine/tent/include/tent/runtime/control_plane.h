@@ -64,7 +64,9 @@ struct BootstrapDesc {
 // RDMA QPs, CQs and GIDs.  Keep a dedicated bootstrap envelope so neither
 // transport has to smuggle native identifiers through the other's fields.
 struct UbBootstrapDesc {
-    uint32_t protocol_version = 1;
+    static constexpr uint32_t kProtocolVersion = 2;
+
+    uint32_t protocol_version = kProtocolVersion;
     std::string segment_name;
     std::string local_nic_path;
     std::string peer_nic_path;
@@ -74,8 +76,13 @@ struct UbBootstrapDesc {
     std::string local_eid;
     std::vector<uint32_t> jetty_ids;
     // UASID is part of urma_jetty_id_t on providers that use nonzero address
-    // spaces. Kept parallel to jetty_ids for protocol-v1 compatibility.
+    // spaces and is kept parallel to jetty_ids.
     std::vector<uint32_t> jetty_uasids;
+    // Protocol v2 requires the full provider-exported rjetty context. Jetty
+    // IDs alone are insufficient for providers that resolve CTP state from
+    // private descriptor data.
+    std::vector<std::string> jetty_contexts;
+    std::string trans_mode;
     uint64_t endpoint_generation = 0;
     uint64_t segment_generation = 0;
     std::vector<std::string> capabilities;
@@ -93,6 +100,8 @@ inline void to_json(nlohmann::json& j, const UbBootstrapDesc& desc) {
                        {"local_eid", desc.local_eid},
                        {"jetty_ids", desc.jetty_ids},
                        {"jetty_uasids", desc.jetty_uasids},
+                       {"jetty_contexts", desc.jetty_contexts},
+                       {"trans_mode", desc.trans_mode},
                        {"endpoint_generation", desc.endpoint_generation},
                        {"segment_generation", desc.segment_generation},
                        {"capabilities", desc.capabilities},
@@ -101,7 +110,7 @@ inline void to_json(nlohmann::json& j, const UbBootstrapDesc& desc) {
 
 inline void from_json(const nlohmann::json& j, UbBootstrapDesc& desc) {
     desc.protocol_version = j.value("protocol_version", 0u);
-    if (desc.protocol_version != 1) {
+    if (desc.protocol_version != UbBootstrapDesc::kProtocolVersion) {
         throw std::invalid_argument("unsupported UB bootstrap version");
     }
     desc.segment_name = j.value("segment_name", "");
@@ -113,6 +122,9 @@ inline void from_json(const nlohmann::json& j, UbBootstrapDesc& desc) {
     desc.local_eid = j.value("local_eid", "");
     desc.jetty_ids = j.value("jetty_ids", std::vector<uint32_t>{});
     desc.jetty_uasids = j.value("jetty_uasids", std::vector<uint32_t>{});
+    desc.jetty_contexts =
+        j.value("jetty_contexts", std::vector<std::string>{});
+    desc.trans_mode = j.value("trans_mode", "");
     desc.endpoint_generation = j.value("endpoint_generation", uint64_t{0});
     desc.segment_generation = j.value("segment_generation", uint64_t{0});
     desc.capabilities = j.value("capabilities", std::vector<std::string>{});

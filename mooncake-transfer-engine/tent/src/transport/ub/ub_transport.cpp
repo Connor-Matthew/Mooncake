@@ -569,7 +569,10 @@ struct UbTransport::Impl {
             return -1;
         }
         if (request.local_device_id < 0 || request.local_eid.empty() ||
-            request.jetty_ids.empty() || request.endpoint_generation == 0) {
+            request.jetty_ids.empty() || request.endpoint_generation == 0 ||
+            request.jetty_uasids.size() != request.jetty_ids.size() ||
+            request.jetty_contexts.size() != request.jetty_ids.size() ||
+            request.trans_mode.empty()) {
             response.reply_msg = "UB bootstrap request is incomplete";
             return -1;
         }

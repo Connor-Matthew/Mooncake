@@ -60,6 +60,9 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
         return device_;
     }
     [[nodiscard]] const ContextPtr& handle() const noexcept { return handle_; }
+    [[nodiscard]] TransportMode transportMode() const noexcept {
+        return bonding_.transport_mode;
+    }
     [[nodiscard]] State state() const noexcept {
         return state_.load(std::memory_order_acquire);
     }
