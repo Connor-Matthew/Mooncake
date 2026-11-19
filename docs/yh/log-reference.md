@@ -19,6 +19,13 @@ MC_LOG 系统的每条日志自动带有 `trace_id[xxx] ` 前缀（无 trace 上
 
 **注意**：当两层日志混合输出时（如 `get_batch`），原生 glog 日志与 MC_LOG 日志可能因异步队列导致顺序不完全一致。
 
+**字段风格约定（两种并存，均为规范，按家族固定）**：
+
+- **breakdown 家族**（`urma_*_breakdown`、`ub_*_breakdown`、`*_setup_breakdown`）：`key[value]` 括号风格，便于先按日志名前缀 grep 再逐字段解析；
+- **worker / 队列 / 导入统计家族**（`ub_worker_breakdown`、`urma_queue_depth`、`ub_import_breakdown`）：`key=value` 风格。
+
+新增日志请沿用其所属家族的既有风格，不要在同一家族内混用。
+
 ### 0.2 MC_LOG 异步队列
 
 MC_LOG 通过 `AsyncLogMessage` 临时对象在析构时将日志条目入队，后台单线程消费并调用 glog 输出。队列容量 8192 条，满时阻塞写入线程。FATAL 级别绕过队列直接同步输出。进程退出时通过 `atexit` 处理器刷出剩余日志。
@@ -556,6 +563,8 @@ PerfPoint 定义在 `mooncake-integration/store/mooncake_perf_points.def`。
 | `UB_ENDPOINT_DO_SETUP_ALL` | urma_endpoint.cpp::doSetupConnection | DoSetupAll | `urma_do_setup_all_breakdown` |
 | `UB_ENDPOINT_IMPORT_JETTY` | urma_endpoint.cpp::doSetupConnection | ImportJetty | `urma_import_jetty_breakdown` |
 | `UB_ENDPOINT_BIND_JETTY` | urma_endpoint.cpp::doSetupConnection | BindJetty | `urma_bind_jetty_breakdown` |
+| `UB_ENDPOINT_GET_RJETTY` | urma_endpoint.cpp::JettyRjettyBlobs | GetRjetty | `urma_get_rjetty_breakdown` |
+| `UB_SEGMENT_IMPORT` | urma_endpoint.cpp::retrieveRemoteSeg | ImportSeg | `urma_import_seg_breakdown` |
 
 ---
 
@@ -935,14 +944,14 @@ setupConnectionsByActive()  ← 计时起点 t0
   │     → urma_active_setup_breakdown ... local_peer[1] handshake_us[0] ...   (§12.3 变体1)
   │
   └─[情况②: 跨节点] 需要握手
-       sendHandshake(local_desc{nic,jetty_num,trace_id})  ──RPC──▶  onSetupConnections()
+       sendHandshake(local_desc{nic,jetty_num,rjetty_blobs,trace_id})  ──RPC──▶  onSetupConnections()
                                                                       setupConnectionsByPassive()
                                                                         doSetupConnection()   ← 被动端也建
-                                                                          每个 jetty: import + bind
+                                                                          每个 jetty: (EID 交叉校验) + import + bind
                                                                           → urma_import_jetty_breakdown  (§12.6)
                                                                           → urma_bind_jetty_breakdown    (§12.7)
                                                                         → urma_do_setup_all_breakdown    (§12.5)
-                                                      ◀──返回 peer_desc{eid,jetty_num}──
+                                                      ◀──返回 peer_desc{eid,jetty_num,rjetty_blobs}──
                                                                       → urma_passive_setup_breakdown     (§12.4)
        ├─ 握手失败 → urma_active_setup_breakdown ... handshake_us[..] do_setup_us[0] status[err]  (§12.3 变体2)
        └─ 握手成功 → doSetupConnection(peer_eid, peer_jetty_num)   ← 主动端建
@@ -1076,6 +1085,8 @@ urma_import_jetty_breakdown index[{i}] peer_jetty_id[{id}] import_us[{us}] statu
 | `import_us` | `urma_import_jetty()` 调用耗时（微秒） |
 | `status` | 结果：`0` 成功，`-1` 失败 |
 
+> 光组网（k8s）分支中，`urma_import_jetty()` 的输入是握手携带的**委派 rjetty blob**（base64 解码后的可变长副本），导入前会先用 blob 内的 EID 与元数据 EID 做交叉校验（不一致即拒绝，防止过期元数据导入错误目标）。blob 导出与校验相关的日志见 §12.9。
+
 ### 12.7 `urma_bind_jetty_breakdown`
 
 ```
@@ -1091,6 +1102,100 @@ urma_bind_jetty_breakdown index[{i}] local_jetty_id[{id}] peer_jetty_id[{id}] bi
 | `peer_jetty_id` | 对端 jetty ID（即 imported jetty） |
 | `bind_us` | `urma_bind_jetty()` 调用耗时（微秒） |
 | `status` | 结果：`0` 成功 |
+
+### 12.8 UB 初始化日志序列（初始化阶段，建连之前）
+
+来源：`client_service.cpp`（Client 构造 / TE 安装）、`topology.cpp`、`urma_endpoint.cpp`（`UrmaContext::construct`）、`ub_context.h`、`ub_transport.cpp`。按发生顺序：
+
+```
+client_id=..., host_id=...                                  ← Client 构造
+ub protocol enabled device names: <dev[,dev]>               ← 显式设备列表（auto-discovery 关闭时）
+URMA module init success (topology discovery, temporary), ret=0
+UB device: <dev>, pci=<bus>, numa=<n>                       ← 设备发现（每设备一行）
+[WARNING] UB device <dev>: numa node unavailable; ...       ← 仅 numa<0 时出现
+Topology discovery complete with specified devices. Found <n> HCAs
+URMA module init success (owned), ret=0, depth=1            ← 传输层持有式 init
+Selected URMA device <dev>, EID index <i>, EID <eid>, transport mode <RM|RC|UM>
+created <n> jfce
+registered async fd to epoll
+create jfc(send) done, jfc id : <id>                        ← 每个发送 JFC 一行
+create jfc(recv) done, jfc id : <id>                        ← 每个接收 JFC 一行
+created <n> jfr
+UB worker scheduling: per-worker wait, workers=<w> jfcs=<n>
+finish construct context UrmaContext:{device_name: ..., max_endpoints: ..., async_fd: ...}, endpoint store ready
+device <dev> add to list
+ub resources init success
+allocated local segment id
+start handshake daemon done
+publish segments done
+```
+
+| 日志 | 含义 |
+|------|------|
+| `URMA module init success (topology discovery, temporary)` | 设备发现阶段临时 `urma_init`，发现结束即 `urma_uninit`；与下一处 owned init 成对出现是正常序列 |
+| `URMA module init success (owned), depth=1` | 传输层正式持有的 `urma_init`；`depth` 为进程内引用计数（多个 transport 实例共享时递增） |
+| `UB device: ..., numa=-1` | `-1` 表示无法从 `/sys/class/ubcore/<dev>/numa` 读到 NUMA 节点，NUMA 亲和对该设备不生效 |
+| `Selected URMA device ...` | 设备与 EID 的最终选择结果（EID 由 `MC_EID_INDEX` 决定），同时给出 `MC_URMA_TRANS_MODE` 解析后的传输模式 |
+| `registered async fd to epoll` | `urma_context->async_fd` 已注册进 epoll，后续异步事件（JETTY_ERR/PORT_DOWN 等）由事件线程处理 |
+| `UB worker scheduling: ...` | worker 线程数与 JFC 数（worker 按 `thread_id % jfcs` 条带轮询） |
+| `finish construct context ... endpoint store ready` | Context 构造完成；`max_endpoints` 为 endpoint 缓存容量（受设备 `max_jetty / num_jetty_per_ep` 约束） |
+| `allocated local segment id` | 已分配本地 segment 的元数据 ID（不是内存分配） |
+
+失败行为：若显式指定的设备列表匹配不到任何设备，初始化**直接失败**（`no UB device available ... refusing implicit mock fallback`），不会再静默退回 `mock_urma_device`；mock 设备仅当设备名被显式指定为 `mock_urma_device` 时可用。
+
+### 12.9 委派上下文（blob）链路日志（光组网 / k8s）
+
+光组网环境没有 UVS 控制面，段与 jetty 的跨节点布局信息改由应用侧手动交换：段上下文经 etcd 的 `tseg_ctx` 字段，jetty 上下文经握手 RPC 的 `rjetty_blobs` 字段，均为 base64 编码。相关日志如下。
+
+**导出侧（发布方）**
+
+```
+urma_get_rjetty_breakdown jetty_id[{id}] blob_len[{n}] export_us[{us}] status[{0/-1}]
+```
+
+| 字段 | 含义 |
+|------|------|
+| `jetty_id` | 本地 jetty ID |
+| `blob_len` | 导出 blob 的字节数（`urma_get_rjetty()` 返回长度） |
+| `export_us` | `urma_get_rjetty()` 调用耗时（微秒） |
+| `status` | `0` 成功；`-1` 失败（同时打 ERROR，并清空本次握手的 blob） |
+
+段上下文导出使用 VLOG(1)：`Exported delegated segment context, va=0x..., blob_len=N`。
+
+**导入侧（消费方）**
+
+```
+urma_import_seg_breakdown blob_len[{n}] va[0x{va}] import_us[{us}] status[{0/-1}]
+```
+
+仅在**首次导入**（缓存未命中）时输出；同一段的缓存命中静默。`va` 为远端段 UBVA。
+
+**握手报文规模**：`Encode/Decode: ... jetty_num size is {n} rjetty_blobs size is {n}`。
+
+**失败日志**
+
+| 日志 | 含义 |
+|------|------|
+| `[Handshake] peer did not provide an rjetty context blob (required by the UB import path)` | 握手缺少 jetty blob（对端版本不匹配） |
+| `[Handshake] invalid rjetty blob: ...` / `rjetty blob is smaller than urma_rjetty_t` | blob 解码失败 / 长度不足 |
+| `[Handshake] rjetty blob eid mismatch, stale metadata for peer ...` | **EID 交叉校验失败**：blob 内 EID 与元数据 EID 不一致，拒绝握手（`ERR_REJECT_HANDSHAKE`） |
+| `[UB] target segment has no context blob for target_id=... buffer_id=... device_id=... trace_id=...` | 对端 desc 缺少 `tseg_ctx`（旧格式/混部） |
+| `[UB] retrieveRemoteSeg failed for target_id=... ... trace_id=...` | submit 路径段导入失败 |
+| `[UB] retrieveRemoteSeg failed while redispatching target_id=... ... trace_id=...` | 重试路径段导入失败 |
+| `Invalid remote segment context blob` / `Remote segment context blob too small` / `Import segment Failed, blob size ...` | 段 blob 解码/长度/导入失败（`retrieveRemoteSeg` 内部） |
+| `Corrupted segment descriptor`（WARNING） | desc 解码校验失败：`tseg_ctx` 为空、与 `tseg` 不等长、名/地址/长度缺失 |
+
+**导入统计（诊断模式，`MC_UB_WORKER_DIAG=1`）**
+
+```
+ub_import_breakdown nic={nic} import_attempts_total={n} import_failures_total={n} import_suppressed_total={n}
+```
+
+仅 worker 0 每个诊断周期输出一次。段导入发生在**调用者线程**（不在 worker 指标内），故以池级累计值上报：
+
+- `import_attempts_total`：`retrieveRemoteSeg` 调用次数（含 submit 与 redispatch 两条路径）；
+- `import_failures_total`：导入失败次数（含 desc 缺 blob）；
+- `import_suppressed_total`：被 1 秒 target 抑制窗口快速判死的 slice 数。
 
 ---
 

@@ -141,7 +141,7 @@ PERF_KEY_DEF(UB_ENDPOINT_PASSIVE_SETUP,      "urma_endpoint.cpp::setupConnection
 PERF_KEY_DEF(UB_ENDPOINT_DO_SETUP_ALL,       "urma_endpoint.cpp::doSetupConnection",                    "DoSetupAll")
 PERF_KEY_DEF(UB_ENDPOINT_IMPORT_JETTY,       "urma_endpoint.cpp::doSetupConnection",                    "ImportJetty")
 PERF_KEY_DEF(UB_ENDPOINT_BIND_JETTY,         "urma_endpoint.cpp::doSetupConnection",                    "BindJetty")
-PERF_KEY_DEF(UB_ENDPOINT_GET_RJETTY,         "urma_endpoint.cpp::exportJettyInfos",                     "GetRjetty")
+PERF_KEY_DEF(UB_ENDPOINT_GET_RJETTY,         "urma_endpoint.cpp::JettyRjettyBlobs",                     "GetRjetty")
 
 // ============================================================
 // === Master 服务端打点（程序名 mooncake_master）           ===
@@ -345,3 +345,4 @@ PERF_KEY_DEF(MASTER_VSEG_PUT_START_DESCRIPTOR_BUILD,   "master_service.cpp::TryV
 PERF_KEY_DEF(MASTER_VSEG_PUT_START_SHARD_LOCK_WAIT,    "master_service.cpp::TryVSegmentPutStart", "VSegShardLockWait")
 PERF_KEY_DEF(MASTER_VSEG_PUT_START_METADATA_MUTATION,  "master_service.cpp::TryVSegmentPutStart", "VSegMetadataMutation")
 PERF_KEY_DEF(MASTER_VSEG_PUT_START_ROLLBACK,           "master_service.cpp::TryVSegmentPutStart", "VSegRollback")
+PERF_KEY_DEF(UB_SEGMENT_IMPORT,              "urma_endpoint.cpp::retrieveRemoteSeg",                    "ImportSeg")

@@ -464,7 +464,7 @@ int UbTransport::install(std::string& local_server_name,
         uninit(this);
         return ret;
     }
-    LOG(INFO) << "Transfer engine allocate local segment done";
+    LOG(INFO) << "Transfer engine allocated local segment id";
 
     ret = startHandshakeDaemon(local_server_name);
     if (ret) {
@@ -1042,10 +1042,14 @@ int UbTransport::initializeUbResources(UbTransport* t) {
         hca_list = t->local_topology_->getHcaList();
     }
 
-    // If no devices from topology, use mock device
+    // Never silently fall back to the mock device: an empty HCA list means the
+    // requested device list matched nothing (misconfiguration or discovery
+    // failure). The mock device is only usable when the caller names it
+    // explicitly in the device list.
     if (hca_list.empty()) {
-        hca_list.push_back("mock_urma_device");
-        LOG(INFO) << "Using mock_urma_device for testing";
+        LOG(ERROR) << "UbTransport: no UB device available; requested device "
+                      "list matched nothing (refusing implicit mock fallback)";
+        return ERR_DEVICE_NOT_FOUND;
     }
 
     for (auto& device_name : hca_list) {

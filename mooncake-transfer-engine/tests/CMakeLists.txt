@@ -571,15 +571,6 @@ if(USE_UB)
   target_link_libraries(urma_eid_test PRIVATE gtest gtest_main)
   add_test(NAME urma_eid_test COMMAND urma_eid_test)
 
-  add_executable(urma_compat_test ${WORKSPACE}/urma_compat_test.cpp)
-  target_include_directories(urma_compat_test PRIVATE ${urma_INCLUDE_DIR})
-  target_link_libraries(urma_compat_test PRIVATE transfer_engine gtest
-                                                   gtest_main)
-  if(NOT URMA_LIBRARY)
-    target_compile_definitions(urma_compat_test PRIVATE MOONCAKE_MOCK_URMA=1)
-  endif()
-  add_test(NAME urma_compat_test COMMAND urma_compat_test)
-
   add_executable(ub_transport_test ${WORKSPACE}/ub_transport_test.cpp)
   target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest
                                                  gtest_main glog::glog pthread)
@@ -672,6 +663,13 @@ add_executable(glog_preinitialized_test
 target_link_libraries(glog_preinitialized_test PUBLIC transfer_engine gtest
                                                       gtest_main glog::glog)
 add_test(NAME glog_preinitialized_test COMMAND glog_preinitialized_test)
+
+add_executable(ub_bonding_policy_test
+               ${WORKSPACE}/ub_bonding_policy_test.cpp)
+target_link_libraries(ub_bonding_policy_test PUBLIC gtest gtest_main)
+target_include_directories(
+  ub_bonding_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME ub_bonding_policy_test COMMAND ub_bonding_policy_test)
 
 add_executable(rdma_gid_probe_test ${WORKSPACE}/rdma_gid_probe_test.cpp)
 target_link_libraries(rdma_gid_probe_test PUBLIC transfer_engine gtest

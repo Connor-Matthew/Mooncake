@@ -27,9 +27,18 @@
 #include "urma_ubagg.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
-#include "transport/kunpeng_transport/urma/urma_compat.h"
 
 namespace mooncake {
+
+// Redirect liburma driver logs (default rsyslog) into the application's glog
+// output. Enabled explicitly with MC_URMA_LOG_REDIRECT=1; idempotent, safe to
+// call from any init path before urma_init(). Registers both the plain
+// callback (urma_register_log_func, which is the only one propagated to
+// provider drivers) and the location callback
+// (urma_register_loc_log_func). Levels follow urma_vlog_level_t:
+// 0-3 -> ERROR, 4-5 -> WARNING, 6 -> INFO, 7 -> VLOG(1).
+void UrmaRegisterLogRedirectIfEnabled();
+
 struct UrmaJFC {
     UrmaJFC() : native(nullptr), outstanding(0) {}
 
@@ -193,27 +202,17 @@ class UrmaEndpoint : public UbEndPoint {
    private:
     std::vector<uint32_t> JettyNum() const;
 
-    // Export per-jetty peer info for the handshake: driver-delegated rjetty
-    // blob (hex) when urma_get_rjetty is available, plus id/uasid/trans_mode
-    // used by the receiver's hand-fill fallback. Blobs are exported fresh on
-    // every handshake: they are transient per-peer-pair data and jetty list
-    // may have been rebuilt since the previous handshake.
-    void exportJettyInfos(TransferMetadata::HandShakeDesc& desc) const;
+    std::vector<std::string> JettyRjettyBlobs() const;
 
-    int doSetupConnection(
-        const std::string& peer_eid,
-        std::vector<uint32_t> peer_jetty_num_list,
-        std::string* reply_msg = nullptr,
-        const std::vector<TransferMetadata::HandShakeDesc::PeerJettyInfo>*
-            peer_jetty_infos = nullptr,
-        int peer_trans_mode = -1);
+    int doSetupConnection(const std::string& peer_eid,
+                          std::vector<uint32_t> peer_jetty_num_list,
+                          std::vector<std::string> peer_rjetty_blobs,
+                          std::string* reply_msg = nullptr);
 
-    int doSetupConnection(
-        int qp_index, const std::string& peer_eid, uint32_t peer_jetty_num,
-        std::string* reply_msg = nullptr,
-        const TransferMetadata::HandShakeDesc::PeerJettyInfo* peer_jetty_info =
-            nullptr,
-        int peer_trans_mode = -1);
+    int doSetupConnection(int qp_index, const std::string& peer_eid,
+                          uint32_t peer_jetty_num,
+                          const std::string& peer_rjetty_blob,
+                          std::string* reply_msg = nullptr);
 
    private:
     UrmaContext* context_;

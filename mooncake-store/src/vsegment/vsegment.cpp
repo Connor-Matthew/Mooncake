@@ -1,9 +1,20 @@
 #include "vsegment/vsegment.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <set>
 #include <sstream>
+#include <string>
+
+#if defined(__aarch64__) && defined(__GNUC__)
+#include <arm_acle.h>
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#define MOONCAKE_VSEGMENT_ARM_CRC 1
+#endif
 
 #include "crc32c.h"
 
@@ -19,16 +30,85 @@ ErrorCode Invalid(std::string message, std::string* detail) {
     return ErrorCode::INVALID_PARAMS;
 }
 
-void AppendUint64(std::string& output, uint64_t value) {
-    for (unsigned shift = 0; shift < 64; shift += 8) {
-        output.push_back(static_cast<char>((value >> shift) & 0xff));
-    }
+#ifdef MOONCAKE_VSEGMENT_ARM_CRC
+// CRC-32C via the ARMv8 CRC32C instructions. Same polynomial, same bit order and
+// same init/final XOR as mooncake::Crc32c, so the produced value is identical;
+// the instructions only make it faster. The instruction is optional on ARMv8.0,
+// so it is only used when the CPU advertises it.
+bool ArmCrc32Available() {
+    static const bool available = (getauxval(AT_HWCAP) & HWCAP_CRC32) != 0;
+    return available;
 }
 
-void AppendString(std::string& output, const std::string& value) {
-    AppendUint64(output, value.size());
-    output.append(value);
+__attribute__((target("arch=armv8-a+crc"))) uint32_t Crc32cArmUpdate(
+    uint32_t crc, const uint8_t* data, size_t len) {
+    while (len >= 8) {
+        uint64_t chunk;
+        std::memcpy(&chunk, data, sizeof(chunk));
+        // The instruction consumes the register as a little-endian byte
+        // sequence, while the checksum covers the bytes in memory order. A
+        // plain native load is therefore only correct on little-endian; on
+        // aarch64_be it would reverse every 8-byte window and change the wire
+        // value, so convert explicitly instead of relying on the host order.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+    (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+        chunk = __builtin_bswap64(chunk);
+#endif
+        crc = __crc32cd(crc, chunk);
+        data += 8;
+        len -= 8;
+    }
+    while (len > 0) {
+        crc = __crc32cb(crc, *data);
+        ++data;
+        --len;
+    }
+    return crc;
 }
+#endif
+
+// Feeds the view serialization straight into the checksum instead of building an
+// intermediate std::string. The byte stream is byte-for-byte the same as before,
+// so ComputeViewChecksum returns the same value for every input.
+class ViewChecksumStream {
+   public:
+    void Extend(const void* data, size_t len) {
+#ifdef MOONCAKE_VSEGMENT_ARM_CRC
+        if (use_hw_) {
+            state_ = Crc32cArmUpdate(state_, static_cast<const uint8_t*>(data), len);
+            return;
+        }
+#endif
+        table_.Extend(data, len);
+    }
+
+    void ExtendUint64(uint64_t value) {
+        uint8_t bytes[8];
+        for (unsigned shift = 0; shift < 64; shift += 8) {
+            bytes[shift / 8] = static_cast<uint8_t>((value >> shift) & 0xff);
+        }
+        Extend(bytes, sizeof(bytes));
+    }
+
+    void ExtendString(const std::string& value) {
+        ExtendUint64(value.size());
+        Extend(value.data(), value.size());
+    }
+
+    uint32_t Final() const {
+#ifdef MOONCAKE_VSEGMENT_ARM_CRC
+        if (use_hw_) return state_ ^ 0xFFFFFFFFu;
+#endif
+        return table_.Final();
+    }
+
+   private:
+    mooncake::Crc32c table_;
+#ifdef MOONCAKE_VSEGMENT_ARM_CRC
+    bool use_hw_{ArmCrc32Available()};
+    uint32_t state_{0xFFFFFFFFu};
+#endif
+};
 
 }  // namespace
 
@@ -191,19 +271,19 @@ ErrorCode ValidatePublishedConfig(
 }
 
 uint32_t ComputeViewChecksum(const VSegmentView& view) {
-    std::string bytes;
-    AppendString(bytes, view.vsegment_id);
-    AppendString(bytes, view.partition_id);
-    AppendUint64(bytes, static_cast<uint8_t>(view.mapping_algorithm));
-    AppendUint64(bytes, view.stripe_size);
-    AppendUint64(bytes, view.logical_capacity);
-    AppendUint64(bytes, view.members.size());
+    ViewChecksumStream stream;
+    stream.ExtendString(view.vsegment_id);
+    stream.ExtendString(view.partition_id);
+    stream.ExtendUint64(static_cast<uint8_t>(view.mapping_algorithm));
+    stream.ExtendUint64(view.stripe_size);
+    stream.ExtendUint64(view.logical_capacity);
+    stream.ExtendUint64(view.members.size());
     for (const auto& member : view.members) {
-        AppendString(bytes, member.segment_id);
-        AppendUint64(bytes, member.base_offset);
-        AppendUint64(bytes, member.length);
+        stream.ExtendString(member.segment_id);
+        stream.ExtendUint64(member.base_offset);
+        stream.ExtendUint64(member.length);
     }
-    return Crc32cValue(bytes.data(), bytes.size());
+    return stream.Final();
 }
 
 ErrorCode ValidateView(const VSegmentView& view,

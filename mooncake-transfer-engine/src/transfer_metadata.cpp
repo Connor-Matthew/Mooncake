@@ -243,23 +243,13 @@ struct TransferHandshakeUtil {
         Json::Value jettyNums(Json::arrayValue);
         for (const auto &jetty : desc.jetty_num) jettyNums.append(jetty);
         root["jetty_num"] = jettyNums;
-        if (desc.trans_mode >= 0) root["trans_mode"] = desc.trans_mode;
-        if (!desc.jetty_infos.empty()) {
-            Json::Value jettyInfos(Json::arrayValue);
-            for (const auto &info : desc.jetty_infos) {
-                Json::Value item;
-                item["id"] = info.id;
-                item["uasid"] = info.uasid;
-                item["rjetty"] = info.rjetty;
-                jettyInfos.append(item);
-            }
-            root["jetty_infos"] = jettyInfos;
-        }
+        Json::Value rjettyBlobs(Json::arrayValue);
+        for (const auto &blob : desc.rjetty_blobs) rjettyBlobs.append(blob);
+        root["rjetty_blobs"] = rjettyBlobs;
         MC_LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
                      << " peer_nic_path is " << desc.peer_nic_path
                      << " jetty_num size is " << desc.jetty_num.size()
-                     << " jetty_infos size is " << desc.jetty_infos.size()
-                     << " trans_mode is " << desc.trans_mode;
+                     << " rjetty_blobs size is " << desc.rjetty_blobs.size();
         pt.End(0);
 #endif
         return root;
@@ -333,25 +323,13 @@ struct TransferHandshakeUtil {
         for (const auto &jetty : root["jetty_num"]) {
             desc.jetty_num.push_back(jetty.asUInt());
         }
-        if (root.isMember("trans_mode") && root["trans_mode"].isInt()) {
-            desc.trans_mode = root["trans_mode"].asInt();
-        } else {
-            desc.trans_mode = -1;
-        }
-        if (root.isMember("jetty_infos") && root["jetty_infos"].isArray()) {
-            for (const auto &item : root["jetty_infos"]) {
-                TransferMetadata::HandShakeDesc::PeerJettyInfo info;
-                info.id = item["id"].asUInt();
-                info.uasid = item["uasid"].asUInt();
-                info.rjetty = item["rjetty"].asString();
-                desc.jetty_infos.push_back(std::move(info));
-            }
+        for (const auto &blob : root["rjetty_blobs"]) {
+            desc.rjetty_blobs.push_back(blob.asString());
         }
         MC_LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
                      << " peer_nic_path is " << desc.peer_nic_path
                      << " jetty_num size is " << desc.jetty_num.size()
-                     << " jetty_infos size is " << desc.jetty_infos.size()
-                     << " trans_mode is " << desc.trans_mode;
+                     << " rjetty_blobs size is " << desc.rjetty_blobs.size();
         pt.End(0);
 #endif
         return 0;
@@ -710,6 +688,9 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             Json::Value tsegJSON(Json::arrayValue);
             for (auto &entry : buffer.tseg) tsegJSON.append(entry);
             bufferJSON["tseg"] = tsegJSON;
+            Json::Value tsegCtxJSON(Json::arrayValue);
+            for (auto &entry : buffer.tseg_ctx) tsegCtxJSON.append(entry);
+            bufferJSON["tseg_ctx"] = tsegCtxJSON;
             bufferJSON["chip_id"] = buffer.chip_id;
             buffersJSON.append(bufferJSON);
         }
@@ -1208,12 +1189,16 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &tsegJSON : bufferJSON["tseg"]) {
                 buffer.tseg.push_back(tsegJSON.asString());
             }
+            for (const auto &tsegCtxJSON : bufferJSON["tseg_ctx"]) {
+                buffer.tseg_ctx.push_back(tsegCtxJSON.asString());
+            }
             // Backward compatible: old peers don't publish chip_id -> keep -1.
             buffer.chip_id = bufferJSON.isMember("chip_id")
                                  ? bufferJSON["chip_id"].asInt()
                                  : -1;
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
-                buffer.tseg.empty()) {
+                buffer.tseg.empty() || buffer.tseg_ctx.empty() ||
+                buffer.tseg_ctx.size() != buffer.tseg.size()) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol;
                 return nullptr;

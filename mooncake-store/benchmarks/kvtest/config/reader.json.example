@@ -1,0 +1,28 @@
+{
+  "mode": "pipeline",
+  "instance_id": 1,
+  "listen_port": 9001,
+  "notify_rpc_port": 19001,
+  "role": "reader",
+  "notify_pipeline": ["getBuffer"],
+  "num_threads": 1,
+  "num_total_threads": 5,
+  "data_sizes": ["8MB"],
+  "metrics_interval_ms": 3000,
+  "output_dir": "kvtest-reader-output",
+  "verify_level": "sample",
+  "verify_sample_bytes": "4KB",
+  "verify_sample_step_bytes": "1MB",
+  "verify_fail_op": true,
+  "store": {
+    "local_hostname": "10.0.0.2:12345",
+    "metadata_server": "http://10.0.0.10:8080/metadata",
+    "global_segment_size": 0,
+    "local_buffer_size": "8GB",
+    "protocol": "ub",
+    "rdma_devices": "bonding_dev_0",
+    "master_server_address": "10.0.0.10:50051",
+    "tenant_id": "default",
+    "replica_num": 1
+  }
+}

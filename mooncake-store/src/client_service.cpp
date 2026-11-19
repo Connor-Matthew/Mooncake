@@ -491,9 +491,10 @@ Client::Client(const std::string& local_hostname,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
-    LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
+    } else {
+        LOG(INFO) << "client_id=" << client_id_;
     }
     if (object_checksum_enabled_) {
         LOG(INFO) << "Object checksum validation is enabled";

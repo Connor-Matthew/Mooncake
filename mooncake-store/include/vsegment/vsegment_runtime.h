@@ -110,6 +110,9 @@ class LogicalRangeAllocator {
                       std::string* detail = nullptr);
 
     uint64_t FreeBytes() const;
+    // Bytes held by in-flight PutStart reservations. Together with
+    // FreeBytes() and the committed ranges this partitions logical_capacity_.
+    uint64_t ReservedBytes() const;
     size_t ReservationCount() const;
     size_t CommittedCount() const;
     bool Empty() const;
@@ -154,9 +157,15 @@ struct ResolveResult {
 
 // Splits on both stripe and Client Slice boundaries. The output preserves
 // logical order, while execution may complete in any order.
+// `prevalidated` lets a caller that already ran ValidateViewStructure on this
+// exact view skip the duplicate check. VSegmentTransferPlanner::Plan does that
+// and keeps its own CHECKSUM_MISMATCH contract, so the production error code
+// and detail are unchanged. The default preserves the standalone contract for
+// other callers and for unit tests.
 ResolveResult ResolveTransfer(const VSegmentView& view,
                               uint64_t logical_offset, uint64_t length,
-                              const std::vector<ClientSlice>& slices);
+                              const std::vector<ClientSlice>& slices,
+                              bool prevalidated = false);
 
 // Serializes overlapping creation calls for the same creation_key. The owner
 // stores durable results and calls Forget after publishing them.

@@ -29,6 +29,136 @@
 namespace mooncake {
 namespace {
 
+class UrmaBondingEnvTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        SaveAndUnset("MC_URMA_BONDING_MODE", saved_mode_);
+        SaveAndUnset("MC_URMA_BONDING_LEVEL", saved_level_);
+    }
+
+    void TearDown() override {
+        Restore("MC_URMA_BONDING_MODE", saved_mode_);
+        Restore("MC_URMA_BONDING_LEVEL", saved_level_);
+    }
+
+    static void SaveAndUnset(const char* name,
+                             std::optional<std::string>& saved) {
+        if (const char* value = std::getenv(name)) saved = value;
+        ::unsetenv(name);
+    }
+
+    static void Restore(const char* name,
+                        const std::optional<std::string>& saved) {
+        if (saved) {
+            ::setenv(name, saved->c_str(), 1);
+        } else {
+            ::unsetenv(name);
+        }
+    }
+
+    std::optional<std::string> saved_mode_;
+    std::optional<std::string> saved_level_;
+};
+
+TEST_F(UrmaBondingEnvTest, DefaultsPreserveLegacyModeAndPortLevel) {
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.urma_bonding_mode, UrmaBondingMode::kAuto);
+    EXPECT_EQ(config.urma_bonding_level, UrmaBondingLevel::kPort);
+}
+
+TEST_F(UrmaBondingEnvTest, AcceptsAllBondingModes) {
+    const std::pair<const char*, UrmaBondingMode> cases[] = {
+        {"BALANCE", UrmaBondingMode::kBalance},
+        {"standalone", UrmaBondingMode::kStandalone},
+        {"ACTIVE-BACKUP", UrmaBondingMode::kActiveBackup},
+        {"active_backup", UrmaBondingMode::kActiveBackup},
+    };
+    for (const auto& [value, expected] : cases) {
+        ASSERT_EQ(::setenv("MC_URMA_BONDING_MODE", value, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.urma_bonding_mode, expected);
+    }
+}
+
+TEST_F(UrmaBondingEnvTest, AcceptsBothBondingLevels) {
+    const std::pair<const char*, UrmaBondingLevel> cases[] = {
+        {"IODIE", UrmaBondingLevel::kIodie},
+        {"port", UrmaBondingLevel::kPort},
+    };
+    for (const auto& [value, expected] : cases) {
+        ASSERT_EQ(::setenv("MC_URMA_BONDING_LEVEL", value, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.urma_bonding_level, expected);
+    }
+}
+
+TEST_F(UrmaBondingEnvTest, InvalidValuesPreserveConfiguredValues) {
+    ASSERT_EQ(::setenv("MC_URMA_BONDING_MODE", "invalid", 1), 0);
+    ASSERT_EQ(::setenv("MC_URMA_BONDING_LEVEL", "invalid", 1), 0);
+    GlobalConfig config;
+    config.urma_bonding_mode = UrmaBondingMode::kActiveBackup;
+    config.urma_bonding_level = UrmaBondingLevel::kIodie;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.urma_bonding_mode, UrmaBondingMode::kActiveBackup);
+    EXPECT_EQ(config.urma_bonding_level, UrmaBondingLevel::kIodie);
+}
+
+class UbElectricalNetworkEnvTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        if (const char* value =
+                std::getenv("MC_UB_ELECTRICAL_NETWORK_ENABLE")) {
+            saved_ = value;
+        }
+        ::unsetenv("MC_UB_ELECTRICAL_NETWORK_ENABLE");
+    }
+    void TearDown() override {
+        if (saved_) {
+            ::setenv("MC_UB_ELECTRICAL_NETWORK_ENABLE", saved_->c_str(), 1);
+        } else {
+            ::unsetenv("MC_UB_ELECTRICAL_NETWORK_ENABLE");
+        }
+    }
+    std::optional<std::string> saved_;
+};
+
+TEST_F(UbElectricalNetworkEnvTest, DefaultsToElectricalNetwork) {
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_TRUE(config.ub_electrical_network);
+}
+
+TEST_F(UbElectricalNetworkEnvTest, AcceptsElectricalValues) {
+    for (const char* value : {"true", "1", "on"}) {
+        ASSERT_EQ(::setenv("MC_UB_ELECTRICAL_NETWORK_ENABLE", value, 1), 0);
+        GlobalConfig config;
+        config.ub_electrical_network = false;
+        loadGlobalConfig(config);
+        EXPECT_TRUE(config.ub_electrical_network);
+    }
+}
+
+TEST_F(UbElectricalNetworkEnvTest, AcceptsOpticalValues) {
+    for (const char* value : {"false", "0", "off"}) {
+        ASSERT_EQ(::setenv("MC_UB_ELECTRICAL_NETWORK_ENABLE", value, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_FALSE(config.ub_electrical_network);
+    }
+}
+
+TEST_F(UbElectricalNetworkEnvTest, InvalidValuePreservesConfiguration) {
+    ASSERT_EQ(
+        ::setenv("MC_UB_ELECTRICAL_NETWORK_ENABLE", "invalid", 1), 0);
+    GlobalConfig config;
+    config.ub_electrical_network = false;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.ub_electrical_network);
+}
+
 class EidIndexEnvTest : public ::testing::Test {
    protected:
     void SetUp() override {

@@ -47,6 +47,7 @@
 #ifdef USE_UB
 #include <libgen.h>
 #include <urma_api.h>
+#include "transport/kunpeng_transport/urma/urma_endpoint.h"
 #endif
 
 namespace mooncake {
@@ -217,11 +218,13 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
 
     struct ibv_device **device_list = ibv_get_device_list(&num_devices);
     if (!device_list) {
-        LOG(WARNING) << "No RDMA devices found, check your device installation";
+        LOG(WARNING)
+            << "No RDMA devices found during RDMA topology discovery";
         return {};
     }
     if (device_list && num_devices <= 0) {
-        LOG(WARNING) << "No RDMA devices found, check your device installation";
+        LOG(WARNING)
+            << "No RDMA devices found during RDMA topology discovery";
         ibv_free_device_list(device_list);
         return {};
     }
@@ -462,14 +465,18 @@ static std::vector<UBDevice> listUBDevices(
     std::vector<UBDevice> devices;
 
     urma_init_attr_t init_attr = {};
+    // Capture device-discovery-phase driver logs too (no-op unless
+    // MC_URMA_LOG_REDIRECT is set). Registered before urma_init; idempotent.
+    UrmaRegisterLogRedirectIfEnabled();
     auto ret = urma_init(&init_attr);
     if (ret != URMA_SUCCESS && ret != URMA_EEXIST) {
         LOG(WARNING) << "Failed to urma init, ret=" << ret;
         return {};
     }
     const bool need_uninit = (ret == URMA_SUCCESS);
-    LOG(INFO) << "URMA module init success, ret=" << ret
-              << ", need_uninit=" << need_uninit;
+    LOG(INFO) << "URMA module init success (topology discovery, temporary), "
+                 "ret="
+              << ret << ", need_uninit=" << need_uninit;
 
     urma_device_t **device_list = urma_get_device_list(&num_devices);
     if (!device_list) {
@@ -494,19 +501,18 @@ static std::vector<UBDevice> listUBDevices(
         // Get the PCI bus id for the infiniband device. Note that
         snprintf(path, sizeof(path), "/sys/class/ubcore/%s",
                  device_list[i]->name);
-        LOG(INFO) << "listUBDevices: path " << path;
+        VLOG(1) << "listUBDevices: path " << path;
         if (realpath(path, resolved_path) == NULL) {
-            LOG(ERROR) << "listUBDevices: realpath " << resolved_path
-                       << " failed";
+            LOG(ERROR) << "listUBDevices: realpath failed for " << path;
             continue;
         }
-        LOG(INFO) << "listUBDevices: realpath " << resolved_path;
+        VLOG(1) << "listUBDevices: realpath " << resolved_path;
         std::string pci_bus_id = basename(resolved_path);
 
         int numa_node = -1;
         snprintf(path, sizeof(path), "%s/numa",
                  dirname(dirname(resolved_path)));
-        LOG(INFO) << "listUBDevices: numanodepath " << path;
+        VLOG(1) << "listUBDevices: numanodepath " << path;
         // The ubcore "numa" attribute is written in hex (e.g. "0x01"), unlike
         // the infiniband "numa_node" which is decimal. A plain `>> int` parses
         // "0x01" as 0 (stops at 'x'), so read as string and pick the base by
@@ -520,8 +526,13 @@ static std::vector<UBDevice> listUBDevices(
                            : 10;
             numa_node = static_cast<int>(strtol(numa_str.c_str(), nullptr, base));
         }
-        LOG(INFO) << "UBDevices : performation node ----"
-                  << device_list[i]->name << " : " << numa_node;
+        LOG(INFO) << "UB device: " << device_list[i]->name
+                  << ", pci=" << pci_bus_id << ", numa=" << numa_node;
+        if (numa_node < 0) {
+            LOG(WARNING) << "UB device " << device_list[i]->name
+                         << ": numa node unavailable; NUMA affinity cannot be "
+                            "applied for this device";
+        }
 
         devices.push_back(UBDevice{.name = std::move(device_name),
                                    .pci_bus_id = std::move(pci_bus_id),
