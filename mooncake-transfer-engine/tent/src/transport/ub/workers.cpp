@@ -8,8 +8,13 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <thread>
 #include <unordered_set>
 #include <utility>
+
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 #include <glog/logging.h>
 
@@ -44,13 +49,25 @@ constexpr uint64_t kRailProbeEndpointGeneration = 1;
 // only one candidate.
 constexpr size_t kMinResolvedCandidates = 2;
 
+inline void cpuRelax() {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::this_thread::yield();
+#endif
+}
+
 }  // namespace
 
 struct UbWorkers::Route {
     SegmentDescRef pin;
     BufferDesc* remote_buffer{nullptr};
+    // Decoded once per slice and reused by device ordering and the import.
     UbBufferMetadata metadata;
     std::vector<Topology::NicID> remote_devices;
+    std::string local_location{kWildcardLocation};
 };
 
 struct UbWorkers::Inflight {
@@ -169,6 +186,7 @@ Status UbWorkers::stop() {
                 queue.pop_front();
             }
         }
+        queued_hint_.store(0, std::memory_order_relaxed);
     }
     for (auto& pending : abandoned) {
         if (pending.slice) pending.slice->requestCancellation();
@@ -360,6 +378,9 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
                         --inserted_counts[priority];
                     }
                 }
+            } else {
+                queued_hint_.fetch_add(pending.size(),
+                                       std::memory_order_release);
             }
         }
     }
@@ -403,7 +424,37 @@ size_t UbWorkers::inflightCount() const {
     return inflight_.size();
 }
 
+bool UbWorkers::withinIdleSpin(uint64_t now_ns, uint64_t last_ns,
+                               uint32_t window_us) const {
+    if (window_us == 0 || last_ns == 0) return false;
+    // last_ns may be published by another thread after now_ns was sampled.
+    if (last_ns >= now_ns) return true;
+    return now_ns - last_ns < static_cast<uint64_t>(window_us) * 1000ULL;
+}
+
+void UbWorkers::spinForPending() {
+    if (params_.post_idle_spin_us == 0) return;
+    if (queued_hint_.load(std::memory_order_acquire) != 0) return;
+    bool expected = false;
+    if (!post_spinner_active_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+    // Spin only while the previous post is recent. The caller always falls
+    // through to the locked condition-variable wait, which rechecks the
+    // queues, so leaving the spin early or late can never lose a wakeup.
+    while (posting_.load(std::memory_order_acquire) &&
+           queued_hint_.load(std::memory_order_acquire) == 0 &&
+           withinIdleSpin(steadyNowNs(),
+                          last_post_ns_.load(std::memory_order_relaxed),
+                          params_.post_idle_spin_us)) {
+        cpuRelax();
+    }
+    post_spinner_active_.store(false, std::memory_order_release);
+}
+
 bool UbWorkers::popPending(PendingSlice& pending) {
+    spinForPending();
     std::unique_lock<std::mutex> lock(queue_mutex_);
     queue_cv_.wait(lock, [this] {
         if (!posting_.load(std::memory_order_acquire)) return true;
@@ -417,6 +468,7 @@ bool UbWorkers::popPending(PendingSlice& pending) {
         if (!queue.empty()) {
             pending = std::move(queue.front());
             queue.pop_front();
+            queued_hint_.fetch_sub(1, std::memory_order_relaxed);
             return true;
         }
     }
@@ -432,9 +484,15 @@ void UbWorkers::postingLoop(size_t worker_index) {
 }
 
 void UbWorkers::pollingLoop(size_t poller_index) {
+#if defined(__linux__)
+    // The default 50us timer slack would stretch the 20us idle sleep below
+    // to as much as 70us of completion latency.
+    (void)prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+#endif
     const size_t poller_count = std::max<size_t>(
         1, std::min<size_t>(params_.poller_count, all_jfcs_.size()));
     uint64_t last_timeout_scan = 0;
+    uint64_t last_progress_ns = 0;
     while (polling_.load(std::memory_order_acquire)) {
         bool progressed = false;
         for (size_t index = poller_index; index < all_jfcs_.size();
@@ -473,8 +531,19 @@ void UbWorkers::pollingLoop(size_t poller_index) {
             scanTimeouts();
             last_timeout_scan = now;
         }
-        if (!progressed)
-            std::this_thread::sleep_for(std::chrono::microseconds(20));
+        if (progressed) {
+            last_progress_ns = now;
+            continue;
+        }
+        // Keep polling while a post or completion is recent so a sparse
+        // foreground transfer does not wait out a sleep after its WR lands.
+        const uint64_t last_activity_ns = std::max(
+            last_progress_ns, last_post_ns_.load(std::memory_order_relaxed));
+        if (withinIdleSpin(now, last_activity_ns, params_.poll_idle_spin_us)) {
+            cpuRelax();
+            continue;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
 }
 
@@ -494,6 +563,7 @@ void UbWorkers::enqueueRetry(const PendingSlice& pending) {
             queues_[std::clamp(pending.priority, static_cast<int>(PRIO_HIGH),
                                static_cast<int>(PRIO_LOW))]
                 .push_back(pending);
+            queued_hint_.fetch_add(1, std::memory_order_release);
         }
     }
     if (stopped) {
@@ -526,6 +596,7 @@ void UbWorkers::deferPending(const PendingSlice& pending) {
             queues_[std::clamp(pending.priority, static_cast<int>(PRIO_HIGH),
                                static_cast<int>(PRIO_LOW))]
                 .push_back(pending);
+            queued_hint_.fetch_add(1, std::memory_order_release);
             lock.unlock();
             queue_cv_.notify_one();
             return;
@@ -558,7 +629,8 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
             if (!status.ok()) return status;
             route.remote_buffer = buffer;
             route.metadata = std::move(metadata);
-            route.remote_devices = orderedRemoteDevices(*segment, *buffer);
+            route.remote_devices =
+                orderedRemoteDevices(*segment, *buffer, route.metadata);
             if (route.remote_devices.empty()) {
                 return Status::DeviceNotFound(
                     "UB target has no active advertised device" LOC_MARK);
@@ -567,15 +639,23 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
         });
 }
 
+std::string UbWorkers::localLocationOf(const PendingSlice& pending) const {
+    // The registration already probed the buffer; reuse that unless it
+    // spanned several locations, so the common path makes no NUMA syscall.
+    auto location = buffers_->localLocation(
+        reinterpret_cast<uint64_t>(pending.slice->spec().local_address));
+    if (!location.empty()) return location;
+    auto locations = Platform::getLoader().getLocation(
+        pending.slice->spec().local_address, 1, true);
+    if (!locations.empty()) return locations.front().location;
+    return kWildcardLocation;
+}
+
 std::vector<UbWorkers::LocalDeviceCandidate> UbWorkers::orderedLocalDevices(
-    const PendingSlice& pending) const {
+    const PendingSlice& pending, const std::string& location) const {
     std::vector<LocalDeviceCandidate> ordered;
     std::unordered_set<Topology::NicID> seen;
     std::unordered_map<Topology::NicID, size_t> device_rank;
-    std::string location = kWildcardLocation;
-    auto locations = Platform::getLoader().getLocation(
-        pending.slice->spec().local_address, 1, true);
-    if (!locations.empty()) location = locations.front().location;
 
     auto append = [&](Topology::NicID id) {
         auto found = context_by_topology_id_.find(id);
@@ -623,12 +703,9 @@ std::vector<UbWorkers::LocalDeviceCandidate> UbWorkers::orderedLocalDevices(
 }
 
 std::vector<Topology::NicID> UbWorkers::orderedRemoteDevices(
-    const SegmentDesc& segment, const BufferDesc& buffer) {
+    const SegmentDesc& segment, const BufferDesc& buffer,
+    const UbBufferMetadata& metadata) {
     std::vector<Topology::NicID> ordered;
-    auto attr = buffer.transport_attrs.find(TransportType::UB);
-    if (attr == buffer.transport_attrs.end()) return ordered;
-    UbBufferMetadata metadata;
-    if (!decodeBufferMetadata(attr->second, metadata).ok()) return ordered;
     std::unordered_set<Topology::NicID> advertised;
     for (const auto& item : metadata.segments) {
         advertised.insert(item.topology_id);
@@ -674,7 +751,8 @@ Status UbWorkers::chooseAndResolveEndpoint(
         QuotaAvailability capacity;
     };
 
-    const auto local_devices = orderedLocalDevices(pending);
+    const auto local_devices =
+        orderedLocalDevices(pending, route.local_location);
     if (route.remote_devices.empty()) {
         return Status::DeviceNotFound("No usable UB posting path" LOC_MARK);
     }
@@ -876,13 +954,14 @@ void UbWorkers::processPending(const PendingSlice& pending,
         }
         return;
     }
+    route.local_location = localLocationOf(pending);
     if (traced && pending.slice->spec().request_offset == 0) {
-        const auto locations = Platform::getLoader().getLocation(
-            pending.slice->spec().local_address, 1, true);
         pending.task->noteTraceLocations(
-            locations.empty() ? std::string() : locations.front().location,
+            route.local_location == kWildcardLocation ? std::string()
+                                                      : route.local_location,
             route.remote_buffer->location);
     }
+    const uint64_t route_ready_ns = traced ? steadyNowNs() : 0;
 
     std::shared_ptr<UbEndpoint> endpoint;
     UbPostPath path;
@@ -901,6 +980,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
         }
         return;
     }
+    const uint64_t path_selected_ns = traced ? steadyNowNs() : 0;
 
     LocalSegmentRef local;
     status = buffers_->findLocal(
@@ -914,7 +994,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
     ImportedSegmentRef remote;
     status = buffers_->importRemote(pending.target_id, path.local_topology_id,
                                     path.remote_device_id, *route.remote_buffer,
-                                    pending.opcode,
+                                    route.metadata, pending.opcode,
                                     pending.slice->spec().remote_address,
                                     pending.slice->spec().length, remote);
     if (!status.ok()) {
@@ -930,6 +1010,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
         }
         return;
     }
+    const uint64_t segments_ready_ns = traced ? steadyNowNs() : 0;
 
     if (!endpoint->tryAcquireOutstanding(pending.slice->spec().length)) {
         (void)quota_->release(reservation);
@@ -959,6 +1040,10 @@ void UbWorkers::processPending(const PendingSlice& pending,
         inflight->posted_ns,
         static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL);
 
+    if (traced) {
+        pending.slice->notePrepareCheckpoints(route_ready_ns, path_selected_ns,
+                                              segments_ready_ns);
+    }
     if (!pending.slice->tryCommitPost(*attempt, inflight->posted_ns)) {
         endpoint->releaseOutstanding(pending.slice->spec().length);
         (void)quota_->release(reservation);
@@ -980,6 +1065,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
     work.local_segment = local.segment;
     work.remote_segment = remote.segment;
     auto jetty = endpoint->jetty(worker_index);
+    last_post_ns_.store(inflight->posted_ns, std::memory_order_relaxed);
     size_t posted_count = 0;
     status = jetty ? adapter_->post(jetty, {work}, posted_count)
                    : Status::InternalError("UB endpoint has no Jetty" LOC_MARK);

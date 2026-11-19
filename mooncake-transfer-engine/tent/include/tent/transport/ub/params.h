@@ -48,6 +48,13 @@ struct UbParams {
     uint32_t max_retries = 8;
     uint32_t slice_timeout_ms = 5000;
     uint32_t endpoint_cooldown_ms = 1000;
+    // After the most recent post, JFC pollers keep polling instead of
+    // sleeping, and one posting worker spins on the queue instead of waiting
+    // on the condition variable, for this long. Sparse foreground transfers
+    // then skip a scheduler wakeup on both the post and the completion side.
+    // 0 restores the sleep/wait-only behaviour.
+    uint32_t poll_idle_spin_us = 1000;
+    uint32_t post_idle_spin_us = 1000;
 
     bool enable_bandwidth_estimation = true;
     bool enable_notifications = false;
@@ -104,6 +111,17 @@ struct UbParams {
         CHECK_STATUS(readPositive(config, "transports/ub/endpoint_cooldown_ms",
                                   parsed.endpoint_cooldown_ms,
                                   parsed.endpoint_cooldown_ms));
+        CHECK_STATUS(readNonNegative(config, "transports/ub/poll_idle_spin_us",
+                                     parsed.poll_idle_spin_us,
+                                     parsed.poll_idle_spin_us));
+        CHECK_STATUS(readNonNegative(config, "transports/ub/post_idle_spin_us",
+                                     parsed.post_idle_spin_us,
+                                     parsed.post_idle_spin_us));
+        if (parsed.poll_idle_spin_us > kMaxIdleSpinUs ||
+            parsed.post_idle_spin_us > kMaxIdleSpinUs) {
+            return Status::InvalidArgument(
+                "transports/ub/*_idle_spin_us must not exceed 1000000");
+        }
         CHECK_STATUS(readBool(config,
                               "transports/ub/enable_bandwidth_estimation",
                               parsed.enable_bandwidth_estimation,
@@ -196,6 +214,8 @@ struct UbParams {
         }
         return Status::OK();
     }
+
+    static constexpr uint32_t kMaxIdleSpinUs = 1'000'000;
 
     template <typename T>
     static Status readPositive(const Config& config, const char* key,

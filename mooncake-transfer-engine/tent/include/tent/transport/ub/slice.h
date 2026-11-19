@@ -186,6 +186,11 @@ struct UbSliceSnapshot {
     uint64_t dequeued_ns{0};
     uint64_t post_returned_ns{0};
     uint32_t defer_count{0};
+    // Prepare sub-phase checkpoints of the posted attempt (traced tasks only):
+    // route resolved, endpoint/quota selected, local+remote segments ready.
+    uint64_t route_ready_ns{0};
+    uint64_t path_selected_ns{0};
+    uint64_t segments_ready_ns{0};
 };
 
 struct UbTask;
@@ -440,6 +445,13 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
     void noteDeferred() {
         defer_count_.fetch_add(1, std::memory_order_relaxed);
     }
+    void notePrepareCheckpoints(uint64_t route_ready_ns,
+                                uint64_t path_selected_ns,
+                                uint64_t segments_ready_ns) {
+        route_ready_ns_.store(route_ready_ns, std::memory_order_relaxed);
+        path_selected_ns_.store(path_selected_ns, std::memory_order_relaxed);
+        segments_ready_ns_.store(segments_ready_ns, std::memory_order_relaxed);
+    }
 
     [[nodiscard]] UbSliceSnapshot snapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -459,7 +471,10 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
             terminal_ns_,
             dequeued_ns_.load(std::memory_order_relaxed),
             post_returned_ns_.load(std::memory_order_relaxed),
-            defer_count_.load(std::memory_order_relaxed)};
+            defer_count_.load(std::memory_order_relaxed),
+            route_ready_ns_.load(std::memory_order_relaxed),
+            path_selected_ns_.load(std::memory_order_relaxed),
+            segments_ready_ns_.load(std::memory_order_relaxed)};
     }
 
    private:
@@ -509,6 +524,9 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
     std::atomic<uint64_t> dequeued_ns_{0};
     std::atomic<uint64_t> post_returned_ns_{0};
     std::atomic<uint32_t> defer_count_{0};
+    std::atomic<uint64_t> route_ready_ns_{0};
+    std::atomic<uint64_t> path_selected_ns_{0};
+    std::atomic<uint64_t> segments_ready_ns_{0};
 };
 
 struct UbTaskSnapshot {

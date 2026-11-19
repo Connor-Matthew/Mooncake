@@ -86,11 +86,26 @@ class UbBufferManager final {
                      Topology::NicID local_topology_id,
                      LocalSegmentRef& result) const;
 
+    // Location ("cpu:N", ...) recorded when the registered buffer containing
+    // `address` was added, or an empty string when the address is not
+    // registered or its registration did not resolve to a single location.
+    // Lets the posting path skip a per-slice NUMA probe.
+    [[nodiscard]] std::string localLocation(uint64_t address) const;
+
     Status importRemote(SegmentID remote_segment_id,
                         Topology::NicID local_topology_id,
                         Topology::NicID remote_topology_id,
                         const BufferDesc& remote_buffer, Request::OpCode opcode,
                         uint64_t address, size_t length,
+                        ImportedSegmentRef& result);
+    // Same as above for a caller that already decoded `remote_buffer`'s UB
+    // metadata, so the hot path parses it once per slice instead of twice.
+    Status importRemote(SegmentID remote_segment_id,
+                        Topology::NicID local_topology_id,
+                        Topology::NicID remote_topology_id,
+                        const BufferDesc& remote_buffer,
+                        const UbBufferMetadata& metadata,
+                        Request::OpCode opcode, uint64_t address, size_t length,
                         ImportedSegmentRef& result);
 
     [[nodiscard]] size_t localBufferCount() const;
@@ -110,6 +125,8 @@ class UbBufferManager final {
     struct LocalRecord {
         MemoryOptions options;
         uint64_t generation{0};
+        // Empty unless the whole buffer resolved to one concrete location.
+        std::string location;
         std::unordered_map<Topology::NicID, LocalSegmentPtr> segments;
     };
 

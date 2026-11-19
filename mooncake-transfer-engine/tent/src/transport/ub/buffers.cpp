@@ -228,6 +228,11 @@ Status UbBufferManager::addBufferInternal(BufferDesc& desc,
 
     LocalRecord record;
     record.options = options;
+    // A buffer spanning several locations keeps per-region detail in
+    // desc.regions; leave the cached location empty so callers probe instead.
+    if (desc.regions.empty() && desc.location != kWildcardLocation) {
+        record.location = desc.location;
+    }
     record.generation =
         next_generation_.fetch_add(1, std::memory_order_relaxed);
     if (record.generation == 0) {
@@ -483,6 +488,16 @@ Status UbBufferManager::findLocal(uint64_t address, size_t length,
     return Status::OK();
 }
 
+std::string UbBufferManager::localLocation(uint64_t address) const {
+    std::shared_lock<std::shared_mutex> lock(local_mutex_);
+    auto it = local_buffers_.upper_bound(
+        AddressRange{address, std::numeric_limits<uint64_t>::max()});
+    if (it == local_buffers_.begin()) return std::string();
+    --it;
+    if (!it->first.contains(address, 1)) return std::string();
+    return it->second.location;
+}
+
 Status UbBufferManager::importRemote(SegmentID remote_segment_id,
                                      Topology::NicID local_topology_id,
                                      Topology::NicID remote_topology_id,
@@ -497,6 +512,16 @@ Status UbBufferManager::importRemote(SegmentID remote_segment_id,
     }
     UbBufferMetadata metadata;
     CHECK_STATUS(decodeBufferMetadata(attr->second, metadata));
+    return importRemote(remote_segment_id, local_topology_id,
+                        remote_topology_id, remote_buffer, metadata, opcode,
+                        address, length, result);
+}
+
+Status UbBufferManager::importRemote(
+    SegmentID remote_segment_id, Topology::NicID local_topology_id,
+    Topology::NicID remote_topology_id, const BufferDesc& remote_buffer,
+    const UbBufferMetadata& metadata, Request::OpCode opcode, uint64_t address,
+    size_t length, ImportedSegmentRef& result) {
     if (metadata.base != remote_buffer.addr ||
         metadata.length != remote_buffer.length) {
         return Status::NeedsRefreshCache(
