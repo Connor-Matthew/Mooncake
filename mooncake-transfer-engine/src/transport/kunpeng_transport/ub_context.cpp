@@ -317,7 +317,7 @@ int UbWorkerPool::submitPostSend(
                                           slice->ub.dest_addr, slice->length,
                                           hint, buffer_id, device_id)) {
                 slice->markFailed();
-                failed_target_ids[slice->target_id] = getCurrentTimeInNano();
+                markTargetFailed(slice->target_id);
                 // The per-device list used to be logged here per event,
                 // which floods under failure storms; the throttled
                 // fixed-size record inside dumpMetadataContent covers it.
