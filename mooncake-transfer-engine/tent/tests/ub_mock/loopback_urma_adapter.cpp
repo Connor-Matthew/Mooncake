@@ -198,7 +198,8 @@ class LoopbackUrmaAdapter final : public UrmaAdapter {
         return Status::OK();
     }
 
-    Status openContext(const DeviceInfo& device, ContextPtr& context) override {
+    Status openContext(const DeviceInfo& device, const BondingOptions&,
+                       ContextPtr& context) override {
         if (!initialized_.load(std::memory_order_acquire) ||
             device.topology_name != device_.topology_name) {
             return Status::DeviceNotFound("loopback device missing");

@@ -186,7 +186,8 @@ class FakeUrmaAdapter final : public UrmaAdapter {
         devices = {device_};
         return Status::OK();
     }
-    Status openContext(const DeviceInfo& device, ContextPtr& context) override {
+    Status openContext(const DeviceInfo& device, const BondingOptions&,
+                       ContextPtr& context) override {
         if (!initialized_ || device.topology_name != device_.topology_name) {
             return Status::DeviceNotFound("fake device missing");
         }

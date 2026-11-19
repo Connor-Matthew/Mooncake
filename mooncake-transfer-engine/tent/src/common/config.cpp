@@ -162,6 +162,39 @@ static inline void setArrayConfig(Config& config, const std::string& env_key,
     if (!items.empty()) config.set(config_key, items);
 }
 
+static std::string normalizeBondingToken(const char* value) {
+    std::string token(value);
+    const auto first = token.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const auto last = token.find_last_not_of(" \t\r\n");
+    token = token.substr(first, last - first + 1);
+    std::transform(token.begin(), token.end(), token.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::toupper(c));
+                   });
+    std::replace(token.begin(), token.end(), '_', '-');
+    return token;
+}
+
+static void setBondingConfig(Config& config, const char* env_key,
+                             const char* config_key, const char* first_value,
+                             const char* second_value,
+                             const char* third_value = nullptr) {
+    const char* value = std::getenv(env_key);
+    if (!value || *value == '\0') return;
+    const auto token = normalizeBondingToken(value);
+    if (token == first_value || token == second_value ||
+        (third_value != nullptr && token == third_value)) {
+        config.set(config_key, token);
+        LOG(INFO) << env_key << " is " << token;
+        return;
+    }
+    std::string expected = std::string(first_value) + "|" + second_value;
+    if (third_value != nullptr) expected += std::string("|") + third_value;
+    LOG(WARNING) << "Ignore " << env_key << "='" << value
+                 << "': expected " << expected;
+}
+
 void ConfigHelper::forceTcp(Config& config) {
     config.set("transports/force_tcp", true);
     config.set("transports/tcp/enable", true);
@@ -252,6 +285,13 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // Consumed by filterInfiniBandDevices() in the platform probes.
     setArrayConfig(config, "MC_TE_FILTERS", "topology/rdma_whitelist");
     setArrayConfig(config, "MC_TE_FILTERS_EXCLUDE", "topology/rdma_blacklist");
+    // Keep the classic TE variable names and accepted values so the same
+    // deployment environment configures bonding under either engine.
+    setBondingConfig(config, "MC_URMA_BONDING_MODE",
+                     "transports/ub/bonding_mode", "BALANCE", "STANDALONE",
+                     "ACTIVE-BACKUP");
+    setBondingConfig(config, "MC_URMA_BONDING_LEVEL",
+                     "transports/ub/bonding_level", "IODIE", "PORT");
     // Classic TE custom topology file path. Maps into TENT config so the same
     // MC_CUSTOM_TOPO_JSON works under MC_USE_TENT. Inline
     // topology/priority_matrix in MC_TENT_CONF still takes precedence.

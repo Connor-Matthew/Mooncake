@@ -447,6 +447,30 @@ TEST(TransferEngineConfigOverrideTest, LegacyBoolEnvAcceptsNumericValues) {
     }
 }
 
+TEST(TransferEngineConfigOverrideTest, ClassicUrmaBondingEnvLoadsTentConfig) {
+    EnvVarGuard mode_guard("MC_URMA_BONDING_MODE", "active_backup");
+    EnvVarGuard level_guard("MC_URMA_BONDING_LEVEL", "port");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+    EXPECT_EQ(config.get("transports/ub/bonding_mode", ""),
+              "ACTIVE-BACKUP");
+    EXPECT_EQ(config.get("transports/ub/bonding_level", ""), "PORT");
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     InvalidClassicUrmaBondingEnvPreservesTentConfig) {
+    EnvVarGuard mode_guard("MC_URMA_BONDING_MODE", "invalid");
+    EnvVarGuard level_guard("MC_URMA_BONDING_LEVEL", "invalid");
+
+    Config config;
+    config.set("transports/ub/bonding_mode", "BALANCE");
+    config.set("transports/ub/bonding_level", "IODIE");
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+    EXPECT_EQ(config.get("transports/ub/bonding_mode", ""), "BALANCE");
+    EXPECT_EQ(config.get("transports/ub/bonding_level", ""), "IODIE");
+}
+
 TEST(TransferEngineConfigOverrideTest, InvalidConstructorFilePreventsStartup) {
     TempConfigFile file("{invalid-json");
     EnvVarGuard conf_guard("MC_TENT_CONF", "");

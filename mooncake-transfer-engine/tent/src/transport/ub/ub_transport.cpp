@@ -196,7 +196,8 @@ struct UbTransport::Impl {
                     jfc_options.receiver_depth, device_caps.max_jfr_depth);
             }
             auto context = std::make_shared<ub::UbContext>(
-                static_cast<Topology::NicID>(id), found->second, adapter);
+                static_cast<Topology::NicID>(id), found->second, adapter,
+                params.bonding);
             status = context->initialize(params.jfc_per_context, jfc_options);
             if (!status.ok()) {
                 if (context->state() == ub::UbContext::State::kDraining) {

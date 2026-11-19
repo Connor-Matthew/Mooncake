@@ -57,6 +57,24 @@ struct DeviceInfo {
     DeviceCapabilities capabilities;
 };
 
+// Bonding policy applied when opening a native bonding URMA device. The
+// defaults preserve TENT's pre-configuration behavior.
+enum class BondingMode : uint8_t {
+    kBalance,
+    kStandalone,
+    kActiveBackup,
+};
+
+enum class BondingLevel : uint8_t {
+    kIodie,
+    kPort,
+};
+
+struct BondingOptions {
+    BondingMode mode = BondingMode::kStandalone;
+    BondingLevel level = BondingLevel::kIodie;
+};
+
 // The segment descriptor is intentionally an explicit envelope. Raw
 // urma_seg_t bytes are ABI-specific; import must reject a different API
 // version, structure size, schema, or malformed hex instead of copying an
@@ -218,6 +236,7 @@ class UrmaAdapter {
     virtual Status discoverDevices(std::vector<DeviceInfo>& devices) = 0;
 
     virtual Status openContext(const DeviceInfo& device,
+                               const BondingOptions& bonding,
                                ContextPtr& context) = 0;
     // close/delete/unregister/unimport reset the caller's shared_ptr only after
     // the provider has released the native resource. If another owner still

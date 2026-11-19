@@ -46,6 +46,27 @@ TEST(UbParamsTest, ParsesStrictValuesAndAllowsRetryDisable) {
     EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
 }
 
+TEST(UbParamsTest, ParsesBondingPolicyUsingClassicTeValues) {
+    Config config;
+    config.set("transports/ub/bonding_mode", "active_backup");
+    config.set("transports/ub/bonding_level", "port");
+
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.bonding.mode, BondingMode::kActiveBackup);
+    EXPECT_EQ(params.bonding.level, BondingLevel::kPort);
+
+    config.set("transports/ub/bonding_mode", "invalid");
+    EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
+}
+
+TEST(UbParamsTest, BondingDefaultsPreserveExistingTentBehavior) {
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(Config{}, params).ok());
+    EXPECT_EQ(params.bonding.mode, BondingMode::kStandalone);
+    EXPECT_EQ(params.bonding.level, BondingLevel::kIodie);
+}
+
 Request makeRequest(size_t length) {
     Request request{};
     request.opcode = Request::WRITE;

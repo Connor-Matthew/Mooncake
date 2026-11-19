@@ -29,7 +29,8 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     };
 
     UbContext(Topology::NicID topology_id, DeviceInfo device,
-              std::shared_ptr<UrmaAdapter> adapter);
+              std::shared_ptr<UrmaAdapter> adapter,
+              BondingOptions bonding = {});
     ~UbContext();
 
     UbContext(const UbContext&) = delete;
@@ -91,6 +92,7 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     const Topology::NicID topology_id_;
     const DeviceInfo device_;
     std::shared_ptr<UrmaAdapter> adapter_;
+    const BondingOptions bonding_;
     ContextPtr handle_;
     std::vector<std::shared_ptr<UbJfc>> jfcs_;
     mutable std::mutex lifecycle_mutex_;

@@ -20,10 +20,12 @@ uint64_t steadyNowNs() noexcept {
 }  // namespace
 
 UbContext::UbContext(Topology::NicID topology_id, DeviceInfo device,
-                     std::shared_ptr<UrmaAdapter> adapter)
+                     std::shared_ptr<UrmaAdapter> adapter,
+                     BondingOptions bonding)
     : topology_id_(topology_id),
       device_(std::move(device)),
-      adapter_(std::move(adapter)) {}
+      adapter_(std::move(adapter)),
+      bonding_(bonding) {}
 
 UbContext::~UbContext() { (void)shutdown(); }
 
@@ -45,7 +47,7 @@ Status UbContext::initialize(uint32_t jfc_count, const JfcOptions& options) {
             "Requested UB JFC count exceeds device capability" LOC_MARK);
     }
 
-    auto status = adapter_->openContext(device_, handle_);
+    auto status = adapter_->openContext(device_, bonding_, handle_);
     if (!status.ok()) {
         // Providers are allowed to report an error together with a partially
         // created handle. Adopt it and make cleanup retryable just like a

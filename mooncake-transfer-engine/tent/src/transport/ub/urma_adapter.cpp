@@ -65,7 +65,8 @@ class UnavailableUrmaAdapter final : public UrmaAdapter {
         return unavailable();
     }
 
-    Status openContext(const DeviceInfo&, ContextPtr& context) override {
+    Status openContext(const DeviceInfo&, const BondingOptions&,
+                       ContextPtr& context) override {
         context.reset();
         return unavailable();
     }
@@ -276,6 +277,39 @@ DeviceCapabilities convertCapabilities(const urma_device_attr_t& attr) {
     result.feature_flags = attr.dev_cap.feature.value;
     result.transport_modes = attr.dev_cap.trans_mode;
     return result;
+}
+
+bondp_bonding_mode_t nativeBondingMode(BondingMode mode) {
+    switch (mode) {
+        case BondingMode::kBalance: return BONDP_BONDING_MODE_BALANCE;
+        case BondingMode::kStandalone:
+            return BONDP_BONDING_MODE_STANDALONE;
+        case BondingMode::kActiveBackup:
+            return BONDP_BONDING_MODE_ACTIVE_BACKUP;
+    }
+    return BONDP_BONDING_MODE_STANDALONE;
+}
+
+bondp_bonding_level_t nativeBondingLevel(BondingLevel level) {
+    return level == BondingLevel::kIodie ? BONDP_BONDING_LEVEL_IODIE
+                                         : BONDP_BONDING_LEVEL_PORT;
+}
+
+const char* bondingModeName(BondingMode mode) {
+    switch (mode) {
+        case BondingMode::kBalance: return "BALANCE";
+        case BondingMode::kStandalone: return "STANDALONE";
+        case BondingMode::kActiveBackup: return "ACTIVE-BACKUP";
+    }
+    return "UNKNOWN";
+}
+
+const char* bondingLevelName(BondingLevel level) {
+    switch (level) {
+        case BondingLevel::kIodie: return "IODIE";
+        case BondingLevel::kPort: return "PORT";
+    }
+    return "UNKNOWN";
 }
 
 bool deviceIsActive(const urma_device_attr_t& attr) {
@@ -1088,6 +1122,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
     }
 
     Status openContext(const DeviceInfo& requested,
+                       const BondingOptions& bonding,
                        ContextPtr& output) override {
         std::shared_ptr<RuntimeLease> runtime;
         CHECK_STATUS(getRuntime(runtime));
@@ -1147,8 +1182,8 @@ class RealUrmaAdapter final : public UrmaAdapter {
 
             if (isBondingDevice(requested)) {
                 bondp_set_bonding_mode_in_t bonding_mode{};
-                bonding_mode.bonding_mode = BONDP_BONDING_MODE_STANDALONE;
-                bonding_mode.bonding_level = BONDP_BONDING_LEVEL_IODIE;
+                bonding_mode.bonding_mode = nativeBondingMode(bonding.mode);
+                bonding_mode.bonding_level = nativeBondingLevel(bonding.level);
 
                 urma_user_ctl_in_t ctl_in{};
                 ctl_in.addr = reinterpret_cast<uint64_t>(&bonding_mode);
@@ -1163,6 +1198,11 @@ class RealUrmaAdapter final : public UrmaAdapter {
                     return nativeError("urma_user_ctl(SET_BONDING_MODE)",
                                        ctl_rc);
                 }
+                LOG(INFO) << "Configured UB bonding device "
+                          << requested.native_device_name
+                          << " bonding_mode=" << bondingModeName(bonding.mode)
+                          << " bonding_level="
+                          << bondingLevelName(bonding.level);
             }
 
             uint32_t ctp_priority = 15;

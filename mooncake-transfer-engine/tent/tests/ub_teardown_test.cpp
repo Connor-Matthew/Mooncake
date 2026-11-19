@@ -143,7 +143,8 @@ class FailOnceAdapter final : public UrmaAdapter {
         return Status::OK();
     }
 
-    Status openContext(const DeviceInfo& device, ContextPtr& context) override {
+    Status openContext(const DeviceInfo& device, const BondingOptions&,
+                       ContextPtr& context) override {
         context = std::make_shared<FakeContext>(device);
         ++live_contexts;
         return Status::OK();

@@ -15,6 +15,8 @@
 #ifndef TENT_TRANSPORT_UB_PARAMS_H_
 #define TENT_TRANSPORT_UB_PARAMS_H_
 
+#include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -24,6 +26,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
+#include "tent/transport/ub/urma_adapter.h"
 
 namespace mooncake {
 namespace tent {
@@ -33,6 +36,7 @@ struct UbParams {
     // UB is opt-in until a real URMA provider and NIC topology are present.
     bool enable = false;
     std::vector<std::string> device_filter;
+    BondingOptions bonding;
 
     uint32_t worker_count = 6;
     uint32_t poller_count = 2;
@@ -57,6 +61,8 @@ struct UbParams {
         CHECK_STATUS(readBool(config, "transports/ub/enable", parsed.enable,
                               parsed.enable));
         CHECK_STATUS(readDeviceFilter(config, parsed.device_filter));
+        CHECK_STATUS(readBondingMode(config, parsed.bonding.mode));
+        CHECK_STATUS(readBondingLevel(config, parsed.bonding.level));
         CHECK_STATUS(readPositive(config, "transports/ub/worker_count",
                                   parsed.worker_count, parsed.worker_count));
         CHECK_STATUS(readPositive(config, "transports/ub/poller_count",
@@ -109,6 +115,63 @@ struct UbParams {
     }
 
    private:
+    static std::string normalizeBondingToken(std::string token) {
+        const auto first = token.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return {};
+        const auto last = token.find_last_not_of(" \t\r\n");
+        token = token.substr(first, last - first + 1);
+        std::transform(token.begin(), token.end(), token.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::toupper(c));
+                       });
+        std::replace(token.begin(), token.end(), '_', '-');
+        return token;
+    }
+
+    static Status readBondingMode(const Config& config, BondingMode& output) {
+        static constexpr const char* kKey = "transports/ub/bonding_mode";
+        const json value = config.get<json>(kKey, json());
+        if (value.is_null()) return Status::OK();
+        if (!value.is_string()) {
+            return Status::InvalidArgument(std::string(kKey) +
+                                           " must be a string");
+        }
+        const auto token = normalizeBondingToken(value.get<std::string>());
+        if (token == "BALANCE") {
+            output = BondingMode::kBalance;
+        } else if (token == "STANDALONE") {
+            output = BondingMode::kStandalone;
+        } else if (token == "ACTIVE-BACKUP") {
+            output = BondingMode::kActiveBackup;
+        } else {
+            return Status::InvalidArgument(
+                std::string(kKey) +
+                " must be BALANCE, STANDALONE, or ACTIVE-BACKUP");
+        }
+        return Status::OK();
+    }
+
+    static Status readBondingLevel(const Config& config,
+                                   BondingLevel& output) {
+        static constexpr const char* kKey = "transports/ub/bonding_level";
+        const json value = config.get<json>(kKey, json());
+        if (value.is_null()) return Status::OK();
+        if (!value.is_string()) {
+            return Status::InvalidArgument(std::string(kKey) +
+                                           " must be a string");
+        }
+        const auto token = normalizeBondingToken(value.get<std::string>());
+        if (token == "IODIE") {
+            output = BondingLevel::kIodie;
+        } else if (token == "PORT") {
+            output = BondingLevel::kPort;
+        } else {
+            return Status::InvalidArgument(std::string(kKey) +
+                                           " must be IODIE or PORT");
+        }
+        return Status::OK();
+    }
+
     template <typename T>
     static Status readPositive(const Config& config, const char* key,
                                T default_value, T& output) {
