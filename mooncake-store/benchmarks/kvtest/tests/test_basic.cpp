@@ -188,6 +188,34 @@ TEST(BasicRunnerTest, WarmupSamplesAreExcluded) {
     metrics.Stop();
 }
 
+TEST(BasicRunnerTest, GetWarmupReusesMeasuredKeys) {
+    FakeStore store;
+    MetricsCollector metrics(0, 3000, MetricsDir("get_warmup_reuse"));
+    metrics.Start();
+    Config config = MakeConfig("get", 1, 6);
+    config.warmup_duration = 0.02;
+    Prefill(store, config, 6);
+    BasicRunner runner(config, store, metrics);
+    std::string error;
+    ASSERT_TRUE(runner.Prepare(&error)) << error;
+    ASSERT_TRUE(runner.Start(&error)) << error;
+
+    const auto stats = runner.GetStats();
+    EXPECT_GT(stats.warmup_ops, 0u);
+    const auto snapshots = metrics.SnapshotCounts();
+    const MetricSnapshot *get = FindSnapshot(snapshots, "get");
+    ASSERT_NE(get, nullptr);
+    EXPECT_EQ(get->total, 6u);
+    EXPECT_EQ(get->success, 6u);
+    // The warmup must not allocate or delete a second key set.
+    EXPECT_EQ(store.data.size(), 6u);
+    for (const auto &entry : store.data) {
+        EXPECT_EQ(entry.first.rfind("mc_warmup", 0), std::string::npos)
+            << entry.first;
+    }
+    metrics.Stop();
+}
+
 TEST(BasicRunnerTest, PutFromUsesRegisteredBuffer) {
     FakeStore store;
     MetricsCollector metrics(0, 3000, MetricsDir("put_from"));

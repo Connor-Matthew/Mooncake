@@ -142,7 +142,10 @@ bool BasicRunner::BuildKeys() {
     if (end <= begin) return false;
     measured_keys_ = MakeKeyRange(config_.key_prefix, config_.key_scenario,
                                   begin, end);
-    if (config_.warmup_duration > 0.0) {
+    // Get-family warmup reuses the measured keys (YuanRong behavior): the
+    // orchestration prefill already wrote them, so warmup must not allocate a
+    // second key set. Write/mixed operations keep a dedicated warmup prefix.
+    if (config_.warmup_duration > 0.0 && !needs_prefill_) {
         warmup_keys_ = MakeKeyRange(config_.warmup_key_prefix,
                                     config_.key_scenario, begin, end);
     }
@@ -184,10 +187,11 @@ bool BasicRunner::PrepareThreadBuffers(std::string *error) {
 }
 
 bool BasicRunner::Start(std::string *error) {
+    (void)error;
     if (started_.exchange(true)) return true;
     running_.store(true, std::memory_order_release);
     if (config_.warmup_duration > 0.0) {
-        if (!RunPhase(true, error)) {
+        if (!RunPhase(true)) {
             running_.store(false, std::memory_order_release);
             return false;
         }
@@ -198,7 +202,7 @@ bool BasicRunner::Start(std::string *error) {
         metrics_.Freeze();
         return true;
     }
-    if (!RunPhase(false, error)) {
+    if (!RunPhase(false)) {
         running_.store(false, std::memory_order_release);
         return false;
     }
@@ -229,11 +233,17 @@ BasicRunner::Stats BasicRunner::GetStats() const {
     return stats;
 }
 
-bool BasicRunner::RunPhase(bool warmup, std::string *error) {
+bool BasicRunner::RunPhase(bool warmup) {
     if (warmup) {
-        if (warmup_keys_.empty()) return true;
-        if (needs_prefill_ && !PrefillWarmup(error)) return false;
-        phase_.keys = &warmup_keys_;
+        if (needs_prefill_) {
+            // Get-family warmup reads the measured keys prepared by the
+            // orchestration prefill. No warmup key allocation, no extra
+            // prefill write, and no RemoveKeys on the measured set.
+            phase_.keys = &measured_keys_;
+        } else {
+            if (warmup_keys_.empty()) return true;
+            phase_.keys = &warmup_keys_;
+        }
         phase_.deadline_us =
             NowUs() + static_cast<int64_t>(config_.warmup_duration * 1e6);
     } else {
@@ -254,36 +264,7 @@ bool BasicRunner::RunPhase(bool warmup, std::string *error) {
         if (thread.joinable()) thread.join();
     }
     threads_.clear();
-    if (warmup) RemoveKeys(warmup_keys_);
-    return true;
-}
-
-bool BasicRunner::PrefillWarmup(std::string *error) {
-    const OpSpec *put = FindOp("put_batch");
-    if (put == nullptr) {
-        *error = "put_batch is required to prefill warmup keys";
-        return false;
-    }
-    OpScratch scratch;
-    const size_t batch = static_cast<size_t>(config_.BatchSize());
-    for (size_t offset = 0; offset < warmup_keys_.size(); offset += batch) {
-        const size_t count = std::min(batch, warmup_keys_.size() - offset);
-        std::vector<std::string> group(warmup_keys_.begin() + offset,
-                                       warmup_keys_.begin() + offset + count);
-        OpContext context;
-        context.keys = &group;
-        context.value_size = data_size_;
-        context.value = &value_;
-        context.seed = config_.value_seed;
-        context.scratch = &scratch;
-        ExecuteOptions options;
-        options.metric_name = "put_batch";
-        const OpOutcome outcome = ExecuteOp(store_, *put, context, options);
-        if (!outcome.ok) {
-            *error = "warmup prefill failed for key " + group.front();
-            return false;
-        }
-    }
+    if (warmup && !needs_prefill_) RemoveKeys(warmup_keys_);
     return true;
 }
 

@@ -60,12 +60,11 @@ class BasicRunner {
 
     bool BuildKeys();
     bool PrepareThreadBuffers(std::string *error);
-    bool RunPhase(bool warmup, std::string *error);
+    bool RunPhase(bool warmup);
     void RunThread(int thread_id);
     void ExecuteGroup(const OpSpec &spec, const std::vector<std::string> &keys,
                       ThreadState &state, bool warmup);
     void RemoveKeys(const std::vector<std::string> &keys);
-    bool PrefillWarmup(std::string *error);
 
     const Config &config_;
     StoreAdapter &store_;
