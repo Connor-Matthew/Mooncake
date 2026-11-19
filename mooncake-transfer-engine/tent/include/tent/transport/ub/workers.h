@@ -185,6 +185,9 @@ class UbWorkers final {
     void postingLoop(size_t worker_index);
     void pollingLoop(size_t poller_index);
     bool popPending(PendingSlice& pending);
+    void spinForPending();
+    [[nodiscard]] bool withinIdleSpin(uint64_t now_ns, uint64_t last_ns,
+                                      uint32_t window_us) const;
     void enqueueRetry(const PendingSlice& pending);
     void deferPending(const PendingSlice& pending);
     void processPending(const PendingSlice& pending, size_t worker_index);
@@ -234,6 +237,15 @@ class UbWorkers final {
     mutable std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::array<std::deque<PendingSlice>, PRIO_LOW + 1> queues_;
+    // Lock-free mirror of the total queue length, maintained under
+    // queue_mutex_. Only the idle posting spinner reads it, as a hint; the
+    // queues themselves stay authoritative and are rechecked under the lock.
+    std::atomic<size_t> queued_hint_{0};
+    // At most one posting worker spins at a time.
+    std::atomic<bool> post_spinner_active_{false};
+    // steadyNowNs() of the most recent post attempt; anchors the idle-spin
+    // windows of pollers and the posting spinner.
+    std::atomic<uint64_t> last_post_ns_{0};
 
     mutable std::mutex inflight_mutex_;
     mutable std::mutex endpoint_drain_mutex_;

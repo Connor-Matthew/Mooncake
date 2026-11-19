@@ -46,6 +46,25 @@ TEST(UbParamsTest, ParsesStrictValuesAndAllowsRetryDisable) {
     EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
 }
 
+TEST(UbParamsTest, IdleSpinDefaultsOnAndAcceptsZeroToDisable) {
+    Config config;
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.poll_idle_spin_us, 1000U);
+    EXPECT_EQ(params.post_idle_spin_us, 1000U);
+
+    config.set("transports/ub/poll_idle_spin_us", 0);
+    config.set("transports/ub/post_idle_spin_us", 0);
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_EQ(params.poll_idle_spin_us, 0U);
+    EXPECT_EQ(params.post_idle_spin_us, 0U);
+
+    config.set("transports/ub/poll_idle_spin_us", 1000001);
+    EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
+    config.set("transports/ub/poll_idle_spin_us", -1);
+    EXPECT_TRUE(UbParams::FromConfig(config, params).IsInvalidArgument());
+}
+
 Request makeRequest(size_t length) {
     Request request{};
     request.opcode = Request::WRITE;
