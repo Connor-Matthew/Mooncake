@@ -3,6 +3,7 @@
   "instance_id": 0,
   "listen_port": 9000,
   "notify_rpc_port": 19000,
+  "notify_transport": "rpc",
   "role": "writer",
   "pipeline": ["upsertFrom"],
   "notify_pipeline": ["getBuffer"],
@@ -18,7 +19,7 @@
   "batch_keys_count": 1,
   "key_pool_size": 256,
   "data_sizes": ["8MB"],
-  "metrics_interval_ms": 3000,
+  "metrics_interval_ms": 0,
   "output_dir": "kvtest-writer-output",
   "nodes": [
     {

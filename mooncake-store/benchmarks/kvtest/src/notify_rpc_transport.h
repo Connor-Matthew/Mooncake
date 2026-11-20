@@ -13,6 +13,7 @@ struct NotifyRpcRequest {
     std::vector<std::string> keys;
     uint64_t size{0};
     int sender{0};
+    bool warmup{false};
 };
 
 struct NotifyRpcResponse {

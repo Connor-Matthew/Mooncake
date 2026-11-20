@@ -1,0 +1,25 @@
+{
+  "mode": "cleanup",
+  "instance_id": 0,
+  "listen_port": 9100,
+  "role": "client",
+  "scope": "range",
+  "key_prefix": "mc_bench",
+  "key_scenario": "basic",
+  "key_count": 1000,
+  "key_start": 0,
+  "key_end": 1000,
+  "data_sizes": ["8MB"],
+  "output_dir": "kvtest-cleanup-output",
+  "store": {
+    "local_hostname": "10.0.0.1:12345",
+    "metadata_server": "http://10.0.0.10:8080/metadata",
+    "global_segment_size": 0,
+    "local_buffer_size": "8GB",
+    "protocol": "ub",
+    "rdma_devices": "bonding_dev_0",
+    "master_server_address": "10.0.0.10:50051",
+    "tenant_id": "default",
+    "replica_num": 1
+  }
+}
