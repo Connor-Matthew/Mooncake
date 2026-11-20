@@ -5833,11 +5833,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             // Allocate a buffer from the client's buffer allocator.  The
             // allocator's underlying memory is already registered with the
             // transfer engine during setup_internal, so it can be used directly
-            // as the source (WRITE) and destination (READ) for warmup
-            // transfers.  BufferHandle is RAII: it deallocates the buffer back
-            // to the allocator on destruction, so no explicit
-            // register/unregister is needed here.
-            constexpr size_t kWarmupBufSize = 4096;
+            // as the destination for a warmup READ.  BufferHandle is RAII: it
+            // deallocates the buffer back to the allocator on destruction, so
+            // no explicit register/unregister is needed here.
+            constexpr size_t kWarmupBufSize = 1;
+            constexpr auto kWarmupTransferTimeout = std::chrono::seconds(5);
             auto buf_handle = allocator->allocate(kWarmupBufSize);
             if (!buf_handle) {
                 LOG(WARNING) << "warmup: failed to allocate warmup buffer";
@@ -5858,10 +5858,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                       << segments.size() << " segment(s) for protocol '"
                       << protocol_ << "'";
 
-            // Helper lambda: submit a single transfer request and poll to
-            // completion.
-            auto submit_and_wait =
-                [&](Transport::TransferRequest::OpCode op, SegmentID target_id,
+            // Helper lambda: submit a non-destructive READ and poll it to
+            // completion. Any successful transfer establishes the same
+            // transport connection used by later reads and writes; avoiding a
+            // remote WRITE also prevents warmup from corrupting live data.
+            auto submit_read_and_wait =
+                [&](SegmentID target_id, uint64_t target_offset,
                     const std::string& segment_name) -> bool {
                 auto batch_id = transfer_engine_->allocateBatchID(1);
                 if (batch_id == INVALID_BATCH_ID) {
@@ -5869,46 +5871,73 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                                  << segment_name << "'";
                     return false;
                 }
-                auto target_meta_data = transfer_engine_->getMetadata();
-                auto target_segment =
-                    target_meta_data->getSegmentDescByID(target_id);
-                Transport::TransferRequest request;
-                request.opcode = op;
+
+                Transport::TransferRequest request{};
+                request.opcode = Transport::TransferRequest::READ;
                 request.source =
-                    buf_handle->ptr();  // registered buffer carries r/w data
+                    buf_handle->ptr();  // registered warmup destination
                 request.target_id = target_id;
-                request.target_offset = target_segment->buffers[0].addr;
+                request.target_offset = target_offset;
                 request.length = kWarmupBufSize;
 
                 auto status =
                     transfer_engine_->submitTransfer(batch_id, {request});
                 if (!status.ok()) {
-                    LOG(WARNING)
-                        << "warmup: submitTransfer("
-                        << (op == Transport::TransferRequest::WRITE ? "W" : "R")
-                        << ") failed for '" << segment_name
-                        << "': " << status.message();
+                    LOG(WARNING) << "warmup: submitTransfer(READ) failed for '"
+                                 << segment_name << "': " << status.message();
                     transfer_engine_->freeBatchID(batch_id);
                     return false;
                 }
 
                 // Poll for completion — the connection handshake occurs here.
-                Transport::TransferStatus ts;
-                for (int poll = 0; poll < 1000; ++poll) {
-                    auto s =
+                Transport::TransferStatus ts{Transport::WAITING, 0};
+                bool completed = false;
+                const auto deadline =
+                    std::chrono::steady_clock::now() + kWarmupTransferTimeout;
+                while (std::chrono::steady_clock::now() < deadline) {
+                    auto poll_status =
                         transfer_engine_->getTransferStatus(batch_id, 0, ts);
-                    if (!s.ok()) break;
-                    if (ts.s == Transport::COMPLETED ||
-                        ts.s == Transport::FAILED || ts.s == Transport::INVALID)
+                    if (!poll_status.ok()) {
+                        LOG(WARNING)
+                            << "warmup: getTransferStatus failed for '"
+                            << segment_name << "': " << poll_status.message();
                         break;
+                    }
+                    if (ts.s == Transport::COMPLETED) {
+                        completed = true;
+                        break;
+                    }
+                    if (ts.s == Transport::FAILED ||
+                        ts.s == Transport::INVALID ||
+                        ts.s == Transport::CANCELED ||
+                        ts.s == Transport::TIMEOUT) {
+                        LOG(WARNING)
+                            << "warmup: transfer failed for '" << segment_name
+                            << "', status=" << static_cast<int>(ts.s);
+                        break;
+                    }
                     std::this_thread::sleep_for(std::chrono::microseconds(100));
                 }
+                if (!completed &&
+                    std::chrono::steady_clock::now() >= deadline) {
+                    LOG(WARNING) << "warmup: transfer timed out after "
+                                 << kWarmupTransferTimeout.count() << "s for '"
+                                 << segment_name << "'";
+                }
 
-                transfer_engine_->freeBatchID(batch_id);
-                return ts.s == Transport::COMPLETED;
+                auto free_status = transfer_engine_->freeBatchID(batch_id);
+                if (!free_status.ok()) {
+                    LOG(WARNING) << "warmup: freeBatchID failed for '"
+                                 << segment_name
+                                 << "': " << free_status.message();
+                    return false;
+                }
+                return completed;
             };
 
             size_t success_count = 0;
+            size_t failure_count = 0;
+            size_t local_segment_count = 0;
             for (const auto& segment_name : segments) {
                 // Open the segment to resolve its SegmentID (caches the
                 // descriptor).
@@ -5916,26 +5945,49 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 if (target_id == (SegmentHandle)-1) {
                     LOG(WARNING) << "warmup: cannot open segment '"
                                  << segment_name << "'";
+                    ++failure_count;
                     continue;
                 }
-                // Skip the local segment — no point self-connecting, and a
-                // WRITE would corrupt our own buffer.
+                // Skip the local segment: there is no remote connection to
+                // establish.
                 if (target_id == LOCAL_SEGMENT_ID) {
+                    ++local_segment_count;
                     continue;
                 }
 
-                // Issue a 1-byte WRITE then a 1-byte READ using the registered
-                // buffer to exercise both directions of the connection.
-                bool ok = submit_and_wait(Transport::TransferRequest::WRITE,
-                                          target_id, segment_name);
-                ok = submit_and_wait(Transport::TransferRequest::READ,
-                                     target_id, segment_name) &&
-                     ok;
-                if (ok) ++success_count;
+                // getMetadata() is unavailable in TENT mode.  This compatibility
+                // API resolves buffer addresses through classic metadata for TE
+                // and through TENT's native SegmentInfo for TENT.
+                std::vector<SegmentBufferInfo> buffers;
+                const int buffer_status =
+                    transfer_engine_->getSegmentBuffers(target_id, buffers);
+                if (buffer_status != 0 || buffers.empty() ||
+                    buffers.front().length < kWarmupBufSize) {
+                    LOG(WARNING)
+                        << "warmup: no usable memory buffer for '"
+                        << segment_name << "', rc=" << buffer_status
+                        << ", buffers=" << buffers.size();
+                    ++failure_count;
+                    continue;
+                }
+
+                if (submit_read_and_wait(target_id, buffers.front().addr,
+                                         segment_name)) {
+                    ++success_count;
+                } else {
+                    ++failure_count;
+                }
             }
 
+            const size_t remote_segment_count = success_count + failure_count;
             LOG(INFO) << "warmup: completed, " << success_count << "/"
-                      << segments.size() << " segments processed";
+                      << remote_segment_count
+                      << " remote segments processed (registered="
+                      << segments.size() << ", local_skipped="
+                      << local_segment_count << ")";
+            if (failure_count != 0) {
+                return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
             return {};
         }
 

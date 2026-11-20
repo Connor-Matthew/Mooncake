@@ -1012,10 +1012,11 @@ class Client {
      * currently registered with the master.
      *
      * Allocates a buffer via the given ClientBufferAllocator (whose base is
-     * already registered with the transfer engine) and issues a 1-byte WRITE
-     * then READ per segment to trigger eager connection setup (e.g. RDMA QP
-     * handshakes). This amortises the first-transfer handshake latency and
-     * mitigates TRANSFER_FAIL caused by handshake storms under
+     * already registered with the transfer engine) and issues a non-destructive
+     * 1-byte READ per remote segment to trigger eager connection setup (e.g.
+     * RDMA QP handshakes). Segment buffer addresses are resolved through an API
+     * shared by classic TE and TENT. This amortises the first-transfer handshake
+     * latency and mitigates TRANSFER_FAIL caused by handshake storms under
      * high-concurrency small-file workloads.
      *
      * @param allocator Client buffer allocator used to allocate/release the

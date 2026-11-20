@@ -19,7 +19,9 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include "config.h"
@@ -102,6 +104,16 @@ bool UrmalogRedirectEnabledByEnv() {
     if (!value || !*value) return false;
     const std::string_view sv(value);
     return sv == "1" || sv == "on" || sv == "true" || sv == "yes";
+}
+
+bool UrmaSliceChipDiagnosticsEnabledByEnv() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("MC_UB_SLICE_CHIP_DIAG");
+        if (!value || !*value) return false;
+        const std::string_view sv(value);
+        return sv == "1" || sv == "on" || sv == "true" || sv == "yes";
+    }();
+    return enabled;
 }
 
 }  // namespace
@@ -1410,6 +1422,12 @@ int UrmaEndpoint::submitPostSend(
     // chip 亲和(用 bondp_jfs_wr_t 带 src/dst_chip_id)由 NUMA 亲和开关控制；
     // bonding 模式本身(设备级)由 multipath 在 openDevice 设置。
     const bool numa_affinity = context_->numa_affinity();
+    const bool slice_chip_log =
+        numa_affinity && UrmaSliceChipDiagnosticsEnabledByEnv() && queue_log;
+    std::unique_ptr<std::ostringstream> slice_chip_bindings;
+    if (slice_chip_log) {
+        slice_chip_bindings = std::make_unique<std::ostringstream>();
+    }
     urma_sge_t l_sge_list[wr_count];
     urma_sge_t r_sge_list[wr_count];
 
@@ -1485,6 +1503,13 @@ int UrmaEndpoint::submitPostSend(
                 slice_list[i]->ub.dst_chip_id);
             wr_list[i].src_chip_id = chip_ids.src;
             wr_list[i].dst_chip_id = chip_ids.dst;
+            if (slice_chip_log) {
+                if (i) *slice_chip_bindings << ", ";
+                *slice_chip_bindings
+                    << "{slice=" << i << ", bytes=" << slice_list[i]->length
+                    << ", src_chip=" << static_cast<int>(chip_ids.src)
+                    << ", dst_chip=" << static_cast<int>(chip_ids.dst) << "}";
+            }
         }
         rc = urma_post_jetty_send_wr(jetty_list_[jetty_index], &wr_list[0].base, &bad_wr);
         if (rc) {
@@ -1526,6 +1551,20 @@ int UrmaEndpoint::submitPostSend(
                 bad_wr = bad_wr->next;
             }
         }
+    }
+    if (slice_chip_log) {
+        MC_LOG(INFO) << "urma_slice_chip_bindings trace_id="
+                     << slice_list.front()->trace_id << " direction="
+                     << (slice_list.front()->opcode ==
+                                 Transport::TransferRequest::READ
+                             ? "read"
+                             : "write")
+                     << " local_nic=" << context_->nicPath()
+                     << " remote_nic=" << peer_nic_path_
+                     << " jetty_index=" << jetty_index
+                     << " slices=" << wr_count << " bindings=["
+                     << slice_chip_bindings->str() << "] status="
+                     << (rc ? "post_fail" : "posted");
     }
     if (auto* metrics = CurrentUbWorkerMetrics()) {
         metrics->posted_slices += wr_count - failed_post_count;
