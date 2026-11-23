@@ -1,4 +1,4 @@
-﻿#include <gtest/gtest.h>
+#include <gtest/gtest.h>
 
 #include <json/json.h>
 
@@ -131,9 +131,19 @@ TEST(MetricsSummaryTest, BusyThroughputUsesAllSuccessLatencies) {
     // every successful request (1+2+...+10 = 55ms).
     EXPECT_DOUBLE_EQ(op["busy_ms"].asDouble(), 55.0);
     EXPECT_EQ(op["success"].asUInt64(), 10u);
-    const double expected = 1000.0 / (55.0 / 1000.0) / (1024.0 * 1024.0);
-    EXPECT_NEAR(op["throughput_mb_s"].asDouble(), expected, 1e-9);
-    EXPECT_NEAR(op["throughput_gb_s"].asDouble(), expected / 1024.0, 1e-12);
+    const double expected_busy =
+        1000.0 / (55.0 / 1000.0) / (1024.0 * 1024.0);
+    EXPECT_NEAR(op["busy_throughput_mb_s"].asDouble(), expected_busy, 1e-9);
+    EXPECT_NEAR(op["busy_throughput_gb_s"].asDouble(),
+                expected_busy / 1024.0, 1e-12);
+    // Summary throughput is wall-clock based so it scales with thread count.
+    const double elapsed = root["elapsed_seconds"].asDouble();
+    ASSERT_GT(elapsed, 0.0);
+    const double expected_wall =
+        1000.0 / elapsed / (1024.0 * 1024.0);
+    EXPECT_NEAR(op["throughput_mb_s"].asDouble(), expected_wall, 1e-9);
+    EXPECT_NEAR(op["throughput_gb_s"].asDouble(), expected_wall / 1024.0,
+                1e-12);
 }
 
 TEST(MetricsWindowTest, DisabledWindowDoesNotCreateCsv) {

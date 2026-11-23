@@ -467,12 +467,22 @@ std::string MetricsCollector::StatsJson() const {
         }
         op["busy_ms"] = busy_ms;
         const double busy_s = busy_ms / 1000.0;
+        // Aggregate throughput uses wall time, so it scales with thread count.
+        // busy_ms is retained above (and exposed as busy_throughput) for
+        // callers that want per-thread service bandwidth.
+        const double elapsed_s = ElapsedSeconds();
         const double throughput_mb =
+            elapsed_s > 0.0
+                ? static_cast<double>(bytes) / elapsed_s / (1024.0 * 1024.0)
+                : 0.0;
+        const double busy_throughput_mb =
             busy_s > 0.0
                 ? static_cast<double>(bytes) / busy_s / (1024.0 * 1024.0)
                 : 0.0;
         op["throughput_mb_s"] = throughput_mb;
         op["throughput_gb_s"] = throughput_mb / 1024.0;
+        op["busy_throughput_mb_s"] = busy_throughput_mb;
+        op["busy_throughput_gb_s"] = busy_throughput_mb / 1024.0;
         op["miss"] = static_cast<Json::UInt64>(
             metric->miss.load(std::memory_order_relaxed));
         op["mismatch"] = static_cast<Json::UInt64>(
@@ -560,12 +570,22 @@ void MetricsCollector::WriteSummary() {
         op["bytes"] = static_cast<Json::UInt64>(bytes);
         op["busy_ms"] = busy_ms;
         const double busy_s = busy_ms / 1000.0;
+        // Aggregate throughput uses wall time, so it scales with thread count.
+        // busy_ms is retained above (and exposed as busy_throughput) for
+        // callers that want per-thread service bandwidth.
+        const double elapsed_s = ElapsedSeconds();
         const double throughput_mb =
+            elapsed_s > 0.0
+                ? static_cast<double>(bytes) / elapsed_s / (1024.0 * 1024.0)
+                : 0.0;
+        const double busy_throughput_mb =
             busy_s > 0.0
                 ? static_cast<double>(bytes) / busy_s / (1024.0 * 1024.0)
                 : 0.0;
         op["throughput_mb_s"] = throughput_mb;
         op["throughput_gb_s"] = throughput_mb / 1024.0;
+        op["busy_throughput_mb_s"] = busy_throughput_mb;
+        op["busy_throughput_gb_s"] = busy_throughput_mb / 1024.0;
         op["miss"] = static_cast<Json::UInt64>(
             metric->miss.load(std::memory_order_relaxed));
         op["mismatch"] = static_cast<Json::UInt64>(
