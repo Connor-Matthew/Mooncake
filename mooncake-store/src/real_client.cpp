@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "store_diagnostics.h"
 #include "gpu_direct_read.h"
 #ifdef USE_UB
 #include "ub_allocator.h"
@@ -4598,10 +4599,13 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                      << "Ensure client_buffer_allocator_ returns host memory.";
     }
 
+    ScopedTransferPathTrace path_trace("get_buffer_read", total_length);
     std::vector<Slice> slices;
     allocateSlices(slices, replica, buffer_handle->ptr());
     auto filtered_qr = FilterQueryResult(query_result.value(), replica);
+    path_trace.mark("slices_and_replica");
     auto get_result = client_->Get(key, filtered_qr, slices);
+    path_trace.mark("client_get");
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
@@ -4610,6 +4614,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     }
 
     log_breakdown("read_ok");
+    path_trace.mark("get_breakdown_log");
     return buffer_handle;
 }
 

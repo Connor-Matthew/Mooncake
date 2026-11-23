@@ -986,6 +986,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
         }
         return;
     }
+    if (traced) pending.slice->noteRouteMetadata(steadyNowNs());
     route.local_location = localLocationOf(pending);
     if (traced && pending.slice->spec().request_offset == 0) {
         pending.task->noteTraceLocations(

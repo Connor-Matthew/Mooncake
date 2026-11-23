@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -649,6 +650,30 @@ Status UbTransport::submitTransfer(
 
 Status UbTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
+    static const uint64_t trace_min_bytes = [] {
+        const char* raw = std::getenv("MC_TRANSFER_TRACE_MIN_BYTES");
+        if (!raw || !*raw || *raw == '-') return uint64_t{0};
+        char* end = nullptr;
+        const auto value = std::strtoull(raw, &end, 10);
+        return *end == '\0' ? static_cast<uint64_t>(value) : uint64_t{0};
+    }();
+    uint64_t trace_bytes = 0;
+    if (trace_min_bytes > 0) {
+        for (const auto* task : task_list) {
+            if (task && task->request) trace_bytes += task->request->length;
+        }
+    }
+    const bool traced = trace_min_bytes > 0 && trace_bytes >= trace_min_bytes;
+    using TraceClock = std::chrono::steady_clock;
+    const auto trace_start =
+        traced ? TraceClock::now() : TraceClock::time_point{};
+    TraceClock::duration enqueue_time{};
+    const auto enqueue_slices = [&](auto& entry) {
+        const auto start =
+            traced ? TraceClock::now() : TraceClock::time_point{};
+        entry.first->submitPostSend(entry.second);
+        if (traced) enqueue_time += TraceClock::now() - start;
+    };
     std::unordered_map<std::shared_ptr<UbContext>, std::vector<Slice*>>
         slices_to_post;
     const size_t kBlockSize = globalConfig().slice_size;
@@ -874,8 +899,7 @@ Status UbTransport::submitTransferTask(
             task.total_bytes += slice->length;
             __sync_fetch_and_add(&task.slice_count, 1);
             if (!staged_request && nr_slices >= kSubmitWatermark) {
-                for (auto& entry : slices_to_post)
-                    entry.first->submitPostSend(entry.second);
+                for (auto& entry : slices_to_post) enqueue_slices(entry);
                 slices_to_post.clear();
                 nr_slices = 0;
             }
@@ -888,8 +912,29 @@ Status UbTransport::submitTransferTask(
             cleanupStagingForTask(&task, true);
         }
     }
-    for (auto& entry : slices_to_post)
-        entry.first->submitPostSend(entry.second);
+    for (auto& entry : slices_to_post) enqueue_slices(entry);
+    if (traced) {
+        const auto trace_end = TraceClock::now();
+        const auto total = trace_end - trace_start;
+        MC_LOG(INFO)
+            << "ub_submit_trace engine=classic trace_id="
+            << logging::CurrentTraceId() << " bytes=" << trace_bytes
+            << " tasks=" << task_list.size() << " start_ns="
+            << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   trace_start.time_since_epoch())
+                   .count()
+            << " end_ns="
+            << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   trace_end.time_since_epoch())
+                   .count()
+            << " prepare_slices_us="
+            << std::chrono::duration<double, std::micro>(total - enqueue_time)
+                   .count()
+            << " enqueue_us="
+            << std::chrono::duration<double, std::micro>(enqueue_time).count()
+            << " total_us="
+            << std::chrono::duration<double, std::micro>(total).count();
+    }
     return Status::OK();
 }
 

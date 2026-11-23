@@ -89,6 +89,7 @@ inline std::string formatUbTaskTrace(
     const auto snapshot = task.snapshot();
     std::vector<uint64_t> queue, prepare, post, device;
     std::vector<uint64_t> prep_route, prep_select, prep_segments, prep_commit;
+    std::vector<uint64_t> route_metadata, local_location;
     uint64_t first_queued = 0, first_post = 0, last_post = 0;
     uint64_t first_complete = 0, last_complete = 0;
     uint64_t retries = 0, defers = 0;
@@ -103,6 +104,12 @@ inline std::string formatUbTaskTrace(
         queue.push_back(delta(item.queued_ns, item.dequeued_ns));
         prepare.push_back(delta(item.dequeued_ns, item.posted_ns));
         if (item.segments_ready_ns != 0) {
+            if (item.route_metadata_ns != 0) {
+                route_metadata.push_back(
+                    delta(item.dequeued_ns, item.route_metadata_ns));
+                local_location.push_back(
+                    delta(item.route_metadata_ns, item.route_ready_ns));
+            }
             prep_route.push_back(delta(item.dequeued_ns, item.route_ready_ns));
             prep_select.push_back(
                 delta(item.route_ready_ns, item.path_selected_ns));
@@ -152,6 +159,11 @@ inline std::string formatUbTaskTrace(
         << " slices=" << snapshot.total_slices << " slice_size=" << slice_size
         << " status=" << static_cast<int>(snapshot.status.s)
         << " total_us=" << us(total_ns) << " MBps=" << mbps
+        << " created_ns=" << snapshot.created_ns
+        << " terminal_ns=" << snapshot.terminal_ns
+        << " first_post_ns=" << first_post
+        << " last_complete_ns=" << last_complete << " completion_finalize_us="
+        << us(delta(last_complete, snapshot.terminal_ns))
         << " build_us=" << since_start(first_queued)
         << " first_post_us=" << since_start(first_post)
         << " last_post_us=" << since_start(last_post)
@@ -160,6 +172,8 @@ inline std::string formatUbTaskTrace(
     write_latency("queue_us", queue);
     write_latency("prepare_us", prepare);
     write_latency("prep_route_us", prep_route);
+    write_latency("prep_route_metadata_us", route_metadata);
+    write_latency("prep_local_location_us", local_location);
     write_latency("prep_select_us", prep_select);
     write_latency("prep_segments_us", prep_segments);
     write_latency("prep_commit_us", prep_commit);

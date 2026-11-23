@@ -378,8 +378,13 @@ struct TransferEngineTrace {
     int64_t alloc_batch_us = 0;
     int64_t build_requests_us = 0;
     int64_t engine_submit_us = 0;
+    int64_t prepare_requests_us = 0;
+    int64_t state_create_us = 0;
+    std::chrono::steady_clock::time_point submit_start;
     std::chrono::steady_clock::time_point submit_end;
     std::chrono::steady_clock::time_point wait_start;
+    std::chrono::steady_clock::time_point observed_done;
+    std::chrono::steady_clock::time_point trace_log_end;
     uint64_t polls = 0;
 };
 
@@ -395,6 +400,7 @@ class TransferEngineOperationState : public OperationState {
           start_ts_(getCurrentTimeInMilli()) {}
 
     ~TransferEngineOperationState();
+    void log_wait_return();
 
     bool is_completed() override;
 
@@ -1041,7 +1047,8 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitTransfer(
         std::vector<TransferRequest>& requests,
         TransferIntent intent = TransferIntent::kUnspecified,
-        int64_t open_segment_us = 0);
+        int64_t open_segment_us = 0, int64_t prepare_requests_us = 0,
+        std::chrono::steady_clock::time_point path_start = {});
 };
 
 }  // namespace mooncake

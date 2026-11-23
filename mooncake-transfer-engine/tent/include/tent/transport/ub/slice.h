@@ -191,6 +191,7 @@ struct UbSliceSnapshot {
     uint64_t route_ready_ns{0};
     uint64_t path_selected_ns{0};
     uint64_t segments_ready_ns{0};
+    uint64_t route_metadata_ns{0};
 };
 
 struct UbTask;
@@ -439,6 +440,9 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
     void noteDequeued(uint64_t now_ns) {
         dequeued_ns_.store(now_ns, std::memory_order_relaxed);
     }
+    void noteRouteMetadata(uint64_t now_ns) {
+        route_metadata_ns_.store(now_ns, std::memory_order_relaxed);
+    }
     void notePostReturned(uint64_t now_ns) {
         post_returned_ns_.store(now_ns, std::memory_order_relaxed);
     }
@@ -474,7 +478,8 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
             defer_count_.load(std::memory_order_relaxed),
             route_ready_ns_.load(std::memory_order_relaxed),
             path_selected_ns_.load(std::memory_order_relaxed),
-            segments_ready_ns_.load(std::memory_order_relaxed)};
+            segments_ready_ns_.load(std::memory_order_relaxed),
+            route_metadata_ns_.load(std::memory_order_relaxed)};
     }
 
    private:
@@ -527,6 +532,7 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
     std::atomic<uint64_t> route_ready_ns_{0};
     std::atomic<uint64_t> path_selected_ns_{0};
     std::atomic<uint64_t> segments_ready_ns_{0};
+    std::atomic<uint64_t> route_metadata_ns_{0};
 };
 
 struct UbTaskSnapshot {

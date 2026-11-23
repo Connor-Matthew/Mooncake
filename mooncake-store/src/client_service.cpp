@@ -2154,6 +2154,11 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
     tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                               const QueryResult& query_result,
                                               std::vector<Slice>& slices) {
+        uint64_t path_bytes = 0;
+        if (StoreTransferTraceMinBytes() > 0) {
+            for (const auto& slice : slices) path_bytes += slice.size;
+        }
+        ScopedTransferPathTrace path_trace("client_get", path_bytes);
         // 编排层整窗：GET_INTERNAL_* 六段之和与本窗的差值即编排层占比
         SpDiag::PerfPoint pt_full(PerfKey::GET_SINGLE_FULL,
                                   SpDiag::PerfLevel::KEY_MODULE);
@@ -2178,6 +2183,7 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
             }
         }
 
+        path_trace.mark("select_replica");
         // Check local hot cache and update replica descriptor if cache hit
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
@@ -2196,6 +2202,7 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
             return tl::unexpected(ErrorCode::INVALID_REPLICA);
         }
 
+        path_trace.mark("cache_and_validate");
         auto t0_get = std::chrono::steady_clock::now();
         if (replica.is_dfs_replica()) {
             err = ReadDfsReplica(object_key, replica, slices);
@@ -2204,6 +2211,7 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
                                query_result.vsegment_layouts.get());
         }
 
+        path_trace.mark("transfer_read");
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
             SpDiag::PerfPoint pt_release(PerfKey::GET_SINGLE_RELEASE_CACHE,
@@ -2229,6 +2237,7 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
             return tl::unexpected(err);
         }
 
+        path_trace.mark("release_cache_and_metrics");
         auto checksum_result = VerifyObjectChecksum(
             object_key, slices, calculate_total_size(replica),
             query_result.object_checksum);
@@ -2242,6 +2251,7 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
             return tl::unexpected(checksum_result.error());
         }
 
+        path_trace.mark("checksum");
         // Frequency admission: only promote frequently accessed keys to hot
         // cache. Skip when cache_used — data was already served from local
         // cache, no need to re-promote or increment the CMS counter.
@@ -7515,6 +7525,11 @@ ErrorCode Client::TransferData(
     TransferRequest::OpCode op_code, TransferIntent intent,
     std::set<std::string>* failed_endpoints,
     const std::vector<VSegmentLayoutEntry>* layouts) {
+    uint64_t path_bytes = 0;
+    if (StoreTransferTraceMinBytes() > 0) {
+        for (const auto& slice : slices) path_bytes += slice.size;
+    }
+    ScopedTransferPathTrace path_trace("client_transfer_data", path_bytes);
     if (!transfer_submitter_) return ErrorCode::INVALID_PARAMS;
     // NoF per-transfer breakdown is opt-in because emitting it before this
     // function returns directly inflates caller-observed read latency.
@@ -7552,7 +7567,9 @@ ErrorCode Client::TransferData(
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
     const TransferStrategy strategy = future->strategy();
+    path_trace.mark("plan_and_submit");
     auto result = future->get();
+    path_trace.mark("future_get");
     const auto wait_end =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
@@ -7582,6 +7599,7 @@ ErrorCode Client::TransferData(
                      << " total_us=" << elapsed_us(transfer_start, wait_end)
                      << " status=" << static_cast<int>(result);
     }
+    path_trace.mark("diagnostics_and_finish");
     return result;
 }
 
