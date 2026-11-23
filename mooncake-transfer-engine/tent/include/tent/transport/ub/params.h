@@ -37,6 +37,8 @@ struct UbParams {
     bool enable = false;
     std::vector<std::string> device_filter;
     BondingOptions bonding;
+    bool numa_affinity = false;
+    bool electrical_network = true;
 
     uint32_t worker_count = 6;
     uint32_t poller_count = 2;
@@ -68,6 +70,10 @@ struct UbParams {
         CHECK_STATUS(readBool(config, "transports/ub/enable", parsed.enable,
                               parsed.enable));
         CHECK_STATUS(readDeviceFilter(config, parsed.device_filter));
+        CHECK_STATUS(readBool(config, "transports/ub/numa_affinity", false,
+                              parsed.numa_affinity));
+        CHECK_STATUS(readBool(config, "transports/ub/electrical_network", true,
+                              parsed.electrical_network));
         CHECK_STATUS(readBondingMode(config, parsed.bonding.mode));
         CHECK_STATUS(readBondingLevel(config, parsed.bonding.level));
         CHECK_STATUS(readTransportMode(config,

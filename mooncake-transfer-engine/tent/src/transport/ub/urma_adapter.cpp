@@ -1717,7 +1717,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
         if (requests.empty()) return Status::OK();
 
         struct NativeWorkRequest {
-            urma_jfs_wr_t wr{};
+            bondp_jfs_wr_t extended{};
             urma_sge_t local_sge{};
             urma_sge_t remote_sge{};
         };
@@ -1760,6 +1760,17 @@ class RealUrmaAdapter final : public UrmaAdapter {
             }
 
             NativeWorkRequest& native = native_requests[i];
+            auto& wr = native.extended.base;
+            if (request.chip_affinity) {
+                if (!isBondingDevice(real_jetty->context()->deviceInfo()) ||
+                    request.src_chip_id == 0 || request.src_chip_id == 0xff ||
+                    request.dst_chip_id == 0 || request.dst_chip_id == 0xff) {
+                    return Status::InvalidArgument("Invalid UB chip affinity");
+                }
+                wr.flag.bs.has_drv_ext = 1;
+                native.extended.src_chip_id = request.src_chip_id;
+                native.extended.dst_chip_id = request.dst_chip_id;
+            }
             native.local_sge.addr = request.local_address;
             native.local_sge.len = static_cast<uint32_t>(request.length);
             native.local_sge.tseg = local->native();
@@ -1767,23 +1778,23 @@ class RealUrmaAdapter final : public UrmaAdapter {
             native.remote_sge.len = static_cast<uint32_t>(request.length);
             native.remote_sge.tseg = remote->native();
 
-            native.wr.opcode = request.operation == Operation::READ
-                                   ? URMA_OPC_READ
-                                   : URMA_OPC_WRITE;
-            native.wr.flag.bs.complete_enable = 1;
-            native.wr.tjetty = real_jetty->remote();
-            native.wr.user_ctx = request.token;
+            wr.opcode = request.operation == Operation::READ ? URMA_OPC_READ
+                                                           : URMA_OPC_WRITE;
+            wr.flag.bs.complete_enable = 1;
+            wr.tjetty = real_jetty->remote();
+            wr.user_ctx = request.token;
             if (request.operation == Operation::READ) {
-                native.wr.rw.src.sge = &native.remote_sge;
-                native.wr.rw.dst.sge = &native.local_sge;
+                wr.rw.src.sge = &native.remote_sge;
+                wr.rw.dst.sge = &native.local_sge;
             } else {
-                native.wr.rw.src.sge = &native.local_sge;
-                native.wr.rw.dst.sge = &native.remote_sge;
+                wr.rw.src.sge = &native.local_sge;
+                wr.rw.dst.sge = &native.remote_sge;
             }
-            native.wr.rw.src.num_sge = 1;
-            native.wr.rw.dst.num_sge = 1;
-            native.wr.next =
-                i + 1 == requests.size() ? nullptr : &native_requests[i + 1].wr;
+            wr.rw.src.num_sge = 1;
+            wr.rw.dst.num_sge = 1;
+            wr.next = i + 1 == requests.size()
+                          ? nullptr
+                          : &native_requests[i + 1].extended.base;
         }
 
         // Retain both segment handles before crossing the native post
@@ -1795,14 +1806,14 @@ class RealUrmaAdapter final : public UrmaAdapter {
 
         urma_jfs_wr_t* bad_wr = nullptr;
         const int rc = urma_post_jetty_send_wr(
-            real_jetty->native(), &native_requests.front().wr, &bad_wr);
+            real_jetty->native(), &native_requests.front().extended.base, &bad_wr);
         if (rc == URMA_SUCCESS) {
             posted_count = requests.size();
             return Status::OK();
         }
         if (bad_wr != nullptr) {
             for (size_t i = 0; i < native_requests.size(); ++i) {
-                if (bad_wr == &native_requests[i].wr) {
+                if (bad_wr == &native_requests[i].extended.base) {
                     posted_count = i;
                     break;
                 }

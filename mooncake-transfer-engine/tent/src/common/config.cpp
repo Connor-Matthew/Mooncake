@@ -294,6 +294,10 @@ Status ConfigHelper::loadFromEnv(Config& config) {
                      "transports/ub/bonding_level", "IODIE", "PORT");
     setBondingConfig(config, "MC_URMA_TRANS_MODE", "transports/ub/trans_mode",
                      "RC", "RM", "UM");
+    setBoolConfig(config, "MC_UB_NUMA_AFFINITY_ENABLE",
+                  "transports/ub/numa_affinity");
+    setBoolConfig(config, "MC_UB_ELECTRICAL_NETWORK_ENABLE",
+                  "transports/ub/electrical_network");
     // Classic TE custom topology file path. Maps into TENT config so the same
     // MC_CUSTOM_TOPO_JSON works under MC_USE_TENT. Inline
     // topology/priority_matrix in MC_TENT_CONF still takes precedence.

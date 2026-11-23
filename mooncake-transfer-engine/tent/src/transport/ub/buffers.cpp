@@ -73,12 +73,27 @@ Status encodeBufferMetadata(const UbBufferMetadata& metadata,
                {"urma_abi_size", segment.descriptor.urma_abi_size},
                {"hex", segment.descriptor.hex}}}});
     }
+    json chip_regions = json::array();
+    uint64_t chip_bytes = 0;
+    for (const auto& region : metadata.chip_regions) {
+        if (region.size == 0 || region.size > metadata.length - chip_bytes ||
+            region.chip_id == 0) {
+            return Status::InvalidArgument("Invalid UB chip region" LOC_MARK);
+        }
+        chip_bytes += region.size;
+        chip_regions.push_back({{"size", region.size},
+                                {"chip_id", region.chip_id}});
+    }
+    if (!metadata.chip_regions.empty() && chip_bytes != metadata.length) {
+        return Status::InvalidArgument("Incomplete UB chip regions" LOC_MARK);
+    }
     encoded = json{{"schema_version", metadata.schema_version},
                    {"generation", metadata.generation},
                    {"base", metadata.base},
                    {"length", metadata.length},
                    {"location", metadata.location},
                    {"permission", static_cast<int>(metadata.permission)},
+                   {"chip_regions", std::move(chip_regions)},
                    {"segments", std::move(segments)}}
                   .dump();
     return Status::OK();
@@ -106,6 +121,26 @@ Status decodeBufferMetadata(std::string_view encoded,
         parsed.base = value.at("base").get<uint64_t>();
         parsed.length = value.at("length").get<uint64_t>();
         parsed.location = value.value("location", "");
+        if (value.contains("chip_regions")) {
+            if (!value.at("chip_regions").is_array()) {
+                return Status::InvalidMetadataType("Invalid UB chip regions");
+            }
+            uint64_t covered = 0;
+            for (const auto& item : value.at("chip_regions")) {
+                const auto size = item.at("size").get<uint64_t>();
+                const int chip = item.at("chip_id").get<int>();
+                if (size == 0 || size > parsed.length - covered ||
+                    chip <= 0 || chip > kUnboundChip) {
+                    return Status::InvalidMetadataType("Invalid UB chip region");
+                }
+                covered += size;
+                parsed.chip_regions.push_back(
+                    {size, static_cast<uint8_t>(chip)});
+            }
+            if (!parsed.chip_regions.empty() && covered != parsed.length) {
+                return Status::InvalidMetadataType("Incomplete UB chip regions");
+            }
+        }
         const int permission = value.at("permission").get<int>();
         if (permission < static_cast<int>(kLocalReadWrite) ||
             permission > static_cast<int>(kGlobalReadWrite)) {
@@ -246,6 +281,16 @@ Status UbBufferManager::addBufferInternal(BufferDesc& desc,
     metadata.length = desc.length;
     metadata.location = desc.location;
     metadata.permission = options.perm;
+    if (desc.regions.empty()) {
+        metadata.chip_regions.push_back(
+            {desc.length, localLocationChip(desc.location)});
+    } else {
+        for (const auto& region : desc.regions) {
+            metadata.chip_regions.push_back(
+                {region.size, localLocationChip(region.location)});
+        }
+    }
+    record.chip_regions = metadata.chip_regions;
 
     SegmentOptions segment_options;
     segment_options.access = segmentAccess(options.perm);
@@ -485,6 +530,8 @@ Status UbBufferManager::findLocal(uint64_t address, size_t length,
     result = LocalSegmentRef{findContext(local_topology_id), segment->second,
                              it->second.generation, it->first.base,
                              it->first.length};
+    result.chip_id = chipForRange(it->second.chip_regions,
+                                 address - it->first.base, length);
     return Status::OK();
 }
 

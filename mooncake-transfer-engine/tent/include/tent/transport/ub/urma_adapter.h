@@ -217,6 +217,11 @@ struct WorkRequest {
 
     LocalSegmentPtr local_segment;
     RemoteSegmentPtr remote_segment;
+    // Optional bondp extension; IDs are native chip hints, independent of
+    // READ/WRITE SGE direction. Disabled requests retain the plain WR path.
+    bool chip_affinity = false;
+    uint8_t src_chip_id = 0xff;
+    uint8_t dst_chip_id = 0xff;
 };
 
 enum class CompletionCategory : uint8_t {

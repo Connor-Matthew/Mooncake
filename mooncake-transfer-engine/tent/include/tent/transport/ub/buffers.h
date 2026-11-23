@@ -17,6 +17,7 @@
 #include "tent/common/status.h"
 #include "tent/runtime/segment.h"
 #include "tent/transport/ub/context.h"
+#include "tent/transport/ub/chip_affinity.h"
 #include "tent/transport/ub/urma_adapter.h"
 
 namespace mooncake::tent::ub {
@@ -39,6 +40,8 @@ struct UbBufferMetadata {
     std::string location;
     Permission permission{kLocalReadWrite};
     std::vector<UbBufferSegmentMetadata> segments;
+    // Optional v1 extension. Old peers omit it and remain unbound.
+    std::vector<ChipRegion> chip_regions;
 };
 
 Status encodeBufferMetadata(const UbBufferMetadata& metadata,
@@ -52,6 +55,7 @@ struct LocalSegmentRef {
     uint64_t generation{0};
     uint64_t buffer_base{0};
     uint64_t buffer_length{0};
+    uint8_t chip_id{kUnboundChip};
 };
 
 struct ImportedSegmentRef {
@@ -127,6 +131,7 @@ class UbBufferManager final {
         uint64_t generation{0};
         // Empty unless the whole buffer resolved to one concrete location.
         std::string location;
+        std::vector<ChipRegion> chip_regions;
         std::unordered_map<Topology::NicID, LocalSegmentPtr> segments;
     };
 

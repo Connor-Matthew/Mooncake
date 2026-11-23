@@ -5,9 +5,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -20,6 +23,7 @@
 
 #include "tent/runtime/platform.h"
 #include "tent/transport/ub/endpoint.h"
+#include "tent/transport/ub/device_selection.h"
 
 namespace mooncake::tent::ub {
 namespace {
@@ -48,6 +52,34 @@ constexpr uint64_t kRailProbeEndpointGeneration = 1;
 // on a single-local-device topology where per-device coverage alone would leave
 // only one candidate.
 constexpr size_t kMinResolvedCandidates = 2;
+
+bool sliceChipDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MC_UB_SLICE_CHIP_DIAG");
+        if (!value) return false;
+        const std::string token(value);
+        return token == "1" || token == "on" || token == "true" ||
+               token == "yes";
+    }();
+    return enabled;
+}
+
+// Sample whole tasks so all eight slices of a sampled 8 MiB request appear.
+bool sampleSliceChipTask(uint64_t created_ns) {
+    static const double rate = [] {
+        const char* raw = std::getenv("MC_HIFREQ_LOG_SAMPLE_RATE");
+        if (!raw || !*raw) return 1.0;
+        char* end = nullptr;
+        const double parsed = std::strtod(raw, &end);
+        if (end == raw || *end || !std::isfinite(parsed)) return 1.0;
+        return std::clamp(parsed, 0.0, 1.0);
+    }();
+    uint64_t value = created_ns + 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    value ^= value >> 31;
+    return static_cast<double>(value >> 11) / 9007199254740992.0 < rate;
+}
 
 inline void cpuRelax() {
 #if defined(__x86_64__) || defined(__i386__)
@@ -1064,12 +1096,56 @@ void UbWorkers::processPending(const PendingSlice& pending,
     work.token = completion_token;
     work.local_segment = local.segment;
     work.remote_segment = remote.segment;
+    const auto remote_chip = chipForRange(
+        route.metadata.chip_regions,
+        work.remote_address - route.metadata.base, work.length);
+    // Keep classic bondp semantics: electrical links select the peer chip at
+    // both ends; optical links select local/peer respectively, also for READ.
+    const auto binding = selectChipBinding(params_.electrical_network,
+                                           local.chip_id, remote_chip);
+    work.chip_affinity =
+        params_.numa_affinity && isBondingDevice(local.context->deviceInfo()) &&
+        binding.valid();
+    if (work.chip_affinity) {
+        work.src_chip_id = binding.src;
+        work.dst_chip_id = binding.dst;
+    }
     auto jetty = endpoint->jetty(worker_index);
     last_post_ns_.store(inflight->posted_ns, std::memory_order_relaxed);
     size_t posted_count = 0;
     status = jetty ? adapter_->post(jetty, {work}, posted_count)
                    : Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
     if (traced) pending.slice->notePostReturned(steadyNowNs());
+    if (sliceChipDiagnosticsEnabled()) {
+        const auto task_snapshot = pending.task->snapshot();
+        if (sampleSliceChipTask(task_snapshot.created_ns)) {
+            LOG(INFO) << "urma_slice_chip_bindings engine=tent"
+                      << " task=" << pending.task.get()
+                      << " task_created_ns=" << task_snapshot.created_ns
+                      << " direction="
+                      << (work.operation == Operation::READ ? "read" : "write")
+                      << " worker=" << worker_index
+                      << " local_device=" << path.local_topology_id
+                      << " remote_nic=" << endpoint->key().peer_nic_path
+                      << " jetty_id=" << (jetty ? jetty->id() : 0)
+                      << " token=" << completion_token
+                      << " slice=" << pending.slice->id()
+                      << " offset=" << pending.slice->spec().request_offset
+                      << " bytes=" << work.length
+                      << " local_location=" << route.local_location
+                      << " remote_location=" << route.remote_buffer->location
+                      << " affinity_requested=" << params_.numa_affinity
+                      << " has_drv_ext=" << work.chip_affinity
+                      << " src_chip_id="
+                      << (work.chip_affinity
+                              ? std::to_string(work.src_chip_id) : "unbound")
+                      << " dst_chip_id="
+                      << (work.chip_affinity
+                              ? std::to_string(work.dst_chip_id) : "unbound")
+                      << " posted=" << posted_count
+                      << " status=" << status.ToString();
+        }
+    }
     if (posted_count == 1) {
         rail_monitor_->registerPath(path);
         if (!status.ok()) {

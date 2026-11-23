@@ -21,6 +21,7 @@
 #include "tent/transport/ub/context.h"
 #include "tent/transport/ub/endpoint_store.h"
 #include "tent/transport/ub/quota.h"
+#include "tent/transport/ub/params.h"
 #include "tent/transport/ub/rail_monitor.h"
 #include "tent/transport/ub/topology_attrs.h"
 #include "tent/transport/ub/ub_transport.h"
@@ -36,6 +37,76 @@ class UbWorkersTestPeer {
 };
 
 namespace {
+
+TEST(UbChipAffinityTest, ResolvesWholeSliceAndRejectsCrossChipRanges) {
+    const std::vector<ChipRegion> regions{{1024, 1}, {1024, 1}, {2048, 2}};
+    EXPECT_EQ(chipForRange(regions, 0, 1024), 1);
+    EXPECT_EQ(chipForRange(regions, 512, 1536), 1);
+    EXPECT_EQ(chipForRange(regions, 2048, 2048), 2);
+    EXPECT_EQ(chipForRange(regions, 1024, 2048), kUnboundChip);
+    EXPECT_EQ(chipForRange(regions, 4096, 1), kUnboundChip);
+    EXPECT_EQ(chipForRange(regions, 0, 4097), kUnboundChip);
+    EXPECT_EQ(chipForRange({}, 0, 1024), kUnboundChip);
+    EXPECT_EQ(chipForRange(regions, 0, 0), kUnboundChip);
+    EXPECT_EQ(localLocationChip("*"), kUnboundChip);
+    EXPECT_EQ(localLocationChip("cpu:0garbage"), kUnboundChip);
+}
+
+TEST(UbChipAffinityTest, ConfigurationIsOptInAndTypeChecked) {
+    Config config;
+    UbParams params;
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_FALSE(params.numa_affinity);
+    EXPECT_TRUE(params.electrical_network);
+    config.set("transports/ub/numa_affinity", true);
+    config.set("transports/ub/electrical_network", false);
+    ASSERT_TRUE(UbParams::FromConfig(config, params).ok());
+    EXPECT_TRUE(params.numa_affinity);
+    EXPECT_FALSE(params.electrical_network);
+    config.set("transports/ub/numa_affinity", "on");
+    EXPECT_FALSE(UbParams::FromConfig(config, params).ok());
+}
+
+TEST(UbChipAffinityTest, ElectricalAndOpticalUseClassicChipSemantics) {
+    const auto electrical = selectChipBinding(true, 1, 2);
+    EXPECT_TRUE(electrical.valid());
+    EXPECT_EQ(electrical.src, 2);
+    EXPECT_EQ(electrical.dst, 2);
+    const auto optical = selectChipBinding(false, 1, 2);
+    EXPECT_TRUE(optical.valid());
+    EXPECT_EQ(optical.src, 1);
+    EXPECT_EQ(optical.dst, 2);
+    EXPECT_FALSE(selectChipBinding(false, kUnboundChip, 2).valid());
+    EXPECT_FALSE(selectChipBinding(true, 1, kUnboundChip).valid());
+    EXPECT_TRUE(selectChipBinding(true, kUnboundChip, 2).valid());
+}
+
+TEST(UbChipAffinityTest, MetadataRoundTripAndOldPeerFallback) {
+    UbBufferMetadata metadata;
+    metadata.generation = 1;
+    metadata.base = 4096;
+    metadata.length = 2048;
+    UbBufferSegmentMetadata segment;
+    segment.topology_id = 0;
+    segment.device_name = "bonding_dev_0";
+    segment.eid = "eid";
+    segment.descriptor = {SegmentDescriptor::kSchemaVersion, 1, 16, "context"};
+    metadata.segments.push_back(segment);
+    metadata.chip_regions = {{1024, 1}, {1024, 2}};
+    std::string encoded;
+    ASSERT_TRUE(encodeBufferMetadata(metadata, encoded).ok());
+    UbBufferMetadata decoded;
+    ASSERT_TRUE(decodeBufferMetadata(encoded, decoded).ok());
+    EXPECT_EQ(chipForRange(decoded.chip_regions, 1024, 1024), 2);
+    auto legacy = nlohmann::json::parse(encoded);
+    legacy.erase("chip_regions");
+    ASSERT_TRUE(decodeBufferMetadata(legacy.dump(), decoded).ok());
+    EXPECT_TRUE(decoded.chip_regions.empty());
+    legacy["chip_regions"] = {{{"size", 2048}, {"chip_id", 256}}};
+    EXPECT_FALSE(decodeBufferMetadata(legacy.dump(), decoded).ok());
+    metadata.chip_regions = {{2049, 1}};
+    EXPECT_FALSE(encodeBufferMetadata(metadata, encoded).ok());
+}
 
 class FakeContext final : public Context {
    public:
