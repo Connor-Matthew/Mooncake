@@ -1,34 +1,28 @@
+#include "basic.h"
 #include "config.h"
 #include "http_transport.h"
+#include "maintenance.h"
 #include "metrics.h"
+#include "notify_codec.h"
 #include "notify_rpc_transport.h"
-#include "rate_gate.h"
-#include "thread_pool.h"
-
+#include "notify_sender.h"
+#include "operations.h"
+#include "pipeline.h"
 #include "real_client.h"
+#include "real_store_adapter.h"
 
 #include <glog/logging.h>
-#include <sys/mman.h>
-#include <unistd.h>
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
-#include <cstring>
 #include <filesystem>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <mutex>
-#include <numeric>
-#include <optional>
-#include <random>
-#include <span>
 #include <sstream>
 #include <string>
 #include <thread>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -41,497 +35,94 @@ void SignalHandler(int) {
     if (g_running) g_running->store(false, std::memory_order_release);
 }
 
-double ElapsedMs(std::chrono::steady_clock::time_point start) {
-    return std::chrono::duration<double, std::milli>(
-               std::chrono::steady_clock::now() - start)
-        .count();
+std::string BasicSummaryExtra(const Config &config,
+                              const BasicRunner::Stats &stats) {
+    std::ostringstream out;
+    out << "\"mode\":\"basic\""
+        << ",\"role\":\"" << config.role << "\""
+        << ",\"operation\":\"" << config.operation << "\""
+        << ",\"threads\":" << config.num_threads
+        << ",\"key_count\":" << config.key_count
+        << ",\"key_start\":" << config.key_start
+        << ",\"key_end\":" << config.EffectiveKeyEnd()
+        << ",\"data_size\":"
+        << (config.data_sizes.empty() ? 0 : config.data_sizes.front())
+        << ",\"batch_size\":" << config.BatchSize()
+        << ",\"put_ratio\":" << config.put_ratio
+        << ",\"target_qps\":" << config.target_qps
+        << ",\"duration\":" << config.duration
+        << ",\"warmup_duration\":" << config.warmup_duration
+        << ",\"warmup_ops\":" << stats.warmup_ops
+        << ",\"measured_ops\":" << stats.measured_ops
+        << ",\"measured_failures\":" << stats.measured_failures;
+    return out.str();
 }
 
-void FillPattern(void *buffer, uint64_t size, int sender) {
-    auto *bytes = static_cast<unsigned char *>(buffer);
-    for (uint64_t i = 0; i < size; ++i) {
-        bytes[i] = static_cast<unsigned char>((sender + i) & 0xff);
+std::string PipelineSummaryExtra(const Config &config,
+                                 const PipelineWriter::Stats *writer,
+                                 const PipelineReader::Stats *reader,
+                                 const NotifySender::Stats *notify,
+                                 const NotifyHttpClient *http,
+                                 size_t reader_queue,
+                                 uint64_t reader_dropped) {
+    std::ostringstream out;
+    out << "\"mode\":\"pipeline\""
+        << ",\"role\":\"" << config.role << "\""
+        << ",\"traffic_mode\":\"" << config.traffic_mode << "\""
+        << ",\"target_qps\":" << config.target_qps
+        << ",\"batch_keys\":" << config.batch_keys_count
+        << ",\"key_pool_size\":" << config.key_pool_size
+        << ",\"notify_count\":" << config.notify_count
+        << ",\"notify_transport\":\"" << config.notify_transport << "\""
+        << ",\"notify_async\":"
+        << (config.notify_async ? "true" : "false")
+        << ",\"warmup_duration\":" << config.warmup_duration
+        << ",\"duration\":" << config.duration
+        << ",\"reader_queue\":" << reader_queue
+        << ",\"reader_queue_dropped\":" << reader_dropped;
+    if (writer != nullptr) {
+        out << ",\"phase\":\"" << writer->phase << "\""
+            << ",\"measured_ops\":" << writer->measured_ops
+            << ",\"measured_failures\":" << writer->measured_failures
+            << ",\"warmup_ops\":" << writer->warmup_ops
+            << ",\"maintenance_ops\":" << writer->maintenance_ops
+            << ",\"notify_submitted\":" << writer->notifications
+            << ",\"notify_dispatch_failures\":" << writer->notify_failures;
     }
+    if (reader != nullptr) {
+        out << ",\"reader_batches\":" << reader->batches
+            << ",\"reader_warmup_batches\":" << reader->warmup_batches
+            << ",\"reader_precheck_misses\":" << reader->precheck_misses;
+    }
+    if (notify != nullptr) {
+        const uint64_t attempts = notify->ok + notify->fail;
+        const double avg_ms =
+            attempts == 0 ? 0.0
+                          : notify->elapsed_sum_ms /
+                                static_cast<double>(attempts);
+        const double wait_avg_ms =
+            attempts == 0 ? 0.0
+                          : notify->queue_wait_sum_ms /
+                                static_cast<double>(attempts);
+        out << ",\"notify_http_submitted\":" << notify->submitted
+            << ",\"notify_http_ok\":" << notify->ok
+            << ",\"notify_http_fail\":" << notify->fail
+            << ",\"notify_dropped\":" << notify->dropped
+            << ",\"notify_inflight_peak\":" << notify->inflight_peak
+            << ",\"notify_queue_peak\":" << notify->queue_peak
+            << ",\"notify_backpressure_ms\":" << notify->backpressure_ms
+            << ",\"notify_queue_wait_avg_ms\":" << wait_avg_ms
+            << ",\"notify_queue_wait_max_ms\":" << notify->queue_wait_max_ms
+            << ",\"notify_drain_ms\":" << notify->drain_ms
+            << ",\"notify_avg_ms\":" << avg_ms
+            << ",\"notify_max_ms\":" << notify->elapsed_max_ms;
+    }
+    if (http != nullptr) {
+        out << ",\"notify_connections_created\":" << http->Created()
+            << ",\"notify_connections_reused\":" << http->Reused();
+    }
+    return out.str();
 }
-
-bool VerifyPattern(const void *buffer, uint64_t actual_size,
-                   uint64_t expected_size, int sender, const Config &cfg) {
-    if (cfg.verify_level == "off") return true;
-    if (actual_size != expected_size) return false;
-    if (cfg.verify_level == "size") return true;
-    const auto *bytes = static_cast<const unsigned char *>(buffer);
-    auto verify_range = [&](uint64_t begin, uint64_t length) {
-        for (uint64_t i = begin; i < begin + length; ++i) {
-            if (bytes[i] != static_cast<unsigned char>((sender + i) & 0xff))
-                return false;
-        }
-        return true;
-    };
-    if (cfg.verify_level == "full") return verify_range(0, actual_size);
-    if (actual_size == 0) return true;
-    const uint64_t sample =
-        std::min(cfg.verify_sample_bytes, actual_size);
-    if (!verify_range(0, sample)) return false;
-    if (actual_size > sample &&
-        !verify_range(actual_size - sample, sample))
-        return false;
-    for (uint64_t offset = cfg.verify_sample_step_bytes;
-         offset + sample < actual_size; offset += cfg.verify_sample_step_bytes) {
-        if (!verify_range(offset, sample)) return false;
-    }
-    return true;
-}
-
-std::string NormalizeOperation(const std::string &operation) {
-    if (operation == "setStringView" || operation == "upsert") return "upsert";
-    if (operation == "upsertFrom" || operation == "upsert_from")
-        return "upsertFrom";
-    if (operation == "getBuffer" || operation == "get_buffer")
-        return "getBuffer";
-    if (operation == "exist" || operation == "isExist") return "exist";
-    if (operation == "mSet" || operation == "batchUpsertFrom" ||
-        operation == "batch_upsert_from")
-        return "batchUpsertFrom";
-    if (operation == "mGet" || operation == "batchGetBuffer" ||
-        operation == "batch_get_buffer")
-        return "batchGetBuffer";
-    if (operation == "del" || operation == "remove") return "remove";
-    return {};
-}
-
-bool ValidateOperations(const std::vector<std::string> &operations,
-                        const char *field, bool registered_buffer_available,
-                        std::string *error) {
-    for (const auto &operation : operations) {
-        const std::string normalized = NormalizeOperation(operation);
-        if (normalized.empty()) {
-            *error = std::string("unsupported operation in ") + field + ": " +
-                     operation;
-            return false;
-        }
-        if (!registered_buffer_available &&
-            (normalized == "upsertFrom" ||
-             normalized == "batchUpsertFrom")) {
-            *error = std::string(field) + " cannot contain " + operation +
-                     ": notify workers do not own registered source buffers";
-            return false;
-        }
-    }
-    return true;
-}
-
-class RegisteredBuffer {
-   public:
-    RegisteredBuffer(std::shared_ptr<RealClient> client, uint64_t max_size,
-                     size_t count)
-        : client_(std::move(client)) {
-        const uint64_t page = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
-        stride_ = ((max_size + page - 1) / page) * page;
-        if (stride_ == 0 || count > std::numeric_limits<size_t>::max() / stride_)
-            return;
-        size_ = static_cast<size_t>(stride_ * count);
-        data_ = mmap(nullptr, size_, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (data_ == MAP_FAILED) {
-            data_ = nullptr;
-            return;
-        }
-        if (client_->register_buffer(data_, size_) != 0) {
-            munmap(data_, size_);
-            data_ = nullptr;
-            return;
-        }
-        registered_ = true;
-    }
-
-    ~RegisteredBuffer() {
-        if (registered_) client_->unregister_buffer(data_);
-        if (data_) munmap(data_, size_);
-    }
-
-    RegisteredBuffer(const RegisteredBuffer &) = delete;
-    RegisteredBuffer &operator=(const RegisteredBuffer &) = delete;
-
-    bool Valid() const { return registered_; }
-    void *At(size_t index) {
-        return static_cast<char *>(data_) + stride_ * index;
-    }
-    void Fill(size_t count, uint64_t size, int sender) {
-        for (size_t i = 0; i < count; ++i) FillPattern(At(i), size, sender);
-    }
-
-   private:
-    std::shared_ptr<RealClient> client_;
-    void *data_{nullptr};
-    uint64_t stride_{0};
-    size_t size_{0};
-    bool registered_{false};
-};
-
-struct RequestContext {
-    std::vector<std::string> keys;
-    uint64_t size{0};
-    int sender{0};
-    RegisteredBuffer *buffer{nullptr};
-};
-
-class PipelineExecutor {
-   public:
-    PipelineExecutor(const Config &config, std::shared_ptr<RealClient> client,
-                     MetricsCollector &metrics)
-        : config_(config), client_(std::move(client)), metrics_(metrics) {
-        replicate_.replica_num = config_.store.replica_num;
-    }
-
-    bool Execute(const std::vector<std::string> &operations,
-                 RequestContext &context) {
-        for (const auto &configured_name : operations) {
-            const std::string operation = NormalizeOperation(configured_name);
-            if (!ExecuteOne(configured_name, operation, context)) return false;
-        }
-        return true;
-    }
-
-   private:
-    bool ExecuteOne(const std::string &metric_name,
-                    const std::string &operation, RequestContext &context) {
-        if (operation == "upsert") {
-            bool all_ok = true;
-            std::string owned;
-            if (!context.buffer) {
-                owned.resize(context.size);
-                FillPattern(owned.data(), context.size, context.sender);
-            }
-            for (size_t i = 0; i < context.keys.size(); ++i) {
-                const char *data = context.buffer
-                                       ? static_cast<char *>(context.buffer->At(i))
-                                       : owned.data();
-                const auto start = std::chrono::steady_clock::now();
-                const int rc = client_->upsert(
-                    context.keys[i], std::span<const char>(data, context.size),
-                    replicate_);
-                metrics_.Record(metric_name, ElapsedMs(start), rc == 0,
-                                context.size);
-                all_ok &= rc == 0;
-            }
-            return all_ok;
-        }
-        if (operation == "upsertFrom") {
-            if (!context.buffer) return false;
-            bool all_ok = true;
-            for (size_t i = 0; i < context.keys.size(); ++i) {
-                const auto start = std::chrono::steady_clock::now();
-                const int rc = client_->upsert_from(
-                    context.keys[i], context.buffer->At(i), context.size,
-                    replicate_);
-                metrics_.Record(metric_name, ElapsedMs(start), rc == 0,
-                                context.size);
-                all_ok &= rc == 0;
-            }
-            return all_ok;
-        }
-        if (operation == "getBuffer") {
-            bool all_ok = true;
-            for (const auto &key : context.keys) {
-                const auto start = std::chrono::steady_clock::now();
-                auto handle = client_->get_buffer(key);
-                const double latency = ElapsedMs(start);
-                bool ok = handle != nullptr;
-                bool verified = ok && VerifyPattern(handle->ptr(), handle->size(),
-                                                     context.size, context.sender,
-                                                     config_);
-                if (!verified) metrics_.RecordVerifyFailure();
-                if (!verified && config_.verify_fail_op) ok = false;
-                metrics_.Record(metric_name, latency, ok, ok ? handle->size() : 0);
-                all_ok &= ok;
-            }
-            return all_ok;
-        }
-        if (operation == "exist") {
-            bool all_ok = true;
-            for (const auto &key : context.keys) {
-                const auto start = std::chrono::steady_clock::now();
-                const int rc = client_->isExist(key);
-                metrics_.Record(metric_name, ElapsedMs(start), rc > 0, 0);
-                all_ok &= rc > 0;
-            }
-            return all_ok;
-        }
-        if (operation == "batchUpsertFrom") {
-            if (!context.buffer) return false;
-            std::vector<void *> buffers;
-            std::vector<size_t> sizes(context.keys.size(), context.size);
-            buffers.reserve(context.keys.size());
-            for (size_t i = 0; i < context.keys.size(); ++i)
-                buffers.push_back(context.buffer->At(i));
-            const auto start = std::chrono::steady_clock::now();
-            const auto results = client_->batch_upsert_from(
-                context.keys, buffers, sizes, replicate_);
-            const bool ok = results.size() == context.keys.size() &&
-                            std::all_of(results.begin(), results.end(),
-                                        [](int rc) { return rc == 0; });
-            metrics_.Record(metric_name, ElapsedMs(start), ok,
-                            context.size * context.keys.size());
-            return ok;
-        }
-        if (operation == "batchGetBuffer") {
-            const auto start = std::chrono::steady_clock::now();
-            auto handles = client_->batch_get_buffer(context.keys);
-            const double latency = ElapsedMs(start);
-            bool ok = handles.size() == context.keys.size();
-            uint64_t bytes = 0;
-            for (const auto &handle : handles) {
-                const bool verified =
-                    handle && VerifyPattern(handle->ptr(), handle->size(),
-                                            context.size, context.sender, config_);
-                if (!verified) metrics_.RecordVerifyFailure();
-                if (!handle || (!verified && config_.verify_fail_op)) ok = false;
-                if (handle) bytes += handle->size();
-            }
-            metrics_.Record(metric_name, latency, ok, bytes);
-            return ok;
-        }
-        if (operation == "remove") {
-            const auto start = std::chrono::steady_clock::now();
-            auto results = client_->batchRemove(context.keys, true);
-            const bool ok = results.size() == context.keys.size() &&
-                            std::all_of(results.begin(), results.end(),
-                                        [](int rc) { return rc == 0; });
-            metrics_.Record(metric_name, ElapsedMs(start), ok, 0);
-            return ok;
-        }
-        return false;
-    }
-
-    const Config &config_;
-    std::shared_ptr<RealClient> client_;
-    MetricsCollector &metrics_;
-    ReplicateConfig replicate_;
-};
-
-class NotifyDispatcher {
-   public:
-    NotifyDispatcher(const Config &config, PipelineExecutor &executor,
-                     MetricsCollector &metrics)
-        : config_(config),
-          executor_(executor),
-          metrics_(metrics),
-          pool_(config.NumReadThreads(), config.notify_queue_max) {}
-
-    bool Dispatch(NotifyRpcRequest request) {
-        RequestContext context;
-        context.sender = request.sender;
-        context.size = request.size;
-        context.keys = std::move(request.keys);
-        if (context.keys.empty() || context.size == 0) return false;
-        const auto arrival = std::chrono::steady_clock::now();
-        return pool_.Submit([this, context = std::move(context), arrival]() mutable {
-            metrics_.Record("notify_queue_wait", ElapsedMs(arrival), true, 0);
-            executor_.Execute(config_.notify_pipeline, context);
-        });
-    }
-
-    size_t QueueSize() const { return pool_.QueueSize(); }
-    uint64_t DroppedCount() const { return pool_.DroppedCount(); }
-    bool WaitIdle(std::chrono::milliseconds timeout) {
-        return pool_.WaitIdle(timeout);
-    }
-    void StopNow() { pool_.StopNow(); }
-    void Stop() { pool_.Stop(); }
-
-   private:
-    const Config &config_;
-    PipelineExecutor &executor_;
-    MetricsCollector &metrics_;
-    ThreadPool pool_;
-};
-
-class Writer {
-   public:
-    Writer(const Config &config, std::shared_ptr<RealClient> client,
-           PipelineExecutor &executor, MetricsCollector &metrics)
-        : config_(config),
-          client_(std::move(client)),
-          executor_(executor),
-          metrics_(metrics),
-          notify_rpc_client_(config.notify_rpc_connections_per_peer,
-                             config.notify_rpc_reuse_limit,
-                             config.notify_rpc_timeout_ms),
-          notify_pool_(config.notify_threads, config.notify_queue_max) {}
-
-    bool Prepare(std::string *error) {
-        if (!buffers_.empty()) return true;
-        const uint64_t max_size =
-            *std::max_element(config_.data_sizes.begin(), config_.data_sizes.end());
-        buffers_.reserve(config_.num_threads);
-        sequences_.assign(config_.num_threads, 0);
-        for (int i = 0; i < config_.num_threads; ++i) {
-            auto buffer = std::make_unique<RegisteredBuffer>(
-                client_, max_size, config_.batch_keys_count);
-            if (!buffer->Valid()) {
-                *error = "failed to allocate/register writer buffer " +
-                         std::to_string(i);
-                return false;
-            }
-            buffers_.push_back(std::move(buffer));
-        }
-        return true;
-    }
-
-    bool Start(std::string *error) {
-        if (running_.load(std::memory_order_acquire)) return true;
-        if (buffers_.size() != static_cast<size_t>(config_.num_threads)) {
-            *error = "writer buffers are not prepared";
-            return false;
-        }
-        running_.store(true, std::memory_order_release);
-        for (int i = 0; i < config_.num_threads; ++i) {
-            workers_.emplace_back([this, i] { Run(i); });
-        }
-        return true;
-    }
-
-    void RequestStop() { running_.store(false, std::memory_order_release); }
-
-    bool PauseAndDrain(std::chrono::milliseconds timeout) {
-        RequestStop();
-        JoinWorkers();
-        return notify_pool_.WaitIdle(timeout);
-    }
-
-    void Stop() {
-        RequestStop();
-        JoinWorkers();
-        notify_pool_.Stop();
-        buffers_.clear();
-        sequences_.clear();
-    }
-
-    size_t NotifyQueueSize() const { return notify_pool_.QueueSize(); }
-    uint64_t NotifyDroppedCount() const { return notify_pool_.DroppedCount(); }
-
-   private:
-    void JoinWorkers() {
-        for (auto &worker : workers_) {
-            if (worker.joinable()) worker.join();
-        }
-        workers_.clear();
-    }
-
-    void Run(int thread_id) {
-        std::mt19937 rng(static_cast<uint32_t>(config_.instance_id * 1000 +
-                                               thread_id));
-        std::uniform_int_distribution<size_t> size_distribution(
-            0, config_.data_sizes.size() - 1);
-        RateGate gate;
-        gate.Configure(config_.target_qps, thread_id, config_.num_threads,
-                       config_.enable_jitter);
-        gate.Reset(SteadyNowUs());
-        uint64_t &sequence = sequences_[thread_id];
-        while (running_.load(std::memory_order_acquire)) {
-            if (gate.Active()) {
-                const int64_t fire = gate.Next(SteadyNowUs(), rng);
-                std::this_thread::sleep_until(
-                    std::chrono::steady_clock::time_point(
-                        std::chrono::microseconds(fire)));
-                gate.Advance();
-                if (!running_.load(std::memory_order_acquire)) break;
-            }
-            RequestContext context;
-            context.sender = config_.instance_id;
-            context.buffer = buffers_[thread_id].get();
-            context.keys.reserve(config_.batch_keys_count);
-            for (int i = 0; i < config_.batch_keys_count; ++i) {
-                uint64_t key_index = sequence;
-                if (config_.key_pool_size != 0) {
-                    key_index =
-                        (sequence * static_cast<uint64_t>(config_.num_threads) *
-                             static_cast<uint64_t>(config_.batch_keys_count) +
-                         static_cast<uint64_t>(thread_id) *
-                             static_cast<uint64_t>(config_.batch_keys_count) +
-                         static_cast<uint64_t>(i)) %
-                        config_.key_pool_size;
-                }
-                context.keys.push_back(
-                    "mooncake_kvtest_" +
-                    std::to_string(config_.instance_id) + "_" +
-                    (config_.key_pool_size == 0
-                         ? std::to_string(thread_id) + "_" +
-                               std::to_string(sequence) + "_" +
-                               std::to_string(i)
-                         : std::to_string(key_index)));
-                if (i == 0) {
-                    context.size = config_.key_pool_size == 0
-                                       ? config_.data_sizes[size_distribution(rng)]
-                                       : config_.data_sizes[
-                                             key_index %
-                                             config_.data_sizes.size()];
-                }
-            }
-            context.buffer->Fill(context.keys.size(), context.size,
-                                 context.sender);
-            const bool ok = executor_.Execute(config_.pipeline, context);
-            if (ok) Notify(context, rng);
-            ++sequence;
-        }
-    }
-
-    void Notify(const RequestContext &context, std::mt19937 &rng) {
-        if (config_.notify_count == 0) return;
-        std::vector<size_t> indexes(config_.peers.size());
-        std::iota(indexes.begin(), indexes.end(), 0);
-        std::shuffle(indexes.begin(), indexes.end(), rng);
-        NotifyRpcRequest request;
-        request.keys = context.keys;
-        request.size = context.size;
-        request.sender = context.sender;
-        size_t request_bytes = sizeof(request.size) + sizeof(request.sender);
-        for (const auto &key : request.keys) request_bytes += key.size();
-        for (int i = 0; i < config_.notify_count; ++i) {
-            const std::string peer = config_.peers[indexes[i]];
-            notify_pool_.Submit([this, peer, request, request_bytes] {
-                std::string error;
-                NotifyRpcTiming timing;
-                const auto start = std::chrono::steady_clock::now();
-                const bool ok = notify_rpc_client_.Notify(
-                    peer, request, &timing, &error);
-                metrics_.Record("notify_rpc_pool_lookup",
-                                timing.pool_lookup_ms,
-                                timing.pool_found, 0);
-                metrics_.Record("notify_rpc_pool_dispatch",
-                                timing.pool_dispatch_ms,
-                                timing.dispatched, 0);
-                metrics_.Record("notify_rpc_await_response",
-                                timing.await_response_ms,
-                                timing.responded, 0);
-                metrics_.Record("notify_rpc", ElapsedMs(start), ok,
-                                request_bytes);
-                if (!ok) {
-                    const uint64_t failures = notify_failures_.fetch_add(
-                                                  1, std::memory_order_relaxed) +
-                                              1;
-                    if (failures == 1 || failures % 1000 == 0) {
-                        LOG(WARNING) << "notify failures=" << failures
-                                     << " last_peer=" << peer
-                                     << " last_error=" << error;
-                    }
-                }
-            });
-        }
-    }
-
-    const Config &config_;
-    std::shared_ptr<RealClient> client_;
-    PipelineExecutor &executor_;
-    MetricsCollector &metrics_;
-    NotifyRpcClient notify_rpc_client_;
-    ThreadPool notify_pool_;
-    std::atomic<bool> running_{false};
-    std::atomic<uint64_t> notify_failures_{0};
-    std::vector<std::thread> workers_;
-    std::vector<std::unique_ptr<RegisteredBuffer>> buffers_;
-    std::vector<uint64_t> sequences_;
-};
 
 }  // namespace
 }  // namespace mooncake::kvtest
@@ -548,17 +139,32 @@ int main(int argc, char **argv) {
     const bool check_only = argc == 3 && std::string(argv[2]) == "--check-config";
     Config config;
     std::string error;
-    if (!LoadConfig(argv[1], &config, &error) ||
-        !ValidateOperations(config.pipeline, "pipeline", true, &error) ||
-        !ValidateOperations(config.notify_pipeline, "notify_pipeline", false,
+    if (!LoadConfig(argv[1], &config, &error)) {
+        std::cerr << "Config error: " << error << '\n';
+        return 2;
+    }
+    if (config.IsPipeline()) {
+        if (!ValidateOpList(config.pipeline, OpSide::kAny, true, &error) ||
+            !ValidateOpList(config.notify_pipeline, OpSide::kRead, true,
                             &error)) {
+            std::cerr << "Config error: " << error << '\n';
+            return 2;
+        }
+    } else if (config.IsBasic() &&
+               !ValidateBasicOperation(config, &error)) {
         std::cerr << "Config error: " << error << '\n';
         return 2;
     }
     if (check_only) {
-        std::cout << "Config OK: role=" << config.role
+        std::cout << "Config OK: mode=" << config.mode
+                  << " role=" << config.role
                   << " write_threads=" << config.num_threads
-                  << " read_threads=" << config.NumReadThreads() << '\n';
+                  << " read_threads=" << config.NumReadThreads()
+                  << " traffic=" << config.traffic_mode
+                  << " target_qps=" << config.target_qps
+                  << " batch_keys=" << config.batch_keys_count;
+        if (config.IsBasic()) std::cout << " operation=" << config.operation;
+        std::cout << '\n';
         return 0;
     }
     if (!ApplyCpuAffinity(config.cpu_affinity, &error)) {
@@ -583,59 +189,288 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    RealStoreAdapter store_adapter(client, config.store.replica_num);
+    if (config.IsOneShot()) {
+        const int rc = config.mode == "prefill"
+                           ? RunPrefill(config, store_adapter, &error)
+                           : RunCleanup(config, store_adapter, &error);
+        if (rc != 0) {
+            std::cerr << "kvtest " << config.mode << " failed: " << error
+                      << '\n';
+        }
+        client->tearDownAll();
+        google::ShutdownGoogleLogging();
+        return rc;
+    }
+
     std::atomic<bool> running{true};
     g_running = &running;
     std::signal(SIGTERM, SignalHandler);
     std::signal(SIGINT, SignalHandler);
+#ifdef SIGPIPE
     std::signal(SIGPIPE, SIG_IGN);
+#endif
 
     MetricsCollector metrics(config.instance_id, config.metrics_interval_ms,
-                             config.output_dir);
+                             config.output_dir, config.samples_max);
     metrics.Start();
-    PipelineExecutor executor(config, client, metrics);
-    NotifyDispatcher dispatcher(config, executor, metrics);
-    std::unique_ptr<Writer> writer;
-    if (config.role == "writer" || config.role == "dual") {
-        writer = std::make_unique<Writer>(config, client, executor, metrics);
+
+    std::unique_ptr<PipelineWriter> writer;
+    std::unique_ptr<PipelineReader> reader;
+    std::unique_ptr<PipelineDispatcher> dispatcher;
+    std::unique_ptr<NotifySender> notify_sender;
+    std::unique_ptr<NotifyHttpClient> http_client;
+    std::unique_ptr<NotifyRpcClient> rpc_client;
+    std::unique_ptr<NotifyRpcServer> rpc_server;
+    std::unique_ptr<BasicRunner> basic_runner;
+
+    auto startup_failed = [&](const std::string &message) {
+        LOG(ERROR) << message;
+        metrics.Stop();
+        client->tearDownAll();
+        google::ShutdownGoogleLogging();
+        return 1;
+    };
+
+    auto prepare_writer = [&]() -> bool {
+        writer = std::make_unique<PipelineWriter>(
+            config, store_adapter, metrics, notify_sender.get());
         if (!writer->Prepare(&error)) {
-            LOG(ERROR) << error;
-            metrics.Stop();
-            client->tearDownAll();
-            google::ShutdownGoogleLogging();
-            return 1;
+            LOG(ERROR) << "writer prepare failed: " << error;
+            return false;
         }
+        return true;
+    };
+    auto prepare_basic = [&]() -> bool {
+        basic_runner =
+            std::make_unique<BasicRunner>(config, store_adapter, metrics);
+        if (!basic_runner->Prepare(&error)) {
+            LOG(ERROR) << "basic prepare failed: " << error;
+            return false;
+        }
+        return true;
+    };
+
+    if (config.IsPipeline()) {
+        if (config.role == "reader" || config.role == "dual") {
+            reader = std::make_unique<PipelineReader>(config, store_adapter,
+                                                      metrics);
+            if (!reader->Prepare(&error)) {
+                return startup_failed("reader prepare failed: " + error);
+            }
+            dispatcher = std::make_unique<PipelineDispatcher>(
+                config, *reader, metrics);
+        }
+        if (config.role == "writer" || config.role == "dual") {
+            http_client = std::make_unique<NotifyHttpClient>(3);
+            NotifyHttpClient *http = http_client.get();
+            if (config.notify_transport == "rpc") {
+                rpc_client = std::make_unique<NotifyRpcClient>(
+                    config.notify_rpc_connections_per_peer,
+                    config.notify_rpc_reuse_limit,
+                    config.notify_rpc_timeout_ms);
+            }
+            NotifyRpcClient *rpc = rpc_client.get();
+            const auto send_fn = [http, rpc, &config, &metrics](
+                                     const std::string &peer,
+                                     const NotifyBatch &batch,
+                                     double *latency_ms) -> bool {
+                const auto start = std::chrono::steady_clock::now();
+                bool ok = false;
+                std::string send_error;
+                if (config.notify_transport == "rpc") {
+                    NotifyRpcRequest request;
+                    request.keys = batch.keys;
+                    request.size = batch.size;
+                    request.sender = batch.sender;
+                    request.warmup = batch.warmup;
+                    NotifyRpcTiming timing;
+                    ok = rpc->Notify(peer, request, &timing, &send_error);
+                    metrics.Record("notify_rpc_pool_lookup",
+                                   timing.pool_lookup_ms,
+                                   timing.pool_found ? RecordStatus::kOk
+                                                     : RecordStatus::kError,
+                                   0);
+                    metrics.Record("notify_rpc_pool_dispatch",
+                                   timing.pool_dispatch_ms,
+                                   timing.dispatched ? RecordStatus::kOk
+                                                     : RecordStatus::kError,
+                                   0);
+                    metrics.Record("notify_rpc_await_response",
+                                   timing.await_response_ms,
+                                   timing.responded ? RecordStatus::kOk
+                                                    : RecordStatus::kError,
+                                   0);
+                } else {
+                    std::string method = "POST";
+                    std::string path = "/notify";
+                    std::string body;
+                    if (config.notify_format == "query") {
+                        method = "GET";
+                        path = EncodeNotifyQuery(batch);
+                    } else {
+                        body = EncodeNotifyJson(batch);
+                    }
+                    ok = http->Send(peer, method, path, body, &send_error);
+                }
+                if (!ok) {
+                    static std::atomic<int> warned{0};
+                    if (warned.fetch_add(1, std::memory_order_relaxed) < 3) {
+                        LOG(WARNING) << "notify send failed for " << peer
+                                     << " (" << config.notify_transport
+                                     << "): " << send_error;
+                    }
+                }
+                if (latency_ms != nullptr) {
+                    *latency_ms =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+                }
+                return ok;
+            };
+            const auto record_fn = [&metrics, &config](bool ok,
+                                                       double latency_ms) {
+                metrics.Record(config.notify_transport == "rpc" ? "notify_rpc"
+                                                                : "notify_http",
+                               latency_ms,
+                               ok ? RecordStatus::kOk : RecordStatus::kError,
+                               0);
+            };
+            const NotifySender::Overflow overflow =
+                config.notify_overflow == "block"
+                    ? NotifySender::Overflow::kBlock
+                    : NotifySender::Overflow::kDrop;
+            notify_sender = std::make_unique<NotifySender>(
+                static_cast<size_t>(config.notify_threads),
+                config.notify_queue_max, overflow, config.notify_async,
+                send_fn, record_fn);
+            if (!prepare_writer()) {
+                return startup_failed("writer prepare failed: " + error);
+            }
+        }
+        metrics.SetSummaryExtra(PipelineSummaryExtra(
+            config, nullptr, nullptr, nullptr, http_client.get(), 0, 0));
+    } else {
+        if (!prepare_basic()) {
+            return startup_failed("basic prepare failed: " + error);
+        }
+        metrics.SetSummaryExtra(
+            BasicSummaryExtra(config, BasicRunner::Stats{}));
+    }
+
+    if (config.IsPipeline() && config.notify_transport == "rpc" &&
+        (config.role == "reader" || config.role == "dual")) {
+        rpc_server = std::make_unique<NotifyRpcServer>(
+            config.notify_rpc_port, config.notify_rpc_threads,
+            [&](NotifyRpcRequest request) {
+                if (!dispatcher || !running.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                NotifyBatch batch;
+                batch.keys = std::move(request.keys);
+                batch.sender = request.sender;
+                batch.size = request.size;
+                batch.warmup = request.warmup;
+                return dispatcher->Dispatch(std::move(batch));
+            });
     }
 
     std::mutex workload_mutex;
     bool workload_started = false;
     bool workload_paused = false;
     bool measurement_armed = false;
+    std::thread workload_thread;
+    std::atomic<bool> workload_failed{false};
 
-    NotifyRpcServer notify_rpc_server(
-        config.notify_rpc_port, config.notify_rpc_threads,
-        [&](NotifyRpcRequest request) {
-            return dispatcher.Dispatch(std::move(request));
-        });
+    auto start_workload = [&](std::string *start_error) -> bool {
+        if (workload_thread.joinable()) return true;
+        if (basic_runner) {
+            workload_thread = std::thread([&] {
+                std::string run_error;
+                if (!basic_runner->Start(&run_error)) {
+                    workload_failed.store(true, std::memory_order_release);
+                    LOG(ERROR) << "basic workload failed: " << run_error;
+                }
+            });
+            return true;
+        }
+        if (writer) {
+            workload_thread = std::thread([&] {
+                std::string run_error;
+                if (!writer->Start(&run_error)) {
+                    workload_failed.store(true, std::memory_order_release);
+                    LOG(ERROR) << "pipeline writer failed: " << run_error;
+                }
+            });
+            return true;
+        }
+        (void)start_error;
+        return true;  // pure reader
+    };
 
     HttpServer server(
         config.listen_port, 4,
         [&](const std::string &method, const std::string &path,
-            const std::string & /*body*/) -> HttpResponse {
-            if (method == "GET" && path == "/stats") {
+            const std::string &body) -> HttpResponse {
+            const auto query = path.find('?');
+            const std::string route =
+                query == std::string::npos ? path : path.substr(0, query);
+            if ((method == "POST" || method == "GET") &&
+                route == "/notify") {
+                if (!dispatcher) {
+                    return {404, "text/plain", "not a reader"};
+                }
+                if (!running.load(std::memory_order_acquire)) {
+                    return {503, "text/plain", "stopping"};
+                }
+                NotifyBatch batch;
+                std::string decode_error;
+                if (!DecodeNotify(path, body, config.notify_read_format, &batch,
+                                  &decode_error)) {
+                    return {400, "text/plain", "invalid notify"};
+                }
+                return dispatcher->Dispatch(std::move(batch))
+                           ? HttpResponse{200, "text/plain", "ok"}
+                           : HttpResponse{503, "text/plain", "queue full"};
+            }
+            if (method == "GET" && route == "/stats") {
+                if (config.IsBasic()) {
+                    metrics.SetSummaryExtra(BasicSummaryExtra(
+                        config, basic_runner != nullptr
+                                    ? basic_runner->GetStats()
+                                    : BasicRunner::Stats{}));
+                    return {200, "application/json", metrics.StatsJson()};
+                }
+                PipelineWriter::Stats writer_stats;
+                PipelineReader::Stats reader_stats;
+                NotifySender::Stats sender_stats;
+                if (writer) writer_stats = writer->GetStats();
+                if (reader) reader_stats = reader->GetStats();
+                if (notify_sender) sender_stats = notify_sender->GetStats();
+                metrics.SetSummaryExtra(PipelineSummaryExtra(
+                    config, writer ? &writer_stats : nullptr,
+                    reader ? &reader_stats : nullptr,
+                    notify_sender ? &sender_stats : nullptr,
+                    http_client.get(),
+                    dispatcher ? dispatcher->QueueSize() : 0,
+                    dispatcher ? dispatcher->Dropped() : 0));
                 return {200, "application/json", metrics.StatsJson()};
             }
-            if (method == "GET" && path == "/health") {
+            if (method == "GET" && route == "/health") {
                 return {200, "text/plain", "ok"};
             }
-            if (method == "POST" && path == "/start") {
+            if (method == "POST" && route == "/start") {
                 std::lock_guard<std::mutex> lock(workload_mutex);
-                if (!running.load(std::memory_order_acquire))
+                if (!running.load(std::memory_order_acquire)) {
                     return {409, "text/plain", "stopping"};
-                if (workload_started)
+                }
+                if (workload_started) {
                     return {200, "text/plain", "already started"};
-                metrics.Reset();
+                }
+                if (!basic_runner && !writer) metrics.Reset();
                 std::string start_error;
-                if (writer && !writer->Start(&start_error)) {
+                if (!start_workload(&start_error)) {
                     return {500, "text/plain", start_error};
                 }
                 workload_started = true;
@@ -643,96 +478,102 @@ int main(int argc, char **argv) {
                 measurement_armed = false;
                 return {200, "text/plain", "started"};
             }
-            if (method == "POST" && path == "/pause") {
+            if (method == "POST" && route == "/pause") {
                 std::lock_guard<std::mutex> lock(workload_mutex);
-                if (!workload_started)
-                    return {409, "text/plain", "not started"};
-                if (workload_paused)
-                    return {200, "text/plain", "already paused"};
-                if (writer && !writer->PauseAndDrain(
-                                  std::chrono::seconds(30))) {
-                    return {500, "text/plain", "outbound drain timeout"};
+                if (!workload_started || workload_paused) {
+                    return {409, "text/plain", "not running or already paused"};
                 }
+                metrics.Freeze();
+                if (writer) writer->RequestStop();
+                if (basic_runner) basic_runner->RequestStop();
+                if (workload_thread.joinable()) workload_thread.join();
+                if (notify_sender) notify_sender->Drain();
                 workload_paused = true;
                 measurement_armed = false;
-                LOG(INFO) << "warmup transition: writer paused, outbound "
-                             "notifications drained";
                 return {200, "text/plain", "paused"};
             }
-            if (method == "POST" && path == "/drain") {
-                if (!dispatcher.WaitIdle(std::chrono::seconds(30))) {
-                    return {500, "text/plain", "inbound drain timeout"};
-                }
-                LOG(INFO) << "warmup transition: inbound notifications drained";
+            if (method == "POST" && route == "/drain") {
+                if (dispatcher) dispatcher->Drain(std::chrono::seconds(5));
                 return {200, "text/plain", "drained"};
             }
-            if (method == "POST" && path == "/reset") {
+            if (method == "POST" && route == "/reset") {
                 std::lock_guard<std::mutex> lock(workload_mutex);
-                if (!workload_started)
-                    return {409, "text/plain", "not started"};
-                if (writer && !workload_paused)
-                    return {409, "text/plain", "writer is not paused"};
+                if (!workload_paused) {
+                    return {409, "text/plain", "workload is not paused"};
+                }
                 metrics.ResetPaused();
                 measurement_armed = false;
-                LOG(INFO) << "warmup transition: metrics cleared and paused";
                 return {200, "text/plain", "reset"};
             }
-            if (method == "POST" && path == "/arm") {
+            if (method == "POST" && route == "/arm") {
                 std::lock_guard<std::mutex> lock(workload_mutex);
-                if (!workload_started || !workload_paused)
+                if (!workload_paused) {
                     return {409, "text/plain", "workload is not paused"};
+                }
                 if (!measurement_armed) {
                     metrics.BeginMeasurement();
                     measurement_armed = true;
                 }
-                LOG(INFO) << "measurement metrics armed";
                 return {200, "text/plain", "armed"};
             }
-            if (method == "POST" && path == "/resume") {
+            if (method == "POST" && route == "/resume") {
                 std::lock_guard<std::mutex> lock(workload_mutex);
-                if (!workload_started)
-                    return {409, "text/plain", "not started"};
-                if (!workload_paused)
-                    return {200, "text/plain", "already running"};
-                if (!measurement_armed)
-                    return {409, "text/plain", "measurement is not armed"};
+                if (!workload_paused || !measurement_armed) {
+                    return {409, "text/plain", "pause/arm first"};
+                }
+                if (config.IsPipeline() &&
+                    (config.role == "writer" || config.role == "dual")) {
+                    writer.reset();
+                    if (!prepare_writer()) {
+                        return {500, "text/plain", error};
+                    }
+                }
+                if (config.IsBasic()) {
+                    basic_runner.reset();
+                    if (!prepare_basic()) {
+                        return {500, "text/plain", error};
+                    }
+                }
+                workload_failed.store(false, std::memory_order_release);
                 std::string resume_error;
-                if (writer && !writer->Start(&resume_error)) {
+                if (!start_workload(&resume_error)) {
                     return {500, "text/plain", resume_error};
                 }
                 workload_paused = false;
-                LOG(INFO) << "measurement workload resumed";
                 return {200, "text/plain", "resumed"};
             }
-            if (method == "POST" && path == "/summary") {
+            if (method == "POST" && route == "/summary") {
                 metrics.WriteSummary();
                 return {200, "text/plain", "ok"};
             }
-            if (method == "POST" && path == "/stop") {
+            if (method == "POST" &&
+                (route == "/stop" || route == "/shutdown")) {
                 std::lock_guard<std::mutex> lock(workload_mutex);
                 metrics.Freeze();
                 running.store(false, std::memory_order_release);
                 if (writer) writer->RequestStop();
+                if (basic_runner) basic_runner->RequestStop();
                 return {200, "text/plain", "stopping"};
             }
             return {404, "text/plain", "not found"};
         });
     int exit_code = 0;
-    if (!notify_rpc_server.Start(&error)) {
-        LOG(ERROR) << "YLT notify RPC server failed: " << error;
-        exit_code = 1;
-        running.store(false, std::memory_order_release);
-    } else if (!server.Start(&error)) {
+    if (!server.Start(&error)) {
         LOG(ERROR) << "HTTP server failed: " << error;
         exit_code = 1;
         running.store(false, std::memory_order_release);
-        notify_rpc_server.Stop();
+    }
+    if (exit_code == 0 && rpc_server && !rpc_server->Start(&error)) {
+        LOG(ERROR) << "RPC notify server failed: " << error;
+        exit_code = 1;
+        running.store(false, std::memory_order_release);
     }
     if (running.load(std::memory_order_acquire) && !config.start_paused) {
         std::lock_guard<std::mutex> lock(workload_mutex);
-        metrics.Reset();
-        if (writer && !writer->Start(&error)) {
-            LOG(ERROR) << error;
+        if (!basic_runner && !writer) metrics.Reset();
+        std::string start_error;
+        if (!start_workload(&start_error)) {
+            LOG(ERROR) << start_error;
             exit_code = 1;
             running.store(false, std::memory_order_release);
         } else {
@@ -740,18 +581,30 @@ int main(int argc, char **argv) {
         }
     }
 
-    LOG(INFO) << "mooncake_kvtest started role=" << config.role
+    LOG(INFO) << "mooncake_kvtest started mode=" << config.mode
+              << " role=" << config.role
               << " instance=" << config.instance_id
+              << " operation=" << config.operation
               << " write_threads=" << config.num_threads
               << " read_threads=" << config.NumReadThreads()
+              << " traffic_mode=" << config.traffic_mode
+              << " target_qps=" << config.target_qps
+              << " batch_keys=" << config.batch_keys_count
+              << " notify_async=" << config.notify_async
+              << " warmup=" << config.warmup_duration
+              << " duration=" << config.duration
               << " listen_port=" << config.listen_port
-              << " notify_rpc_port=" << config.notify_rpc_port
               << " start_paused=" << config.start_paused;
 
     std::vector<MetricSnapshot> previous;
     auto last_report = std::chrono::steady_clock::now();
     while (running.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (workload_failed.load(std::memory_order_acquire)) {
+            exit_code = 1;
+            running.store(false, std::memory_order_release);
+            continue;
+        }
         const auto now = std::chrono::steady_clock::now();
         const double seconds =
             std::chrono::duration<double>(now - last_report).count();
@@ -771,28 +624,59 @@ int main(int argc, char **argv) {
                   << "/s";
         }
         previous = current;
-        LOG(INFO) << '[' << rates.str() << "] [notify_in_q="
-                  << dispatcher.QueueSize() << ", notify_in_dropped="
-                  << dispatcher.DroppedCount() << ", notify_out_q="
-                  << (writer ? writer->NotifyQueueSize() : 0)
-                  << ", notify_out_dropped="
-                  << (writer ? writer->NotifyDroppedCount() : 0) << ']';
+        const std::string phase =
+            writer ? writer->GetStats().phase : std::string("-");
+        LOG(INFO) << '[' << rates.str() << "] [phase=" << phase
+                  << ", reader_q="
+                  << (dispatcher ? dispatcher->QueueSize() : 0)
+                  << ", reader_q_dropped="
+                  << (dispatcher ? dispatcher->Dropped() : 0)
+                  << ", notify_q="
+                  << (notify_sender ? notify_sender->GetStats().queue_peak : 0)
+                  << ']';
     }
 
     LOG(INFO) << "mooncake_kvtest shutdown: draining workload";
     metrics.Freeze();
-    if (writer) writer->RequestStop();
-    // Join outbound RPC tasks before destroying the client pools or stopping
-    // this process's RPC server. This also preserves self-notify in dual mode.
-    if (writer) writer->Stop();
-    notify_rpc_server.Stop();
-    dispatcher.StopNow();
-    dispatcher.Stop();
-    // Persist the final artifacts before stopping the HTTP listener.  Even if
-    // listener teardown regresses, the harness can still recover a complete
-    // summary instead of reporting a misleading pre-summary crash.
+    {
+        std::lock_guard<std::mutex> lock(workload_mutex);
+        if (writer) writer->RequestStop();
+        if (basic_runner) basic_runner->RequestStop();
+    }
+    LOG(INFO) << "mooncake_kvtest shutdown: joining workload thread";
+    if (workload_thread.joinable()) workload_thread.join();
+    if (workload_failed.load(std::memory_order_acquire)) exit_code = 1;
+    LOG(INFO) << "mooncake_kvtest shutdown: stopping notify sender";
+    if (notify_sender) notify_sender->Stop();
+    LOG(INFO) << "mooncake_kvtest shutdown: draining reader dispatcher";
+    if (dispatcher) {
+        dispatcher->Drain(std::chrono::seconds(5));
+        dispatcher->StopNow();
+        dispatcher->Stop();
+    }
+    LOG(INFO) << "mooncake_kvtest shutdown: stopping basic runner";
+    if (basic_runner) basic_runner->Stop();
+
+    PipelineWriter::Stats writer_stats;
+    PipelineReader::Stats reader_stats;
+    NotifySender::Stats sender_stats;
+    if (writer) writer_stats = writer->GetStats();
+    if (reader) reader_stats = reader->GetStats();
+    if (notify_sender) sender_stats = notify_sender->GetStats();
+    if (config.IsBasic()) {
+        metrics.SetSummaryExtra(
+            BasicSummaryExtra(config, basic_runner->GetStats()));
+    } else {
+        metrics.SetSummaryExtra(PipelineSummaryExtra(
+            config, writer ? &writer_stats : nullptr,
+            reader ? &reader_stats : nullptr,
+            notify_sender ? &sender_stats : nullptr, http_client.get(),
+            dispatcher ? dispatcher->QueueSize() : 0,
+            dispatcher ? dispatcher->Dropped() : 0));
+    }
     metrics.Stop();
     LOG(INFO) << "mooncake_kvtest shutdown: metrics persisted";
+    if (rpc_server) rpc_server->Stop();
     server.Stop();
     LOG(INFO) << "mooncake_kvtest shutdown: HTTP server stopped";
     client->tearDownAll();

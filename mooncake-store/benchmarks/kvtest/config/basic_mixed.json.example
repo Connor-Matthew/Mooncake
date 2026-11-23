@@ -1,0 +1,33 @@
+{
+  "mode": "basic",
+  "instance_id": 0,
+  "listen_port": 9101,
+  "role": "client",
+  "operation": "put_batch/get_batch",
+  "put_ratio": 0.5,
+  "key_prefix": "mc_bench",
+  "key_scenario": "basic",
+  "key_count": 1000,
+  "key_start": 0,
+  "key_end": 1000,
+  "data_sizes": ["1MB"],
+  "num_threads": 4,
+  "batch_size": 4,
+  "target_qps": 0,
+  "duration": 30,
+  "warmup_duration": 5,
+  "start_paused": true,
+  "verify_level": "size",
+  "output_dir": "kvtest-basic-mixed-output",
+  "store": {
+    "local_hostname": "10.0.0.1:12345",
+    "metadata_server": "http://10.0.0.10:8080/metadata",
+    "global_segment_size": 0,
+    "local_buffer_size": "8GB",
+    "protocol": "ub",
+    "rdma_devices": "bonding_dev_0",
+    "master_server_address": "10.0.0.10:50051",
+    "tenant_id": "default",
+    "replica_num": 1
+  }
+}

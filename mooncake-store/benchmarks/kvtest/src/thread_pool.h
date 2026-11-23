@@ -1,11 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <chrono>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -52,11 +52,18 @@ class ThreadPool {
         return dropped_.load(std::memory_order_relaxed);
     }
 
-    bool WaitIdle(std::chrono::milliseconds timeout) {
+    // Wait until the queue is empty and every running task finished. Used to
+    // drain reader queues on /stop without dropping accepted notifications.
+    bool WaitIdleFor(std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(mutex_);
         return idle_cv_.wait_for(lock, timeout, [this] {
-            return tasks_.empty() && active_tasks_ == 0;
+            return tasks_.empty() && active_ == 0;
         });
+    }
+
+    // Upstream-compatible name used by the YLT RPC writer path.
+    bool WaitIdle(std::chrono::milliseconds timeout) {
+        return WaitIdleFor(timeout);
     }
 
     void StopNow() {
@@ -91,7 +98,7 @@ class ThreadPool {
                 if (stopped_) return;
                 task = std::move(tasks_.front());
                 tasks_.pop();
-                ++active_tasks_;
+                ++active_;
             }
             try {
                 task();
@@ -100,9 +107,9 @@ class ThreadPool {
             }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                --active_tasks_;
-                if (tasks_.empty() && active_tasks_ == 0) idle_cv_.notify_all();
+                --active_;
             }
+            idle_cv_.notify_all();
         }
     }
 
@@ -112,9 +119,9 @@ class ThreadPool {
     std::queue<std::function<void()>> tasks_;
     std::vector<std::thread> workers_;
     size_t max_queue_;
+    size_t active_{0};
     std::atomic<uint64_t> dropped_{0};
     std::atomic<uint64_t> task_failures_{0};
-    size_t active_tasks_{0};
     bool stopped_{false};
 };
 
