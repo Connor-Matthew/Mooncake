@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -166,6 +167,9 @@ VSegmentPutStartResult VSegmentManager::StartPut(
     const std::string& requested_profile, uint64_t expected_route_epoch,
     const std::vector<std::string>& excluded_vsegments,
     VSegmentCommitBatch* batch) {
+    // 负载均衡模式：调用方未指定 profile 时不再固定写 default_profile_，
+    // 而是跨本 Partition 全部 profile 的 ACTIVE vsegment 做均衡。
+    const bool load_balanced = requested_profile.empty();
     const auto& profile_name =
         requested_profile.empty() ? default_profile_ : requested_profile;
     if (operation_id.empty() || length == 0 || !profiles_.count(profile_name))
@@ -209,63 +213,99 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                 fence = latest_persist_;
                 allocated = true;
             }
-            for (auto& [id, managed] : vsegments_) {
-                if (allocated) break;
-                if (std::find(excluded_vsegments.begin(),
-                              excluded_vsegments.end(), id) !=
-                    excluded_vsegments.end())
-                    continue;
-                if (managed.lifecycle != Lifecycle::ACTIVE ||
-                    managed.profile_name != profile_name)
-                    continue;
-                // No full allocator Snapshot here: Reserve() touches only
-                // free_ranges_/reservations_, so CancelReservation() below is
-                // the exact inverse. A Snapshot per put costs O(completed
-                // operations) and grows with the number of objects.
-                auto reservation =
-                    managed.logical_allocator->Reserve(operation_id, length);
-                if (!reservation) {
-                    if (reservation.error == ErrorCode::NO_AVAILABLE_HANDLE)
+            if (!allocated) {
+                // 候选按「剩余空间从大到小、id 升序」排序后依次尝试：
+                // - 均衡模式覆盖全部 profile：剩余空间大的 profile 自然分到
+                //   更多写入（按剩余容量加权），profile 内也随 vsegment
+                //   剩余空间摊开，避免单卷热点；
+                // - 指定 profile 时仅限该 profile，行为与旧 first-fit 兼容
+                //   （同样改为剩余空间优先）；
+                // - 某候选碎片不足 Reserve 失败时顺延下一个，形成跨
+                //   profile 的无空间回退。
+                struct Candidate {
+                    uint64_t free_bytes;
+                    std::string vsegment_id;
+                };
+                std::vector<Candidate> candidates;
+                candidates.reserve(vsegments_.size());
+                for (const auto& [id, managed] : vsegments_) {
+                    if (managed.lifecycle != Lifecycle::ACTIVE) continue;
+                    if (!load_balanced && managed.profile_name != profile_name)
                         continue;
-                    return {reservation.error, operation_id, {},
-                            std::move(reservation.detail)};
+                    if (std::find(excluded_vsegments.begin(),
+                                  excluded_vsegments.end(), id) !=
+                        excluded_vsegments.end())
+                        continue;
+                    candidates.push_back(
+                        {managed.logical_allocator->FreeBytes(), id});
                 }
-                std::string detail;
-                operation_vsegments_.emplace(operation_id, id);
-                ErrorCode persisted = ErrorCode::OK;
-                if (VSegmentOplogAlignedMode()) {
-                    // aligned：只写一条 O(1) 的 reservation 记录，
-                    // 不做全量状态序列化、不产生 durable 等待。
-                    persisted = committer_->CommitReservation(
-                        partition_id_, operation_id, id, reservation.range,
-                        route_epoch_);
+                std::sort(candidates.begin(), candidates.end(),
+                          [](const Candidate& left, const Candidate& right) {
+                              if (left.free_bytes != right.free_bytes)
+                                  return left.free_bytes > right.free_bytes;
+                              return left.vsegment_id < right.vsegment_id;
+                          });
+                for (const auto& candidate : candidates) {
+                    auto managed = vsegments_.find(candidate.vsegment_id);
+                    if (managed == vsegments_.end()) continue;
+                    // No full allocator Snapshot here: Reserve() touches only
+                    // free_ranges_/reservations_, so CancelReservation() below
+                    // is the exact inverse. A Snapshot per put costs
+                    // O(completed operations) and grows with the number of
+                    // objects.
+                    auto reservation =
+                        managed->second.logical_allocator->Reserve(operation_id,
+                                                                   length);
+                    if (!reservation) {
+                        if (reservation.error == ErrorCode::NO_AVAILABLE_HANDLE)
+                            continue;
+                        return {reservation.error, operation_id, {},
+                                std::move(reservation.detail)};
+                    }
+                    std::string detail;
+                    operation_vsegments_.emplace(operation_id,
+                                                  candidate.vsegment_id);
+                    ErrorCode persisted = ErrorCode::OK;
+                    if (VSegmentOplogAlignedMode()) {
+                        // aligned：只写一条 O(1) 的 reservation 记录，
+                        // 不做全量状态序列化、不产生 durable 等待。
+                        persisted = committer_->CommitReservation(
+                            partition_id_, operation_id,
+                            candidate.vsegment_id, reservation.range,
+                            route_epoch_);
+                        if (persisted != ErrorCode::OK) {
+                            detail = "failed to persist vsegment reservation";
+                        }
+                    } else {
+                        persisted = PersistDeferredLocked("logical_reserve",
+                                                          &detail, &fence);
+                    }
                     if (persisted != ErrorCode::OK) {
-                        detail = "failed to persist vsegment reservation";
+                        operation_vsegments_.erase(operation_id);
+                        // Undo exactly the reservation we just made;
+                        // restoring a full snapshot is unnecessary and
+                        // O(objects).
+                        if (managed->second.logical_allocator
+                                ->CancelReservation(operation_id) !=
+                            ErrorCode::OK) {
+                            LOG(WARNING)
+                                << "vsegment reservation rollback failed, "
+                                   "operation="
+                                << operation_id;
+                        }
+                        return {persisted, operation_id, {},
+                                std::move(detail)};
                     }
-                } else {
-                    persisted = PersistDeferredLocked("logical_reserve",
-                                                      &detail, &fence);
+                    allocated_result = {ErrorCode::OK,
+                                       operation_id,
+                                       {partition_id_, candidate.vsegment_id,
+                                        reservation.range.offset,
+                                        reservation.range.length,
+                                        operation_id},
+                                       {}};
+                    allocated = true;
+                    break;
                 }
-                if (persisted != ErrorCode::OK) {
-                    operation_vsegments_.erase(operation_id);
-                    // Undo exactly the reservation we just made; restoring a
-                    // full snapshot is unnecessary and O(objects).
-                    if (managed.logical_allocator->CancelReservation(
-                            operation_id) != ErrorCode::OK) {
-                        LOG(WARNING) << "vsegment reservation rollback failed, "
-                                        "operation="
-                                     << operation_id;
-                    }
-                    return {persisted, operation_id, {}, std::move(detail)};
-                }
-                allocated_result = {ErrorCode::OK,
-                                    operation_id,
-                                    {partition_id_, id,
-                                     reservation.range.offset,
-                                     reservation.range.length, operation_id},
-                                    {}};
-                allocated = true;
-                break;
             }
         }
         if (allocated) {
@@ -279,7 +319,10 @@ VSegmentPutStartResult VSegmentManager::StartPut(
             if (error != ErrorCode::OK) allocated_result.error = error;
             return allocated_result;
         }
-        auto creation = RequestCreate(profile_name);
+        // 现有 vsegment 都无法承载时触发新建：均衡模式下新建卷也跟随容量
+        // 分布，选剩余物理配额最多的 profile；指定 profile 时保持原行为。
+        auto creation = RequestCreate(load_balanced ? SelectCreationProfile()
+                                                    : profile_name);
         if (!creation) {
             return {creation.error, operation_id, {},
                     std::move(creation.detail)};
@@ -287,6 +330,32 @@ VSegmentPutStartResult VSegmentManager::StartPut(
     }
     return {ErrorCode::NO_AVAILABLE_HANDLE, operation_id, {},
             "new vsegment has no allocatable logical range"};
+}
+
+std::string VSegmentManager::SelectCreationProfile() const {
+    // 按 profile 汇总本 Partition 的剩余物理配额（free_ranges_ 在已分配
+    // vsegment 之后的剩余部分），选剩余最多的 profile，让新建卷的容量也
+    // 跟随各 profile 的空间分布；并列时优先 default_profile_，否则按名称
+    // 序保证确定性。无任何剩余配额时返回 default_profile_，沿用原有的
+    // 配额不足错误语义（Allocate 失败后原样返回错误）。
+    std::map<std::string, uint64_t> free_by_profile;
+    for (const auto& config : quota_configs_) {
+        auto& total = free_by_profile[config.profile_name];
+        for (const auto& quota : config.quotas)
+            total += physical_allocator_.FreeBytes(config.profile_name,
+                                                   quota.segment_id);
+    }
+    std::string best = default_profile_;
+    uint64_t best_free = 0;
+    for (const auto& [name, free_bytes] : free_by_profile) {
+        if (free_bytes == 0) continue;
+        if (free_bytes > best_free ||
+            (free_bytes == best_free && name == default_profile_)) {
+            best = name;
+            best_free = free_bytes;
+        }
+    }
+    return best;
 }
 
 VSegmentAllocationResult VSegmentManager::CreateSingleFlight(

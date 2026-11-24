@@ -2901,6 +2901,160 @@ TEST(VSegmentServiceTest, OrdinaryPutSelectsConfiguredProfile) {
               1);
 }
 
+// ---- 写入负载均衡：未指定 profile 时跨 profile 分摊 ----
+
+namespace {
+
+// default(1 卷) + alternate(2 卷) 的双 profile 拓扑；每个 profile 的初始卷
+// logical capacity 均为 512B（member_extent_size=256 × member_count=2）。
+PartitionPhysicalQuotaSnapshot BalancedTwoProfileQuota(
+    uint32_t alternate_initial_count = 2) {
+    auto alternate = Profile();
+    alternate.name = "alternate";
+    alternate.initial_vsegment_count = alternate_initial_count;
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile(), alternate};
+    quota.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}},
+        {"partition-1", "alternate", "DRAM",
+         {{"segment-a", 512, 512}, {"segment-b", 512, 512}}}};
+    return quota;
+}
+
+}  // namespace
+
+TEST(VSegmentServiceTest, PutWithoutProfileBalancesAcrossProfiles) {
+    VSegmentService service(BalancedTwoProfileQuota());
+    ASSERT_EQ(service.AddPartition("partition-1", 1, Committer()),
+              ErrorCode::OK);
+
+    std::map<std::string, size_t> puts_per_vsegment;
+    for (int i = 0; i < 6; ++i) {
+        auto started = service.StartPutReplicasOwned(
+            "partition-1", {"op-" + std::to_string(i)}, 64);
+        ASSERT_TRUE(started.has_value()) << toString(started.error());
+        ASSERT_EQ(started->size(), 1u);
+        ++puts_per_vsegment[(*started)[0].replica.vsegment_id];
+    }
+    // default(1 卷) + alternate(2 卷) 共 3 个等剩余空间候选，按剩余空间
+    // 从大到小轮转：每卷恰好承载 2 笔，而非 first-fit 填满一卷再换下一卷。
+    ASSERT_EQ(puts_per_vsegment.size(), 3u);
+    for (const auto& [id, count] : puts_per_vsegment)
+        EXPECT_EQ(count, 2u);
+
+    const auto states = service.SnapshotAllPartitions();
+    ASSERT_EQ(states.size(), 1u);
+    std::map<std::string, std::string> profile_of;
+    for (const auto& state : states.front().vsegments)
+        profile_of.emplace(state.view.vsegment_id, state.profile_name);
+    std::set<std::string> written_profiles;
+    for (const auto& [id, count] : puts_per_vsegment) {
+        const auto profile = profile_of.find(id);
+        ASSERT_NE(profile, profile_of.end());
+        written_profiles.insert(profile->second);
+    }
+    // 未指定 profile 的写入同时覆盖两个 profile（跨 profile 负载均衡生效）。
+    EXPECT_EQ(written_profiles.size(), 2u);
+}
+
+TEST(VSegmentServiceTest, PutWithExplicitProfileStaysWithinProfile) {
+    VSegmentService service(BalancedTwoProfileQuota());
+    ASSERT_EQ(service.AddPartition("partition-1", 1, Committer()),
+              ErrorCode::OK);
+
+    std::set<std::string> written;
+    for (int i = 0; i < 3; ++i) {
+        auto started = service.StartPutReplicasOwned(
+            "partition-1", {"op-" + std::to_string(i)}, 64, "alternate");
+        ASSERT_TRUE(started.has_value()) << toString(started.error());
+        ASSERT_EQ(started->size(), 1u);
+        written.insert((*started)[0].replica.vsegment_id);
+    }
+    const auto states = service.SnapshotAllPartitions();
+    ASSERT_EQ(states.size(), 1u);
+    std::map<std::string, std::string> profile_of;
+    uint64_t default_free = 0;
+    for (const auto& state : states.front().vsegments) {
+        profile_of.emplace(state.view.vsegment_id, state.profile_name);
+        if (state.profile_name == "default") {
+            for (const auto& range : state.logical_allocation.free_ranges)
+                default_free += range.length;
+        }
+    }
+    for (const auto& id : written) {
+        const auto profile = profile_of.find(id);
+        ASSERT_NE(profile, profile_of.end());
+        EXPECT_EQ(profile->second, "alternate");
+    }
+    // 显式指定 alternate：profile 内的 2 个初始卷也按剩余空间摊开。
+    EXPECT_EQ(written.size(), 2u);
+    // default profile 完全未被触碰。
+    EXPECT_EQ(default_free, 512u);
+}
+
+TEST(VSegmentServiceTest, PutWithoutProfileFallsBackWhenDefaultFull) {
+    auto alternate = Profile();
+    alternate.name = "alternate";
+    alternate.member_extent_size = 128;  // alternate 卷 logical capacity 256B
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile(), alternate};
+    // default 物理配额每段 256B：恰好只够 1 个初始卷，之后物理配额耗尽。
+    // alternate 每段 256B：初始卷用 128B，仍留有物理余量。
+    quota.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 256}, {"segment-b", 0, 256}}},
+        {"partition-1", "alternate", "DRAM",
+         {{"segment-a", 256, 256}, {"segment-b", 256, 256}}}};
+    VSegmentService service(quota);
+    ASSERT_EQ(service.AddPartition("partition-1", 1, Committer()),
+              ErrorCode::OK);
+
+    // 512B 的写入只有 default 初始卷（剩余 512B > alternate 256B）能承载。
+    auto first = service.StartPutReplicasOwned("partition-1", {"op-fill"}, 512);
+    ASSERT_TRUE(first.has_value()) << toString(first.error());
+
+    // default 卷满且其物理配额耗尽：未指定 profile 的写入应回退 alternate。
+    auto fallback =
+        service.StartPutReplicasOwned("partition-1", {"op-fallback"}, 64);
+    ASSERT_TRUE(fallback.has_value()) << toString(fallback.error());
+
+    // 显式指定 default 时不跨 profile 回退：卷满 + 物理配额耗尽 → 失败。
+    // 首次会触发异步新建并返回 VSEGMENT_CREATING，重试后得到真实错误。
+    tl::expected<std::vector<VSegmentPutStartResult>, ErrorCode>
+        explicit_default;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        explicit_default = service.StartPutReplicasOwned(
+            "partition-1", {"op-explicit-" + std::to_string(attempt)}, 64,
+            "default");
+        if (!explicit_default.has_value() &&
+            explicit_default.error() != ErrorCode::VSEGMENT_CREATING)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_FALSE(explicit_default.has_value());
+    EXPECT_EQ(explicit_default.error(),
+              ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
+
+    const auto states = service.SnapshotAllPartitions();
+    ASSERT_EQ(states.size(), 1u);
+    // 回退使用的是 alternate 的现有卷，没有新建 vsegment。
+    ASSERT_EQ(states.front().vsegments.size(), 2u);
+    std::map<std::string, std::string> profile_of;
+    for (const auto& state : states.front().vsegments)
+        profile_of.emplace(state.view.vsegment_id, state.profile_name);
+    const auto profile =
+        profile_of.find((*fallback)[0].replica.vsegment_id);
+    ASSERT_NE(profile, profile_of.end());
+    EXPECT_EQ(profile->second, "alternate");
+}
+
 // ---- 自动发现：BuildDiscoveredQuotaPlan ----
 
 TEST(BuildDiscoveredQuotaPlanTest, AcceptsNonExclusiveSegmentsByDefault) {
