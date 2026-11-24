@@ -26,7 +26,7 @@ namespace mooncake {
 
 void Transport::logClassicUbTaskTrace(const TransferTask &task) {
     const auto &trace = *task.ub_trace;
-    std::vector<uint64_t> device, post;
+    std::vector<uint64_t> device, post, cqe_handle;
     uint64_t last_complete = 0, first_post = 0;
     uint64_t retries = 0;
     size_t succeeded = 0, terminal = 0;
@@ -36,6 +36,7 @@ void Transport::logClassicUbTaskTrace(const TransferTask &task) {
         const auto done = slice->terminal_ns.load(std::memory_order_acquire);
         const auto returned =
             slice->post_returned_ns.load(std::memory_order_acquire);
+        const auto seen = slice->cqe_seen_ns.load(std::memory_order_acquire);
         const auto started = slice->post_ns.load(std::memory_order_relaxed);
         const auto attempts = slice->attempts.load(std::memory_order_relaxed);
         retries += attempts > 0 ? attempts - 1 : 0;
@@ -49,10 +50,13 @@ void Transport::logClassicUbTaskTrace(const TransferTask &task) {
         ++succeeded;
         // A concurrent completion can precede post return. Do not clamp that
         // race to zero or mistake an unposted/failed slice for a DMA sample.
-        if (returned != 0 && done >= returned && returned >= started &&
-            started != 0) {
-            device.push_back(done - returned);
+        // A missing cqe_seen stamp (slice never went through the poller)
+        // likewise drops the sample instead of corrupting the split.
+        if (started != 0 && returned != 0 && seen != 0 && seen >= returned &&
+            returned >= started) {
+            device.push_back(seen - returned);
             post.push_back(returned - started);
+            if (done >= seen) cqe_handle.push_back(done - seen);
         }
     }
     auto end = trace.terminal_ns.load(std::memory_order_acquire);
@@ -102,7 +106,8 @@ void Transport::logClassicUbTaskTrace(const TransferTask &task) {
         << " device_samples=" << device.size()
         << " device_samples_missing=" << trace.slices.size() - device.size()
         << " retries=" << retries << summarize("post_us", std::move(post))
-        << summarize("device_us", std::move(device));
+        << summarize("device_us", std::move(device))
+        << summarize("cqe_handle_us", std::move(cqe_handle));
 }
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 void Transport::releaseCongestionPermit(Slice *slice) {

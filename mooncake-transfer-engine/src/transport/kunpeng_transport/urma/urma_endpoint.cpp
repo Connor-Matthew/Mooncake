@@ -883,10 +883,20 @@ int UrmaContext::poll(int num_entries, Transport::Slice** failed_slices,
                    << device_name_;
         return ERR_CONTEXT;
     }
+    // Stamped lazily on the first traced slice so an untraced poll reads no
+    // extra clock, and once per batch so every traced CQE shares one
+    // cqe_seen checkpoint.
+    uint64_t cqe_seen_ns = 0;
     for (int i = 0; i < nr_poll; ++i) {
         auto slice = (Transport::Slice*)cr[i].user_ctx;
         if (!slice) {
             continue;
+        }
+
+        if (slice->ub_trace) {
+            if (cqe_seen_ns == 0) cqe_seen_ns = Transport::ubTraceNowNs();
+            slice->ub_trace->cqe_seen_ns.store(cqe_seen_ns,
+                                               std::memory_order_relaxed);
         }
 
         // All deref of `slice` (including the jetty_depth aggregation below)
@@ -1494,6 +1504,7 @@ int UrmaEndpoint::submitPostSend(
         for (const auto& trace : post_traces) {
             trace->post_ns.store(now, std::memory_order_relaxed);
             trace->post_returned_ns.store(0, std::memory_order_relaxed);
+            trace->cqe_seen_ns.store(0, std::memory_order_relaxed);
             trace->attempts.fetch_add(1, std::memory_order_relaxed);
         }
     };

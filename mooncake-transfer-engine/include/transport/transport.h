@@ -119,6 +119,11 @@ class Transport {
     struct UbSliceTrace {
         std::atomic<uint64_t> post_ns{0};
         std::atomic<uint64_t> post_returned_ns{0};
+        // When the poller observed this CQE (stamped right after
+        // urma_poll_jfc() returned). Splits the old device_us into pure
+        // device time (post return -> CQE seen) and completion handling
+        // (CQE seen -> terminal).
+        std::atomic<uint64_t> cqe_seen_ns{0};
         std::atomic<uint64_t> terminal_ns{0};
         std::atomic<uint32_t> attempts{0};
         std::atomic<bool> success{false};

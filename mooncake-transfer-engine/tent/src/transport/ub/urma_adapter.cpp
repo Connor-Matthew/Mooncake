@@ -513,6 +513,12 @@ class RealJfc final : public Jfc {
     }
     std::mutex& pollMutex() noexcept { return poll_mutex_; }
 
+    // Scratch buffer reused across poll() calls, guarded by pollMutex(). It
+    // avoids per-poll heap allocation plus a zero-fill of the whole CR array:
+    // urma_poll_jfc() overwrites the first `count` entries, so only growth
+    // (which happens once, on the first poll) pays the value-initialization.
+    std::vector<urma_cr_t>& pollScratch() noexcept { return poll_scratch_; }
+
     // Callers hold pollMutex(). Markers must survive a failed quiesce call:
     // another normal poller may consume FLUSH_ERR_DONE before shutdown retries
     // the same Jetty.
@@ -614,6 +620,7 @@ class RealJfc final : public Jfc {
     urma_jfr_t* receiver_jfr_ = nullptr;
     std::mutex poll_mutex_;
     std::unordered_set<uint32_t> flush_done_jetty_ids_;
+    std::vector<urma_cr_t> poll_scratch_;
 
     struct InflightSegments {
         LocalSegmentPtr local;
@@ -1838,8 +1845,13 @@ class RealUrmaAdapter final : public UrmaAdapter {
             return Status::InvalidArgument("invalid maximum completion count");
         }
 
-        std::vector<urma_cr_t> native_completions(max_completions);
+        // Take the scratch under the same lock that serializes the poll:
+        // only the first poll (or a larger max_completions) allocates.
         std::lock_guard<std::mutex> lock(real_jfc->pollMutex());
+        auto& native_completions = real_jfc->pollScratch();
+        if (native_completions.size() < max_completions) {
+            native_completions.resize(max_completions);
+        }
         const int count = urma_poll_jfc(real_jfc->nativeSendJfc(),
                                         static_cast<int>(max_completions),
                                         native_completions.data());
