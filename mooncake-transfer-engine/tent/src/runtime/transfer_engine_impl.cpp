@@ -21,7 +21,6 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
-#include <map>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -1855,6 +1854,9 @@ struct TransferEngineImpl::PreparedSubmit {
     std::chrono::steady_clock::time_point submit_time{};
     LogicalTransferRuntimePolicy runtime_policy;
     bool require_post_submit_cancellation{false};
+    // True when at least one merged request carries derived public tasks.
+    // commitPreparedSubmit uses this to skip the merge bookkeeping maps.
+    bool has_derived_tasks{false};
     std::vector<Task> tasks;
     std::vector<Owner> owners;
 };
@@ -1865,6 +1867,17 @@ bool tryAddUint64(uint64_t lhs, uint64_t rhs, uint64_t& out) {
     if (rhs > std::numeric_limits<uint64_t>::max() - lhs) return false;
     out = lhs + rhs;
     return true;
+}
+
+// Clock-read gate for the submit-stage trace in submitTransfer: with
+// MC_HIFREQ_LOG_SAMPLE_RATE=0 (or INFO logging off) the submit path takes
+// no extra clock reads and emits nothing; the per-trace-id MC_LOG_SAMPLED
+// gate re-checks before formatting.
+bool submitTraceClocksEnabled() {
+    static const bool enabled =
+        mooncake::logging::HiFreqLogSampleRate() > 0.0 &&
+        mooncake::logging::ShouldLog(google::INFO);
+    return enabled;
 }
 
 MergeResult makePassThroughMergeResult(const std::vector<Request>& requests) {
@@ -2308,13 +2321,18 @@ Status TransferEngineImpl::prepareSubmit(
     }
     const size_t start_task_id = batch->task_list.size();
     prepared.submit_time = std::chrono::steady_clock::now();
+    // Merging needs at least two requests. A single request skips the
+    // boundary resolution (two findBuffer scans plus a segment lookup per
+    // request) and the sort/copy pass entirely; mergeRequests degrades to
+    // a pass-through and the TCP re-merge block below cannot trigger
+    // (it requires merged.request_list to have shrunk).
+    const bool can_merge = merge_requests_ && request_list.size() > 1;
     auto merge_boundaries =
-        merge_requests_
+        can_merge
             ? resolveRequestBoundaries(metadata_.get(), request_list,
                                        hp_tcp_transport_config_)
             : std::vector<RequestBoundaryInfo>{};
-    auto merged =
-        mergeRequests(request_list, merge_boundaries, merge_requests_);
+    auto merged = mergeRequests(request_list, merge_boundaries, can_merge);
 
     // Limit only oversized merges that would use standard TCP. In
     // particular, an UNSPEC request selected for RDMA/HP TCP keeps its own
@@ -2391,6 +2409,7 @@ Status TransferEngineImpl::prepareSubmit(
             owner.has_owner_task_id = true;
         } else {
             owner.derived_task_ids.push_back(task_id);
+            prepared.has_derived_tasks = true;
         }
         prepared.tasks.push_back({merged_task_index, task_id,
                                   request_list[public_task_index].length});
@@ -2421,21 +2440,28 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
     }
 
     std::vector<size_t> physical_task_id_list[kSupportedTransportTypes];
-    std::unordered_map<size_t, TaskInfo> merged_task_id_map;
 
     batch->task_list.insert(batch->task_list.end(), prepared.tasks.size(),
                             TaskInfo{});
 
+    // Merge bookkeeping is dead weight when no request was merged: every
+    // owner task then carries no derived aliases, so the per-owner TaskInfo
+    // copy map and the public-task index reduce to identity mappings. Only
+    // keep a plain owner list in that case.
+    const bool has_derived = prepared.has_derived_tasks;
+    std::unordered_map<size_t, TaskInfo> merged_task_id_map;
     std::unordered_map<size_t, size_t> owner_task_id_by_merged_task;
     std::unordered_map<size_t, std::vector<size_t>>
         public_tasks_by_physical_owner;
+    std::vector<size_t> owner_task_ids;
+    owner_task_ids.reserve(prepared.owners.size());
     for (const auto& task_plan : prepared.tasks) {
         size_t task_id = task_plan.task_id;
         size_t merged_task_id = task_plan.merged_task_index;
         auto& task = batch->task_list[task_id];
         const auto& owner = prepared.owners[merged_task_id];
         auto& merged_request = owner.request;
-        if (merged_task_id_map.count(merged_task_id)) {
+        if (has_derived && merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
             task.public_length = task_plan.public_length;
@@ -2464,11 +2490,14 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
         task.device_mask = owner.route.device_mask;
         if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
         task.physical_owner_task_id = task_id;
-        owner_task_id_by_merged_task[merged_task_id] = task_id;
+        owner_task_ids.push_back(task_id);
+        if (has_derived) {
+            owner_task_id_by_merged_task[merged_task_id] = task_id;
+        }
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
-            merged_task_id_map[merged_task_id] = task;
+            if (has_derived) merged_task_id_map[merged_task_id] = task;
             continue;
         }
 
@@ -2487,7 +2516,7 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
             } else {
                 task.post_time = std::chrono::steady_clock::now();
             }
-            merged_task_id_map[merged_task_id] = task;
+            if (has_derived) merged_task_id_map[merged_task_id] = task;
             continue;
         }
 
@@ -2505,7 +2534,7 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
                 task.status = FAILED;
                 task.failure_stage = 0;
                 task.suppress_failover = true;
-                merged_task_id_map[merged_task_id] = task;
+                if (has_derived) merged_task_id_map[merged_task_id] = task;
                 continue;
             }
             attachProgressNotifier(batch, batch->sub_batch[task.type]);
@@ -2514,17 +2543,17 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
         task.sub_task_id = -1;
         task.derived = false;
         physical_task_id_list[task.type].push_back(task_id);
-        public_tasks_by_physical_owner[task_id].push_back(task_id);
-        merged_task_id_map[merged_task_id] = task;
+        if (has_derived) {
+            public_tasks_by_physical_owner[task_id].push_back(task_id);
+            merged_task_id_map[merged_task_id] = task;
+        }
     }
 
     // Staging-internal submissions are physical implementation details of an
     // already-counted user request. Count only user-visible owner tasks as
     // logical requests, after their TaskInfo state is fully published and
     // before any transport attempt can complete.
-    for (const auto& [merged_task_id, owner_task_id] :
-         owner_task_id_by_merged_task) {
-        (void)merged_task_id;
+    for (const auto owner_task_id : owner_task_ids) {
         auto& task = batch->task_list[owner_task_id];
         if (owner_kind == QueueOwnerKind::User) {
             startLogicalRequestObservability(task);
@@ -2547,14 +2576,25 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
         // before returning, so groups can safely share one SubBatch.
         std::vector<std::vector<size_t>> submit_groups;
         if (type == RDMA || type == UB) {
-            std::map<std::pair<uint64_t, std::string>, size_t> group_by_policy;
+            // Policy groups are few (one per device mask / QP pool pair);
+            // a linear scan avoids a std::map node allocation plus a
+            // qp_pool string copy for every task.
+            std::vector<std::pair<uint64_t, std::string>> group_keys;
             for (const auto task_id : physical_task_id_list[type]) {
                 const auto& task = batch->task_list[task_id];
-                auto key = std::make_pair(task.device_mask, task.qp_pool);
-                auto [it, inserted] = group_by_policy.emplace(
-                    std::move(key), submit_groups.size());
-                if (inserted) submit_groups.emplace_back();
-                submit_groups[it->second].push_back(task_id);
+                size_t group_index = submit_groups.size();
+                for (size_t k = 0; k < group_keys.size(); ++k) {
+                    if (group_keys[k].first == task.device_mask &&
+                        group_keys[k].second == task.qp_pool) {
+                        group_index = k;
+                        break;
+                    }
+                }
+                if (group_index == submit_groups.size()) {
+                    group_keys.emplace_back(task.device_mask, task.qp_pool);
+                    submit_groups.emplace_back();
+                }
+                submit_groups[group_index].push_back(task_id);
             }
         } else {
             submit_groups.push_back(physical_task_id_list[type]);
@@ -2571,9 +2611,14 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
             // synchronous failure handling still sees a consistent mapping.
             int next_sub_task_id = static_cast<int>(sub_batch->size());
             for (const auto physical_task_id : group) {
-                for (const auto public_task_id :
-                     public_tasks_by_physical_owner.at(physical_task_id)) {
-                    batch->task_list[public_task_id].sub_task_id =
+                if (has_derived) {
+                    for (const auto public_task_id :
+                         public_tasks_by_physical_owner.at(physical_task_id)) {
+                        batch->task_list[public_task_id].sub_task_id =
+                            next_sub_task_id;
+                    }
+                } else {
+                    batch->task_list[physical_task_id].sub_task_id =
                         next_sub_task_id;
                 }
                 ++next_sub_task_id;
@@ -2604,9 +2649,16 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
                 // recovers and later fails at poll must still attribute its
                 // root cause to submit.
                 for (const auto physical_task_id : group) {
-                    for (const auto public_task_id :
-                         public_tasks_by_physical_owner.at(physical_task_id)) {
-                        auto& task = batch->task_list[public_task_id];
+                    if (has_derived) {
+                        for (const auto public_task_id :
+                             public_tasks_by_physical_owner.at(
+                                 physical_task_id)) {
+                            auto& task = batch->task_list[public_task_id];
+                            if (task.failure_stage < 0) task.failure_stage = 0;
+                            finishTransportAttempt(task, FAILED, attempt_end);
+                        }
+                    } else {
+                        auto& task = batch->task_list[physical_task_id];
                         if (task.failure_stage < 0) task.failure_stage = 0;
                         finishTransportAttempt(task, FAILED, attempt_end);
                     }
@@ -2622,17 +2674,23 @@ Status TransferEngineImpl::commitPreparedSubmit(Batch* batch,
                 // Public aliases mirror their owner's recovered (or
                 // terminally failed) route so per-task status queries observe
                 // the same transport and sub-batch slot as the owner.
-                for (const auto physical_task_id : group) {
-                    const auto& owner_task = batch->task_list[physical_task_id];
-                    for (const auto public_task_id :
-                         public_tasks_by_physical_owner.at(physical_task_id)) {
-                        if (public_task_id == physical_task_id) continue;
-                        auto& task = batch->task_list[public_task_id];
-                        task.type = owner_task.type;
-                        task.sub_task_id = owner_task.sub_task_id;
-                        task.status = owner_task.status;
-                        task.failover_count = owner_task.failover_count;
-                        task.xport_priority = owner_task.xport_priority;
+                // Without derived tasks every owner list is just {itself},
+                // so the loop below reduces to a no-op.
+                if (has_derived) {
+                    for (const auto physical_task_id : group) {
+                        const auto& owner_task =
+                            batch->task_list[physical_task_id];
+                        for (const auto public_task_id :
+                             public_tasks_by_physical_owner.at(
+                                 physical_task_id)) {
+                            if (public_task_id == physical_task_id) continue;
+                            auto& task = batch->task_list[public_task_id];
+                            task.type = owner_task.type;
+                            task.sub_task_id = owner_task.sub_task_id;
+                            task.status = owner_task.status;
+                            task.failover_count = owner_task.failover_count;
+                            task.xport_priority = owner_task.xport_priority;
+                        }
                     }
                 }
             }
@@ -3011,20 +3069,41 @@ Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
     const Notification* notifi, QueueOwnerKind owner_kind,
     bool require_post_submit_cancellation) {
+    // Submit-stage checkpoints, gated on the process-wide sampling rate so
+    // MC_HIFREQ_LOG_SAMPLE_RATE=0 leaves submitTransfer with no extra
+    // clock reads. Output goes through MC_LOG_SAMPLED, which re-checks the
+    // same gate per trace id before formatting anything.
+    const bool submit_trace = submitTraceClocksEnabled();
+    const auto submit_start =
+        submit_trace
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
     Batch* batch = nullptr;
     CHECK_STATUS(retainBatch(batch_id, batch));
     BatchRef batch_ref(*this, batch);
+    std::chrono::steady_clock::time_point lock_acquired{}, prepare_done{},
+        commit_done{};
+    bool queued_submit = false;
     {
         // Publish the task list, sub-batch IDs and submit hook together with
         // respect to polling, cancellation and other submits on this batch.
         // Queue mode uses the global progress lock; direct mode uses its shard.
         std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
+        lock_acquired =
+            submit_trace
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
         const size_t start_task_id = batch_ref.get()->task_list.size();
         PreparedSubmit prepared;
         CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
                                    require_post_submit_cancellation));
+        prepare_done =
+            submit_trace
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
 
         if (shouldQueueSubmit(prepared, owner_kind)) {
+            queued_submit = true;
             CHECK_STATUS(
                 enqueuePreparedSubmit(batch_ref.get(), prepared, owner_kind));
             auto dispatch_status = refillDispatchWindow();
@@ -3043,6 +3122,30 @@ Status TransferEngineImpl::submitTransfer(
             addSubmitHook(batch_ref.get(), start_task_id, request_list,
                           *notifi);
         }
+        commit_done =
+            submit_trace
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
+    }
+    if (submit_trace) {
+        // Past the progress lock: formatting the line must not extend the
+        // critical section shared with polling threads.
+        uint64_t total_bytes = 0;
+        for (const auto& request : request_list) total_bytes += request.length;
+        const auto elapsed_us = [](const auto& from, const auto& to) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(
+                       to - from)
+                .count();
+        };
+        MC_LOG_SAMPLED(INFO)
+            << "tent_submit_stage batch=" << batch_id
+            << " requests=" << request_list.size()
+            << " bytes=" << total_bytes << " queued=" << queued_submit
+            << " lock_wait_us="
+            << elapsed_us(submit_start, lock_acquired)
+            << " prepare_us=" << elapsed_us(lock_acquired, prepare_done)
+            << " commit_us=" << elapsed_us(prepare_done, commit_done)
+            << " total_us=" << elapsed_us(submit_start, commit_done);
     }
     // releaseBatch may sweep deferred frees under progress_mutex_. Drop the
     // shard first so this path preserves the global -> shard lock order.
