@@ -1082,6 +1082,43 @@ TEST(PartitionQuotaAllocatorTest, PreservesConfiguredMemberOrder) {
     EXPECT_EQ(allocation.view.members[1].segment_id, "segment-a");
 }
 
+TEST(PartitionQuotaAllocatorTest, RandomizesMemberSelectionAcrossSegments) {
+    // eligible(4) > member_count(2)：顺序选择只会固定用 quota 顺序的前
+    // 两个 segment，导致 vsegment 集中在少数节点；随机选择应把成员分散。
+    // 每段 4096 字节可容纳 16 个 256 字节 extent，12 卷分配远未耗尽容量。
+    auto config = Config();
+    config.quotas.push_back({"segment-c", 2048, 4096});
+    config.quotas.push_back({"segment-d", 3072, 4096});
+    config.quotas[0].length = 4096;
+    config.quotas[1].length = 4096;
+    PartitionQuotaAllocator allocator(config);
+    const std::vector<std::string> quota_order = {
+        "segment-a", "segment-b", "segment-c", "segment-d"};
+    auto rank = [&quota_order](const std::string& segment_id) {
+        return static_cast<size_t>(
+            std::find(quota_order.begin(), quota_order.end(), segment_id) -
+            quota_order.begin());
+    };
+    std::set<std::string> used;
+    for (int i = 0; i < 12; ++i) {
+        auto allocation =
+            allocator.Allocate("vs-" + std::to_string(i), Profile());
+        ASSERT_TRUE(allocation);
+        ASSERT_EQ(allocation.view.members.size(), 2);
+        // 同一 vsegment 内成员互不相同，且保持 quota 声明顺序（确定性
+        // checksum / 测试复现依赖稳定的成员顺序）。
+        EXPECT_NE(allocation.view.members[0].segment_id,
+                  allocation.view.members[1].segment_id);
+        EXPECT_LT(rank(allocation.view.members[0].segment_id),
+                  rank(allocation.view.members[1].segment_id));
+        for (const auto& member : allocation.view.members)
+            used.insert(member.segment_id);
+    }
+    // 12 卷全部落在固定的前两个 segment 上的概率是 (1/6)^12，统计上排除；
+    // 顺序选择时 used == {segment-a, segment-b}。
+    EXPECT_GE(used.size(), 3);
+}
+
 TEST(CreationCoordinatorTest, ConcurrentCallersShareOneCreation) {
     CreationCoordinator coordinator;
     std::atomic<int> calls{0};

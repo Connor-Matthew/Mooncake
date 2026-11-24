@@ -1311,6 +1311,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                                       policy.reserved_ratio =
                                           config
                                               .vsegment_auto_plan_reserved_ratio;
+                                      policy.initial_vsegment_count =
+                                          config
+                                              .vsegment_auto_plan_initial_count;
                                       wrapped_master_service
                                           ->SetVSegmentAutoPlanPolicy(policy);
                                   }

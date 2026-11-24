@@ -298,6 +298,11 @@ DEFINE_uint64(vsegment_member_extent_size, 0,
 DEFINE_double(vsegment_reserved_ratio, 0.0,
               "vsegment auto-plan: fraction reserved outside vsegment "
               "quotas, in [0, 1). Default 0 means no reservation.");
+DEFINE_uint32(vsegment_initial_count, 1,
+              "vsegment auto-plan: number of vsegments pre-created per "
+              "profile per partition at initialization (>=1). Only affects "
+              "the first quota publish; republishing requires deleting the "
+              "existing snapshot first.");
 
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(offload_on_evict, false,
@@ -1722,11 +1727,14 @@ BuildVSegmentAutoPlanPolicy(const mooncake::MasterConfig& config) {
     policy.stripe_size = FLAGS_vsegment_stripe_size;
     policy.member_extent_size = FLAGS_vsegment_member_extent_size;
     policy.reserved_ratio = FLAGS_vsegment_reserved_ratio;
+    policy.initial_vsegment_count =
+        FLAGS_vsegment_initial_count == 0 ? 1 : FLAGS_vsegment_initial_count;
     LOG(INFO) << "VSegment auto-plan policy: member_count="
               << policy.member_count << ", stripe_size=" << policy.stripe_size
               << ", member_extent_size=" << policy.member_extent_size
               << ", reserved_ratio=" << policy.reserved_ratio
-              << ", required_medium="
+              << ", initial_vsegment_count="
+              << policy.initial_vsegment_count << ", required_medium="
               << (policy.required_medium.empty() ? "auto"
                                                  : policy.required_medium)
               << ", io_alignment=" << policy.io_alignment;
@@ -2132,6 +2140,8 @@ int main(int argc, char* argv[]) {
                 auto_plan_policy->member_extent_size;
             supervisor_config.vsegment_auto_plan_reserved_ratio =
                 auto_plan_policy->reserved_ratio;
+            supervisor_config.vsegment_auto_plan_initial_count =
+                auto_plan_policy->initial_vsegment_count;
         }
 #endif
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);

@@ -351,6 +351,9 @@ class MasterServiceSupervisorConfig {
     uint64_t vsegment_auto_plan_stripe_size = 0;
     uint64_t vsegment_auto_plan_member_extent_size = 0;
     double vsegment_auto_plan_reserved_ratio = 0.0;
+    // 每个 partition 每个 profile 初始化时预建的 vsegment 数量（>=1）。
+    // master.cpp 从 --vsegment_initial_count flag 解析注入。
+    uint32_t vsegment_auto_plan_initial_count = 1;
 
     // Metrics reporting to HA backend (etcd/redis).
     bool enable_metrics_report_to_backend =
