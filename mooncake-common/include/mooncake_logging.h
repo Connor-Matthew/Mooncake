@@ -58,6 +58,11 @@ class AsyncLogMessage {
 
 void FlushAsyncLogs();
 
+// Implements lazy stream evaluation, including all operator<< arguments.
+struct LogMessageVoidify {
+    void operator&(std::ostream&) const {}
+};
+
 }  // namespace mooncake::logging
 
 #define MC_LOG(severity)                                \
@@ -66,7 +71,17 @@ void FlushAsyncLogs();
         mooncake::logging::ShouldLog(google::severity)) \
         .stream()
 
-#define MC_VLOG(level)                                                       \
-    mooncake::logging::AsyncLogMessage(__FILE__, __LINE__, google::INFO,     \
-                                       mooncake::logging::ShouldVLog(level)) \
-        .stream()
+#define MC_LOG_SAMPLED(severity)                      \
+    !(mooncake::logging::ShouldSampleHiFreqLog(       \
+          mooncake::logging::CurrentTraceId()) &&     \
+      mooncake::logging::ShouldLog(google::severity)) \
+        ? (void)0                                     \
+        : mooncake::logging::LogMessageVoidify() & MC_LOG(severity)
+
+#define MC_VLOG(level)                            \
+    !(mooncake::logging::ShouldVLog(level) &&     \
+      mooncake::logging::ShouldSampleHiFreqLog(   \
+          mooncake::logging::CurrentTraceId()) && \
+      mooncake::logging::ShouldLog(google::INFO)) \
+        ? (void)0                                 \
+        : mooncake::logging::LogMessageVoidify() & MC_LOG(INFO)

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/transport/ub/urma_adapter.h"
+#include "mooncake_logging.h"
 
 #if defined(TENT_UB_MOCK_ADAPTER) && TENT_UB_MOCK_ADAPTER
 #include "loopback_urma_adapter.h"
@@ -898,11 +899,11 @@ class RealJetty final : public Jetty {
         needs_native_unbind_ =
             context_->transportMode() == TransportMode::kRc;
         state_ = State::BOUND;
-        LOG(INFO) << "TENT UB rjetty ready local_jetty=" << id()
-                  << " remote_jetty=" << remote_info.id
-                  << " mode="
-                  << transportModeName(context_->transportMode())
-                  << " native_bind=" << needs_native_unbind_;
+        MC_LOG_SAMPLED(INFO)
+            << "TENT UB rjetty ready local_jetty=" << id()
+            << " remote_jetty=" << remote_info.id
+            << " mode=" << transportModeName(context_->transportMode())
+            << " native_bind=" << needs_native_unbind_;
         return Status::OK();
     }
 
@@ -1420,9 +1421,9 @@ class RealUrmaAdapter final : public UrmaAdapter {
                 "URMA segment context exceeds the wire size limit");
         }
 
-        LOG(INFO) << "UB_SEG_TOKEN_ID token_id_valid=1"
-                  << " va=0x" << std::hex << address << " len=0x" << length
-                  << std::dec;
+        MC_LOG_SAMPLED(INFO) << "UB_SEG_TOKEN_ID token_id_valid=1"
+                             << " va=0x" << std::hex << address << " len=0x"
+                             << length << std::dec;
 
         SegmentDescriptor descriptor;
         descriptor.urma_api_version = URMA_API_VERSION;

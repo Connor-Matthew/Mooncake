@@ -9143,8 +9143,9 @@ auto MasterService::GetReplicaList(const std::string& key,
     const uint16_t slot = cvm::KeySlot(object_id.tenant_id, object_id.user_key);
     const ErrorCode svc = CheckSlotServiceability(slot);
     if (svc == ErrorCode::SLOT_MIGRATING) {
-        LOG(INFO) << "GetReplicaList rejected with SLOT_MIGRATING: key=" << key
-                  << " slot=" << slot;
+        MC_LOG_SAMPLED(INFO)
+            << "GetReplicaList rejected with SLOT_MIGRATING: key=" << key
+            << " slot=" << slot;
         return tl::make_unexpected(ErrorCode::SLOT_MIGRATING);
     }
     if (svc == ErrorCode::SLOT_NOT_OWNED) {
@@ -9157,9 +9158,9 @@ auto MasterService::GetReplicaList(const std::string& key,
             if (result.has_value()) {
                 return result;
             }
-            VLOG(1) << "GetReplicaList forward failed: key=" << key
-                    << " owner=" << *owner
-                    << " error=" << toString(result.error());
+            MC_VLOG(1) << "GetReplicaList forward failed: key=" << key
+                       << " owner=" << *owner
+                       << " error=" << toString(result.error());
         }
 #endif
         LOG(WARNING) << "GetReplicaList: key=" << key << " slot=" << slot
@@ -9182,7 +9183,7 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
         MasterMetricManager::instance().inc_total_get_nums();
 
         if (!accessor.Exists()) {
-            VLOG(1) << "key=" << key << ", info=object_not_found";
+            MC_VLOG(1) << "key=" << key << ", info=object_not_found";
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         return ReadReplicaList(object_id.tenant_id, key, accessor.Get(),
@@ -9301,7 +9302,7 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     auto resp = [&]() -> tl::expected<GetReplicaListResponse, ErrorCode> {
         MetadataAccessorRO accessor(this, object_id);
         if (!accessor.Exists()) {
-            VLOG(1) << "key=" << key << ", info=object_not_found";
+            MC_VLOG(1) << "key=" << key << ", info=object_not_found";
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         return ReadReplicaListForAdmin(accessor.Get());
@@ -10920,14 +10921,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // Reject if a Copy/Move task is actively reading this key's
                 // replicas.
                 if (state.replication_task) {
-                    LOG(INFO) << "key=" << key
-                              << ", error=object_has_replication_task";
+                    MC_LOG_SAMPLED(INFO)
+                        << "key=" << key
+                        << ", error=object_has_replication_task";
                     return tl::make_unexpected(
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
                 }
 
                 if (state.promotion_task) {
-                    LOG(INFO)
+                    MC_LOG_SAMPLED(INFO)
                         << "key=" << key << ", error=object_has_promotion_task";
                     return tl::make_unexpected(
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
@@ -10956,8 +10958,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // NotifyOffloadSuccess to clear the marker instead.
                 if (!CancelQueuedOffloadTask(accessor.Get(),
                                              accessor.GetState(), object_id)) {
-                    LOG(INFO) << "key=" << key
-                              << ", error=object_has_offloading_task";
+                    MC_LOG_SAMPLED(INFO)
+                        << "key=" << key
+                        << ", error=object_has_offloading_task";
                     return tl::make_unexpected(
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
                 }
@@ -11010,7 +11013,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // Allocate fresh buffers, identical to PutStart. Objects are always
             // routed by hash(tenant, key); group_id does not affect routing.
             if (!accessor.IsPublished()) {
-                VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
+                MC_VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
                 auto result = AllocateAndInsertMetadata(
                     accessor, client_id, slice_length, allocation_config,
                     writer_host_id, allocation_group_id,
@@ -11031,7 +11034,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // would cause data corruption. The client should retry after
                 // readers finish.
                 if (metadata.HasReplica(&Replica::fn_is_busy)) {
-                    LOG(INFO) << "key=" << key << ", error=object_replica_busy";
+                    MC_LOG_SAMPLED(INFO)
+                        << "key=" << key << ", error=object_replica_busy";
                     return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
                 }
 
@@ -11122,8 +11126,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         replica_list.emplace_back(replica.get_descriptor());
                     }
 
-                    VLOG(1) << "key=" << key
-                            << ", action=upsert_start_case_b_inplace";
+                    MC_VLOG(1) << "key=" << key
+                               << ", action=upsert_start_case_b_inplace";
                     return replica_list;
                 }
 
@@ -11203,8 +11207,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // `metadata` is not used past this point.
                 accessor.Erase(EraseMode::kReplace, previous_kv_media);
 
-                VLOG(1) << "key=" << key
-                        << ", action=upsert_start_case_c_reallocate";
+                MC_VLOG(1) << "key=" << key
+                           << ", action=upsert_start_case_c_reallocate";
                 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
                     allocate_result =
                         replacement_replicas.has_value()

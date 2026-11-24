@@ -42,3 +42,9 @@ add_executable(ib_link_speed_test ib_link_speed_test.cpp)
 target_link_libraries(ib_link_speed_test PUBLIC mooncake_common gtest
                                                 gtest_main pthread)
 add_test(NAME ib_link_speed_test COMMAND ib_link_speed_test)
+
+add_executable(logging_sampling_zero_test logging_sampling_zero_test.cpp)
+target_link_libraries(logging_sampling_zero_test PUBLIC mooncake_common gtest gtest_main pthread)
+add_test(NAME logging_sampling_zero_test COMMAND logging_sampling_zero_test)
+set_tests_properties(logging_sampling_zero_test PROPERTIES
+  ENVIRONMENT "MC_HIFREQ_LOG_SAMPLE_RATE=0")

@@ -72,3 +72,94 @@ pre-task overhead. Batch IDs can be reused: also match timestamp windows.
 the upper-layer wait boundary. Neither is a pure hardware DMA measurement.
 These logs cover the current get_buffer transfer chain and its existing UB
 task phases; they do not expose internal firmware or provider execution stages.
+
+## Classic TE UB device and task timing
+
+The same `MC_TRANSFER_TRACE_MIN_BYTES` threshold now enables per-request classic
+UB task timing, emitted as `ub_task_trace engine=classic` when the task is
+destroyed during batch recycling. It covers both READ and WRITE. The line has
+`trace_id`, `batch`, and `task` for correlation; filter measurement windows by
+`created_ns`, not the later log emission time (convert with a same-process
+timestamp anchor, since these are monotonic timestamps, not wall time).
+
+* `device_us[avg/p50/p99/max]`: provider post returned to successful slice
+  terminal handling, including software completion discovery/handling. This
+  matches the intended TENT device window, not pure DMA time.
+* `post_us[avg/p50/p99/max]`: duration around the URMA post call. All slices
+  submitted by one provider call share that call's timestamps.
+* `total_us` / `ub_task_trace_total` (both microseconds): UB task construction
+  start to task completion publication. `terminal_source=last_slice` indicates
+  a fallback boundary (e.g. scheduled tasks), not the usual task publication.
+* `created_ns`, `terminal_ns`, `first_post_ns`, `last_complete_ns`: monotonic
+  timestamps for joining to the enclosing store transfer trace. First post and
+  device timings describe final attempts for retried slices; `retries` counts
+  additional provider post attempts, not all software route retries.
+* `device_samples` / `device_samples_missing`: only successfully completed
+  slices with ordered post-return/completion timestamps enter device statistics.
+  Failed/unposted slices and completions preceding post return are excluded.
+  No valid samples is reported as `-1`, not zero. Incomplete task total is `-1`.
+
+For multiple slices, device statistics are per-slice, not the task critical
+path: do not divide the entire task byte count by a per-slice mean. A single
+8 MiB slice can be compared directly with the corresponding TENT slice.
+Logging itself is outside task/device timing but inside batch release time.
+Enabled tracing allocates diagnostic state and reads clocks; measure both
+engines with consistent tracing, and retain an untraced throughput baseline.
+
+## get_buffer A/B and high-frequency sampling
+
+```sh
+export MC_TRANSFER_TRACE_MIN_BYTES=8388608
+export MC_HIFREQ_LOG_SAMPLE_RATE=1   # full diagnostic capture
+# export MC_HIFREQ_LOG_SAMPLE_RATE=0 # disable request diagnostics
+```
+
+All new request diagnostic capture is gated before diagnostic clock reads,
+trace-state allocation, snapshotting and formatting. The sample rate is cached
+at startup; restart the process after changing it. With rate zero, operational
+timestamps needed by the transport (timeouts, activity tracking), metrics,
+SpDiag and request trace IDs still exist. Startup, warnings and errors remain.
+This is low overhead for disabled logging, not literally zero CPU overhead.
+
+`get_breakdown` adds the following fields in microseconds:
+
+* `read_a_us`: `t_alloc` (allocation finished) to the selected transfer's
+  `submit_start_ns` (openSegment path start).
+* `read_transfer_window_us`: that submit start to `observed_done_ns`.
+* `read_b_us`: observed completion to the `get_breakdown` cutoff, including
+  completion diagnostic output, future return, batch release when locally
+  owned, checksums/cache/lease checks, and intervening diagnostic output.
+* `read_ab_valid`: true only for exactly one observed transfer with ordered
+  boundaries; otherwise A/B/window are `-1`, not zero.
+* `read_transfer_count`: number of observed transfer waits recorded in scope.
+
+For valid single-transfer get_buffer requests, A + transfer_window + B equals
+the elapsed read window (within the existing integer read_us rounding). The
+transfer window is exact elapsed time; `transfer_trace total_us` remains a sum
+of rounded phases and can differ by `submit_unattributed_us`. The synchronous
+wait caller records boundaries, so no pointer to a stack context is handed to
+the transport workers. Multiple-transfer, cache-only, local memcpy and other
+non-TE paths are deliberately reported as invalid instead of misattributed.
+
+Audit of the current get_buffer/upsert_from + UB hot paths:
+
+| Diagnostics | Sampling and output |
+| --- | --- |
+| get_breakdown, upsert_from_breakdown | sample by request trace ID before capture; MC_LOG |
+| query_rpc_breakdown / master_rpc_client_breakdown | sample before log-only timing/formatting; MC_LOG |
+| transfer_trace / transfer_path_trace / wait-return / release | byte threshold + request sample before capture; MC_LOG |
+| classic ub_task_trace / ub_submit_trace | byte threshold + request sample; MC_LOG |
+| TENT ub_task_trace | sampled on submit; no reporter thread at rate zero; MC_LOG on reporter thread with original trace ID |
+| urma_queue_depth / slice_chip_bindings | request sample, plus chip diagnostic opt-in; MC_LOG |
+| URMA setup/import diagnostics | sampled asynchronous MC_LOG_SAMPLED; log-only clock reads skipped at zero |
+| verbose request logs / ScopedVLogTimer | verbose level + sampling; asynchronous MC_LOG backend |
+
+Plain `MC_LOG` is asynchronous, but does not automatically sample and is not
+itself a lazy stream gate. Hot diagnostics use an outer sampled guard before
+capture or `MC_LOG_SAMPLED`, which checks sampling and severity before creating
+the stream or evaluating its arguments. `MC_VLOG` now uses the same lazy rule
+in addition to its verbose-level check. No errors are sampled away.
+
+The URMA INFO/DEBUG redirect is sampled before constructing the local log
+string; formatting already performed inside liburma is outside this control.
+Keep the provider's own debug settings off for throughput baselines.

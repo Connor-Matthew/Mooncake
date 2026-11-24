@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <glog/logging.h>
+#include "mooncake_logging.h"
 
 #include "tent/runtime/topology.h"
 #include "tent/transport/ub/slice.h"
@@ -154,6 +155,7 @@ inline std::string formatUbTaskTrace(
             << us(latency.max_ns);
     };
     out << "ub_task_trace batch=0x" << std::hex << batch_id << std::dec
+        << " engine=tent trace_id=" << task.logTraceId()
         << " op=" << (task.request().opcode == Request::READ ? "read" : "write")
         << " bytes=" << snapshot.total_bytes
         << " slices=" << snapshot.total_slices << " slice_size=" << slice_size
@@ -244,7 +246,8 @@ class UbTaskTraceReporter final {
             pending_.pop_front();
             const uint64_t dropped = std::exchange(dropped_, 0);
             lock.unlock();
-            LOG(INFO) << formatUbTaskTrace(*task, batch_id, nic_name);
+            mooncake::logging::ScopedTraceId log_context(task->logTraceId());
+            MC_LOG(INFO) << formatUbTaskTrace(*task, batch_id, nic_name);
             if (dropped != 0) {
                 LOG(WARNING) << "ub_task_trace dropped " << dropped
                              << " task(s): reporter queue is full";

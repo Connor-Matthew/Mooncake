@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/runtime/transfer_engine_impl.h"
+#include "mooncake_logging.h"
 #include "tent/runtime/control_plane.h"
 
 #include <algorithm>
@@ -3232,8 +3233,8 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto result = resolveTransport(task.request, task.xport_priority);
     auto type = result.transport;
     if (type == UNSPEC) {
-        VLOG(1) << "No more transports available after "
-                << transportTypeName(prev_type) << " failed";
+        MC_VLOG(1) << "No more transports available after "
+                   << transportTypeName(prev_type) << " failed";
         LOG_EVERY_N(WARNING, 100) << "No more transports available after "
                                   << transportTypeName(prev_type) << " failed";
         return Status::InvalidEntry("All available transports are failed");
@@ -3244,10 +3245,11 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         << transportTypeName(type) << " (attempt " << task.failover_count << "/"
         << task.runtime_policy.max_failover_attempts << ", generation "
         << task.runtime_policy.config_generation << ")";
-    VLOG(1) << "Transport failover: " << transportTypeName(prev_type) << " -> "
-            << transportTypeName(type) << " (attempt " << task.failover_count
-            << "/" << task.runtime_policy.max_failover_attempts
-            << ", generation " << task.runtime_policy.config_generation << ")";
+    MC_VLOG(1) << "Transport failover: " << transportTypeName(prev_type)
+               << " -> " << transportTypeName(type) << " (attempt "
+               << task.failover_count << "/"
+               << task.runtime_policy.max_failover_attempts << ", generation "
+               << task.runtime_policy.config_generation << ")";
     TENT_RECORD_TRANSPORT_FAILOVER(prev_type, type);
 
     // A failed device staging operation must never fall through to submitting

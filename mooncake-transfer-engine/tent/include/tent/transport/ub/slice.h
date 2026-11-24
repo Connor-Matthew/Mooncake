@@ -568,6 +568,12 @@ struct UbTask : public std::enable_shared_from_this<UbTask> {
     // Must be called before the task is submitted to the workers.
     void enableTrace() { trace_enabled_ = true; }
     [[nodiscard]] bool traceEnabled() const { return trace_enabled_; }
+    void setLogContext(uint64_t trace_id, bool sampled) {
+        log_trace_id_ = trace_id;
+        diagnostics_sampled_ = sampled;
+    }
+    uint64_t logTraceId() const { return log_trace_id_; }
+    bool diagnosticsSampled() const { return diagnostics_sampled_; }
 
     // Keeps the first reported memory locations of this traced task.
     void noteTraceLocations(const std::string& local,
@@ -742,6 +748,8 @@ struct UbTask : public std::enable_shared_from_this<UbTask> {
     uint64_t terminal_ns_{0};
     TerminalCallback terminal_callback_;
     bool trace_enabled_{false};
+    uint64_t log_trace_id_{0};
+    bool diagnostics_sampled_{false};
     std::string trace_local_location_;
     std::string trace_remote_location_;
 };

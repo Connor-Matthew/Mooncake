@@ -355,7 +355,9 @@ struct UbTransport::Impl {
         status = workers->start();
         if (!status.ok()) return failInstall(status);
 
-        if (ub::ubTaskTraceMinBytes() > 0) {
+        if (ub::ubTaskTraceMinBytes() > 0 &&
+            mooncake::logging::HiFreqLogSampleRate() > 0 &&
+            mooncake::logging::ShouldLog(google::INFO)) {
             trace_reporter =
                 std::make_shared<ub::UbTaskTraceReporter>(local_topology);
             LOG(INFO) << "UB task tracing enabled for requests of at least "
@@ -752,7 +754,12 @@ Status UbTransport::submitTransferTasks(
                     notify_progress(progress_batch_id);
                 }
             });
-        if (impl_->trace_reporter &&
+        const auto log_trace_id = mooncake::logging::CurrentTraceId();
+        const bool sampled =
+            mooncake::logging::ShouldSampleHiFreqLog(log_trace_id) &&
+            mooncake::logging::ShouldLog(google::INFO);
+        task->setLogContext(log_trace_id, sampled);
+        if (sampled && impl_->trace_reporter &&
             request.length >= ub::ubTaskTraceMinBytes()) {
             task->enableTrace();
         }
