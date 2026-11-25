@@ -605,8 +605,8 @@ std::shared_ptr<BufferHandle> AcquireSessionStaging(
         if (prefer_pinned && file_storage) {
             allocation = file_storage->AllocatePinnedStagingBuffer(size);
             if (!allocation) {
-                VLOG(1) << "Pinned session staging arena unavailable or "
-                           "exhausted; using default client buffer arena";
+                MC_VLOG(1) << "Pinned session staging arena unavailable or "
+                              "exhausted; using default client buffer arena";
             }
         }
         if (!allocation && fallback_allocator) {
@@ -4503,6 +4503,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
+    ScopedReadTransferTrace ab_trace(total_length, t_alloc);
     auto buffer_handle =
         std::make_shared<BufferHandle>(std::move(*alloc_result));
 
@@ -4534,11 +4535,15 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                 .count();
         MC_LOG(INFO) << "get_breakdown key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] query_us[" << query_us
-                     << "] select_us[" << select_us
-                     << "] local_endpoints_us[" << local_endpoints_us
-                     << "] select_replica_us[" << select_replica_us
-                     << "] alloc_us[" << alloc_us
+                     << "] select_us[" << select_us << "] local_endpoints_us["
+                     << local_endpoints_us << "] select_replica_us["
+                     << select_replica_us << "] alloc_us[" << alloc_us
                      << "] read_us[" << read_us << "] total_us[" << total_us
+                     << "] read_a_us[" << ab_trace.beforeUs(now)
+                     << "] read_b_us[" << ab_trace.afterUs(now)
+                     << "] read_transfer_window_us[" << ab_trace.transferUs(now)
+                     << "] read_ab_valid[" << ab_trace.valid(now)
+                     << "] read_transfer_count[" << ab_trace.transfers()
                      << "] type[" << replica_type << "] replica_count["
                      << replica_list.size() << "] selected_type["
                      << replica_type << "] local_endpoint["
@@ -5886,7 +5891,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
         if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
              metadata_result.error() == ErrorCode::REPLICA_IS_NOT_READY) &&
             src_offset == 0) {
-            VLOG(1) << "Object not found for key: " << key;
+            MC_VLOG(1) << "Object not found for key: " << key;
         }
         if (breakdown_log) {
             auto now = std::chrono::steady_clock::now();
@@ -6825,7 +6830,10 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
 
     std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
 
-    auto result = client_->Upsert(key, slices, config);
+    const bool diagnostics = mooncake::logging::ShouldSampleHiFreqLog(
+                                 mooncake::logging::CurrentTraceId()) &&
+                             mooncake::logging::ShouldLog(google::INFO);
+    auto result = client_->Upsert(key, slices, config, diagnostics);
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -6834,6 +6842,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
 
 int RealClient::upsert_from(const std::string &key, void *buffer, size_t size,
                             const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() { return upsert_from_internal(key, buffer, size, config); },
         [](const auto &ret) { return ret.has_value(); },
@@ -9533,8 +9542,8 @@ void RealClient::KickPrefetchForDiskHeadedKeys(
     }
     // Without this kick, a request whose exist-triggered promotion was
     // dropped by a saturated backoff window pays the SSD read with no retry.
-    VLOG(1) << "SSD prefetch: get-side kick, disk_keys=" << disk_keys.size()
-            << ", in_cooldown=" << prefetcher_->throttle()->inCooldown();
+    MC_VLOG(1) << "SSD prefetch: get-side kick, disk_keys=" << disk_keys.size()
+               << ", in_cooldown=" << prefetcher_->throttle()->inCooldown();
     prefetcher_->TriggerPrefetch(disk_keys, /*ignore_cooldown=*/true);
 }
 
@@ -10562,8 +10571,8 @@ bool RealClient::prefetch_offload_object(const std::vector<std::string> &keys,
                                          const std::vector<int64_t> &sizes,
                                          const std::string &tenant_id) {
     if (!enable_ssd_prefetch_ || !prefetcher_ || !file_storage_) {
-        VLOG(1) << "prefetch_offload_object called but SSD prefetch is "
-                   "disabled or SSD offload is not set up";
+        MC_VLOG(1) << "prefetch_offload_object called but SSD prefetch is "
+                      "disabled or SSD offload is not set up";
         return false;
     }
     if (keys.empty()) {
@@ -11168,12 +11177,12 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
     if (!result) {
         // This is expected in some cases (e.g., network issues, buffer already
         // GC'd) Log at INFO level since GC will eventually clean up anyway
-        VLOG(1) << "Failed to release_offload_buffer for batch_id=" << batch_id
-                << " at " << client_addr
-                << " (will be GC'd): " << result.error();
+        MC_VLOG(1) << "Failed to release_offload_buffer for batch_id="
+                   << batch_id << " at " << client_addr
+                   << " (will be GC'd): " << result.error();
     } else {
-        VLOG(1) << "Successfully released buffer for batch_id=" << batch_id
-                << " at " << client_addr;
+        MC_VLOG(1) << "Successfully released buffer for batch_id=" << batch_id
+                   << " at " << client_addr;
     }
 }
 
@@ -11185,8 +11194,8 @@ void ClientRequester::prefetch_offload_object(
     auto result = invoke_rpc<&RealClient::prefetch_offload_object, bool>(
         client_addr, nullptr, keys, sizes, tenant_id);
     if (!result) {
-        VLOG(1) << "Failed to invoke prefetch_offload_object, client_addr = "
-                << client_addr << ", error is: " << result.error();
+        MC_VLOG(1) << "Failed to invoke prefetch_offload_object, client_addr = "
+                   << client_addr << ", error is: " << result.error();
     }
 }
 

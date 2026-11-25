@@ -180,6 +180,11 @@ class VSegmentManager {
     // partition/profile and asks callers to retry while it is running.
     VSegmentAllocationResult RequestCreate(const std::string& profile_name,
                                            uint64_t retry_after_ms = 50);
+    // 写入负载均衡：profile_name 为空时不再固定写 default profile，而是跨
+    // 本 Partition 全部 profile 的 ACTIVE vsegment 按剩余空间从大到小
+    // 依次尝试（等效按剩余容量加权，且 profile 内也摊开；单个候选空间
+    // 不足时顺延，形成跨 profile 回退）。profile_name 非空时仅在该
+    // profile 内选择，语义与显式指定一致。
     VSegmentPutStartResult StartPut(const std::string& operation_id,
                                     uint64_t length,
                                     const std::string& profile_name = {},
@@ -252,6 +257,10 @@ class VSegmentManager {
                                                  uint64_t expected_route_epoch = 0,
                                                  bool single_phase_persist = false,
                                                  VSegmentCommitBatch* batch = nullptr);
+    // 负载均衡模式（StartPut 未指定 profile）下触发新建 vsegment 时的
+    // profile 选择：剩余物理配额最多者优先，并列时优先 default profile，
+    // 否则按名称序；无剩余配额时返回 default profile 以保留原有错误语义。
+    std::string SelectCreationProfile() const;
     VSegmentAllocationResult FinishCreate(VSegmentAllocationResult result);
     PartitionVSegmentSnapshot SnapshotLocked() const;
     ErrorCode PersistLocked(const std::string& mutation,

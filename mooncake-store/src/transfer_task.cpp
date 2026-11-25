@@ -90,7 +90,11 @@ static uint64_t TransferTraceMinBytes() {
         }
         return static_cast<uint64_t>(parsed);
     }();
-    return value;
+    return mooncake::logging::ShouldSampleHiFreqLog(
+               mooncake::logging::CurrentTraceId()) &&
+                   mooncake::logging::ShouldLog(google::INFO)
+               ? value
+               : 0;
 }
 
 static int64_t ElapsedUs(std::chrono::steady_clock::time_point begin,
@@ -549,7 +553,8 @@ FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
     : shutdown_(false) {
     static const auto config = FilereadWorkerPoolConfig::FromEnvironment();
     const int num_workers = config.worker_count;
-    VLOG(1) << "Creating FilereadWorkerPool with " << num_workers << " workers";
+    MC_VLOG(1) << "Creating FilereadWorkerPool with " << num_workers
+               << " workers";
 
     // Start worker threads
     workers_.reserve(num_workers);
@@ -574,7 +579,7 @@ FilereadWorkerPool::~FilereadWorkerPool() {
         }
     }
 
-    VLOG(1) << "FilereadWorkerPool destroyed";
+    MC_VLOG(1) << "FilereadWorkerPool destroyed";
 }
 
 void FilereadWorkerPool::submitTask(FilereadTask task) {
@@ -592,7 +597,7 @@ void FilereadWorkerPool::submitTask(FilereadTask task) {
 }
 
 void FilereadWorkerPool::workerThread() {
-    VLOG(2) << "FilereadWorkerPool worker thread started";
+    MC_VLOG(2) << "FilereadWorkerPool worker thread started";
 
     while (true) {
         FilereadTask task("", 0, {}, nullptr);
@@ -627,8 +632,8 @@ void FilereadWorkerPool::workerThread() {
                 auto load_result = backend_->LoadObject(
                     task.file_path, task.slices, task.object_size);
                 if (load_result) {
-                    VLOG(2) << "Fileread task completed successfully with "
-                            << task.file_path;
+                    MC_VLOG(2) << "Fileread task completed successfully with "
+                               << task.file_path;
                     task.state->set_completed(ErrorCode::OK);
                 } else {
                     LOG(ERROR)
@@ -643,7 +648,7 @@ void FilereadWorkerPool::workerThread() {
         }
     }
 
-    VLOG(2) << "FilereadWorkerPool worker thread exiting";
+    MC_VLOG(2) << "FilereadWorkerPool worker thread exiting";
 }
 
 // ============================================================================
@@ -661,7 +666,7 @@ NofWorkerPool::NofWorkerPool(std::shared_ptr<NVMeoFInitiator> initiator,
       queue_mutex_(std::make_unique<std::mutex[]>(worker_count_)),
       queue_cv_(std::make_unique<std::condition_variable[]>(worker_count_)),
       shutdown_(false) {
-    VLOG(1) << "Creating NofWorkerPool with " << worker_count_ << " workers";
+    MC_VLOG(1) << "Creating NofWorkerPool with " << worker_count_ << " workers";
 
     // Start worker threads
     workers_.reserve(worker_count_);
@@ -685,7 +690,7 @@ NofWorkerPool::~NofWorkerPool() {
         }
     }
 
-    VLOG(1) << "NofWorkerPool destroyed";
+    MC_VLOG(1) << "NofWorkerPool destroyed";
 }
 
 void NofWorkerPool::submitTask(NofTask task) {
@@ -853,7 +858,7 @@ static void IsolateNofLane(NVMeoFInitiator& initiator, NofSegmentHandle* lane,
 
 void NofWorkerPool::workerThread(int work_idx) {
     bindToSocket(numa_socket_id_);
-    VLOG(2) << "NofWorkerPool worker thread started";
+    MC_VLOG(2) << "NofWorkerPool worker thread started";
 
     // No longer a stack-variable address: the worker and the task share
     // ownership.
@@ -1260,7 +1265,7 @@ void NofWorkerPool::workerThread(int work_idx) {
     // seg_to_qos will automatically clean up NofQos objects using
     // unique_ptr
 
-    VLOG(2) << "NofWorkerPool worker thread exiting";
+    MC_VLOG(2) << "NofWorkerPool worker thread exiting";
 }
 
 // ============================================================================
@@ -1303,8 +1308,8 @@ static bool IsInlineHostMemcpyEnabled() {
 
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
     const int worker_count = GetMemcpyWorkerCount();
-    VLOG(1) << "Creating MemcpyWorkerPool with " << worker_count
-            << " workers; tune with MC_STORE_MEMCPY_WORKERS";
+    MC_VLOG(1) << "Creating MemcpyWorkerPool with " << worker_count
+               << " workers; tune with MC_STORE_MEMCPY_WORKERS";
 
     // Start worker threads
     workers_.reserve(worker_count);
@@ -1328,7 +1333,7 @@ MemcpyWorkerPool::~MemcpyWorkerPool() {
         }
     }
 
-    VLOG(1) << "MemcpyWorkerPool destroyed";
+    MC_VLOG(1) << "MemcpyWorkerPool destroyed";
 }
 
 void MemcpyWorkerPool::submitTask(MemcpyTask task) {
@@ -1349,7 +1354,7 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
 }
 
 void MemcpyWorkerPool::workerThread() {
-    VLOG(2) << "MemcpyWorkerPool worker thread started";
+    MC_VLOG(2) << "MemcpyWorkerPool worker thread started";
 
     while (true) {
         MemcpyTask task({}, nullptr);
@@ -1487,9 +1492,9 @@ void MemcpyWorkerPool::workerThread() {
                     breakdown_log ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
 
-                VLOG(2) << "Memcpy task completed with "
-                        << task.operations.size() << " operations"
-                        << (ok ? "" : " (with GPU copy failure)");
+                MC_VLOG(2) << "Memcpy task completed with "
+                           << task.operations.size() << " operations"
+                           << (ok ? "" : " (with GPU copy failure)");
                 task.state->set_completed(ok ? ErrorCode::OK
                                              : ErrorCode::TRANSFER_FAIL);
                 if (breakdown_log) {
@@ -1527,7 +1532,7 @@ void MemcpyWorkerPool::workerThread() {
         }
     }
 
-    VLOG(2) << "MemcpyWorkerPool worker thread exiting";
+    MC_VLOG(2) << "MemcpyWorkerPool worker thread exiting";
 }
 
 // ============================================================================
@@ -1577,6 +1582,8 @@ void TransferEngineOperationState::log_wait_return() {
     if (!trace_ ||
         trace_->observed_done == std::chrono::steady_clock::time_point{})
         return;
+    ScopedReadTransferTrace::record(trace_->submit_start,
+                                    trace_->observed_done);
     const auto now = std::chrono::steady_clock::now();
     MC_LOG(INFO) << "transfer_wait_return_trace trace_id=" << trace_->trace_id
                  << " batch=0x" << std::hex << batch_id_ << std::dec
@@ -1648,8 +1655,9 @@ void TransferEngineOperationState::check_task_status() {
             case TransferStatusEnum::CANCELED:
             case TransferStatusEnum::INVALID:
 #ifndef USE_ASCEND_DIRECT
-                VLOG(1) << "Transfer failed for batch " << batch_id_ << " task "
-                        << i << " with status " << static_cast<int>(status.s);
+                MC_VLOG(1) << "Transfer failed for batch " << batch_id_
+                           << " task " << i << " with status "
+                           << static_cast<int>(status.s);
 #endif
                 failed_task_ids.push_back(i);
                 break;
@@ -1693,8 +1701,8 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
         return;  // Don't crash, just return early
     }
 
-    VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
-            << static_cast<int>(error_code);
+    MC_VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
+               << static_cast<int>(error_code);
     result_.emplace(error_code);
     if (trace_) {
         trace_->observed_done = std::chrono::steady_clock::now();
@@ -1770,8 +1778,8 @@ void TransferEngineOperationState::wait_for_completion() {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     // TENT batches do not use the classic transport BatchDesc layout.
     if (!engine_.isUsingTent()) {
-        VLOG(1) << "Waiting for transfer engine completion for batch "
-                << batch_id_;
+        MC_VLOG(1) << "Waiting for transfer engine completion for batch "
+                   << batch_id_;
         // Wait directly on BatchDesc's condition variable.
         auto& batch_desc = Transport::toBatchDesc(batch_id_);
         bool completed;
@@ -1814,9 +1822,9 @@ void TransferEngineOperationState::wait_for_completion() {
             set_result_internal(error_code);
         }
         if (completed) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(error_code);
+            MC_VLOG(1) << "Transfer engine operation completed for batch "
+                       << batch_id_
+                       << " with result: " << static_cast<int>(error_code);
         } else {
             LOG(ERROR) << "Failed to complete transfers after "
                        << timeout_milliseconds << " milliseconds for batch "
@@ -1825,7 +1833,7 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 #endif
-    VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
+    MC_VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
     const bool ub_transport = engine_.getTransport("ub") != nullptr;
     const auto sleep_time =
@@ -1856,9 +1864,9 @@ void TransferEngineOperationState::wait_for_completion() {
             }
             check_task_status();
             if (result_.has_value()) {
-                VLOG(1) << "Transfer engine operation completed for batch "
-                        << batch_id_ << " with result: "
-                        << static_cast<int>(result_.value());
+                MC_VLOG(1) << "Transfer engine operation completed for batch "
+                           << batch_id_ << " with result: "
+                           << static_cast<int>(result_.value());
                 break;
             }
         }
@@ -1947,8 +1955,8 @@ TransferSubmitter::TransferSubmitter(
             std::make_unique<NofWorkerPool>(nof_initiator_, numa_socket_id);
     }
 
-    VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
-            << memcpy_enabled_;
+    MC_VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
+               << memcpy_enabled_;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
@@ -2781,8 +2789,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
     MemcpyTask task(std::move(operations), state, trace_id);
     memcpy_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "Memcpy transfer submitted to worker pool with "
-            << operation_count << " operations";
+    MC_VLOG(1) << "Memcpy transfer submitted to worker pool with "
+               << operation_count << " operations";
 
     return TransferFuture(state);
 }
@@ -3135,7 +3143,7 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
     task.metric = nof_metric_;
     nof_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "NoF transfer submitted to " << handle.transport_endpoint_;
+    MC_VLOG(1) << "NoF transfer submitted to " << handle.transport_endpoint_;
     return TransferFuture(state);
 }
 
@@ -3151,7 +3159,8 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     FilereadTask task(file_path, file_length, slices, state);
     fileread_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "Fileread transfer submitted to worker pool with " << file_path;
+    MC_VLOG(1) << "Fileread transfer submitted to worker pool with "
+               << file_path;
 
     return TransferFuture(state);
 }

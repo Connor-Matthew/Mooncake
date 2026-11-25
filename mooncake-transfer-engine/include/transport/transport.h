@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <queue>
@@ -113,6 +114,36 @@ class Transport {
     struct BatchDesc;
     struct TransferTask;
 
+    // Optional classic UB diagnostics. Shared ownership lets the post-return
+    // stamp survive even if another worker has already published completion.
+    struct UbSliceTrace {
+        std::atomic<uint64_t> post_ns{0};
+        std::atomic<uint64_t> post_returned_ns{0};
+        // When the poller observed this CQE (stamped right after
+        // urma_poll_jfc() returned). Splits the old device_us into pure
+        // device time (post return -> CQE seen) and completion handling
+        // (CQE seen -> terminal).
+        std::atomic<uint64_t> cqe_seen_ns{0};
+        std::atomic<uint64_t> terminal_ns{0};
+        std::atomic<uint32_t> attempts{0};
+        std::atomic<bool> success{false};
+        uint64_t bytes = 0;
+    };
+    struct UbTaskTrace {
+        uint64_t created_ns = 0;
+        uint64_t trace_id = 0;
+        uint64_t bytes = 0;
+        bool is_read = false;
+        std::atomic<uint64_t> terminal_ns{0};
+        std::vector<std::shared_ptr<UbSliceTrace>> slices;
+    };
+    static uint64_t ubTraceNowNs() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+    static void logClassicUbTaskTrace(const TransferTask &task);
+
     // `Slice::task` is produced on the submit thread and consumed on the
     // completion thread, so it must be read/written atomically. `std::atomic`
     // is neither copyable nor movable, which breaks the transports/tests that
@@ -186,6 +217,7 @@ class Transport {
         TransferRequest::OpCode opcode;
         SegmentID target_id;
         uint64_t trace_id = 0;
+        std::shared_ptr<UbSliceTrace> ub_trace;
         std::string peer_nic_path;
         // Non-owning pointer into the process-lifetime NIC-path intern pool.
         // When set, peerNicPath() returns *interned_peer_nic_path so the
@@ -386,6 +418,11 @@ class Transport {
             auto callback = completion_callback;
             completion_callback = nullptr;
             if (callback) callback(this, success);
+            if (ub_trace) {
+                ub_trace->success.store(success, std::memory_order_relaxed);
+                ub_trace->terminal_ns.store(ubTraceNowNs(),
+                                            std::memory_order_release);
+            }
         }
 
         static inline void finishIfComplete(TransferTask *task, uint64_t state,
@@ -408,6 +445,10 @@ class Transport {
             if (__atomic_exchange_n(&task->completion_published, true,
                                     __ATOMIC_ACQ_REL)) {
                 return;
+            }
+            if (task->ub_trace) {
+                task->ub_trace->terminal_ns.store(ubTraceNowNs(),
+                                                  std::memory_order_release);
             }
 
 #ifndef USE_EVENT_DRIVEN_COMPLETION
@@ -528,6 +569,7 @@ class Transport {
             auto cleanup = slice->cleanup_callback;
             slice->cleanup_callback = nullptr;
             slice->completion_callback = nullptr;
+            slice->ub_trace.reset();
             if (cleanup) cleanup(slice);
             slice->interned_peer_nic_path = nullptr;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
@@ -618,7 +660,9 @@ class Transport {
         size_t request_count = 1;
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
+        std::shared_ptr<UbTaskTrace> ub_trace;
         ~TransferTask() {
+            if (ub_trace) logClassicUbTaskTrace(*this);
             for (auto &slice : slice_list)
                 Transport::getSliceCache().deallocate(slice);
         }

@@ -20,10 +20,12 @@
 #endif
 
 #include <glog/logging.h>
+#include "mooncake_logging.h"
 
 #include "tent/runtime/platform.h"
 #include "tent/transport/ub/endpoint.h"
 #include "tent/transport/ub/device_selection.h"
+#include "tent/transport/ub/task_trace.h"
 
 namespace mooncake::tent::ub {
 namespace {
@@ -64,22 +66,6 @@ bool sliceChipDiagnosticsEnabled() {
     return enabled;
 }
 
-// Sample whole tasks so all eight slices of a sampled 8 MiB request appear.
-bool sampleSliceChipTask(uint64_t created_ns) {
-    static const double rate = [] {
-        const char* raw = std::getenv("MC_HIFREQ_LOG_SAMPLE_RATE");
-        if (!raw || !*raw) return 1.0;
-        char* end = nullptr;
-        const double parsed = std::strtod(raw, &end);
-        if (end == raw || *end || !std::isfinite(parsed)) return 1.0;
-        return std::clamp(parsed, 0.0, 1.0);
-    }();
-    uint64_t value = created_ns + 0x9e3779b97f4a7c15ULL;
-    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
-    value ^= value >> 31;
-    return static_cast<double>(value >> 11) / 9007199254740992.0 < rate;
-}
 
 inline void cpuRelax() {
 #if defined(__x86_64__) || defined(__i386__)
@@ -271,7 +257,9 @@ Status UbWorkers::stop() {
         std::vector<Completion> drained;
         auto status = endpoint->quiesce(params_.slice_timeout_ms, drained);
         for (const auto& completion : drained) {
-            if (completion.token != 0) handleCompletion(completion);
+            if (completion.token != 0) {
+                handleCompletion(completion, steadyNowNs());
+            }
         }
         if (!status.ok()) {
             rememberEndpointDrain(endpoint);
@@ -340,6 +328,11 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
         return Status::InvalidArgument(
             "UB workers are not accepting work" LOC_MARK);
     }
+    // Submit-side checkpoints for traced tasks: entry -> queue mutex
+    // acquired -> enqueue finished. The clock reads follow the trace-enable
+    // gate, so MC_HIFREQ_LOG_SAMPLE_RATE=0 skips them entirely.
+    const bool trace_clocks = ubTaskTraceClocksEnabled();
+    const uint64_t submit_started_ns = trace_clocks ? steadyNowNs() : 0;
 
     std::vector<PendingSlice> pending;
     std::unordered_set<const UbTask*> unique_tasks;
@@ -374,12 +367,14 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
 
     bool enqueue_failed = false;
     size_t marked_count = 0;
+    uint64_t queue_locked_ns = 0;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (!accepting_.load(std::memory_order_relaxed)) {
             return Status::InvalidArgument(
                 "UB workers stopped during submission" LOC_MARK);
         }
+        queue_locked_ns = trace_clocks ? steadyNowNs() : 0;
 
         for (const auto& item : pending) {
             if (!item.slice->markQueued()) break;
@@ -430,6 +425,13 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
         }
         return Status::InvalidArgument(
             "UB task changed while it was being submitted" LOC_MARK);
+    }
+    const uint64_t enqueue_finished_ns = trace_clocks ? steadyNowNs() : 0;
+    for (const auto& item : pending) {
+        if (item.task && item.task->traceEnabled()) {
+            item.slice->noteSubmitStages(submit_started_ns, queue_locked_ns,
+                                          enqueue_finished_ns);
+        }
     }
     if (!pending.empty()) queue_cv_.notify_all();
     return Status::OK();
@@ -525,14 +527,36 @@ void UbWorkers::pollingLoop(size_t poller_index) {
         1, std::min<size_t>(params_.poller_count, all_jfcs_.size()));
     uint64_t last_timeout_scan = 0;
     uint64_t last_progress_ns = 0;
+    // Reused across JFCs and loop iterations: poll() only clears the
+    // contents, so a steady poller keeps the capacity instead of paying a
+    // heap allocation per poll.
+    std::vector<Completion> completions;
+    // Sampled poller statistics; accumulation is gated on the process-wide
+    // high-frequency sampling rate so MC_HIFREQ_LOG_SAMPLE_RATE=0 leaves the
+    // poll loop free of extra clock reads. The summary itself goes through
+    // MC_LOG_SAMPLED, so a zero rate disables the output as well.
+    const bool poll_stats_enabled =
+        mooncake::logging::HiFreqLogSampleRate() > 0 &&
+        mooncake::logging::ShouldLog(google::INFO);
+    // Whether any slice trace can observe a cqe_seen checkpoint; false means
+    // the post-poll clock read below is skipped as well.
+    const bool trace_clocks = ubTaskTraceClocksEnabled();
+    uint64_t poll_calls = 0;
+    uint64_t empty_polls = 0;
+    uint64_t polled_completions = 0;
+    uint64_t poll_ns_total = 0;
+    size_t max_batch = 0;
+    uint64_t idle_sleeps = 0;
+    uint64_t last_stats_ns = 0;
     while (polling_.load(std::memory_order_acquire)) {
         bool progressed = false;
         for (size_t index = poller_index; index < all_jfcs_.size();
              index += poller_count) {
-            std::vector<Completion> completions;
+            const uint64_t poll_started_ns =
+                poll_stats_enabled ? steadyNowNs() : 0;
             auto status = all_jfcs_[index]->poll(64, completions);
-            auto context = context_by_jfc_.find(all_jfcs_[index].get());
             if (!status.ok()) {
+                auto context = context_by_jfc_.find(all_jfcs_[index].get());
                 if (context != context_by_jfc_.end() && context->second) {
                     handleLocalDeviceFailure(context->second);
                 }
@@ -540,6 +564,27 @@ void UbWorkers::pollingLoop(size_t poller_index) {
                     << "UB JFC poll failed: " << status.ToString();
                 continue;
             }
+            // One timestamp serves both the sampled poll statistics and the
+            // cqe_seen trace checkpoint; skip the clock read when nothing
+            // completed and neither consumer can run.
+            const uint64_t poll_returned_ns =
+                (poll_stats_enabled ||
+                 (!completions.empty() && trace_clocks))
+                    ? steadyNowNs()
+                    : 0;
+            if (poll_stats_enabled) {
+                ++poll_calls;
+                if (completions.empty()) ++empty_polls;
+                polled_completions += completions.size();
+                max_batch = std::max(max_batch, completions.size());
+                poll_ns_total += poll_returned_ns - poll_started_ns;
+            }
+            // Completion dispatch cost is charged to the slice trace from the
+            // moment the poller saw the CQE, not from when it gets around to
+            // dispatching it.
+            const uint64_t cqe_seen_ns =
+                !completions.empty() ? poll_returned_ns : 0;
+            auto context = context_by_jfc_.find(all_jfcs_[index].get());
             if (context != context_by_jfc_.end() && context->second) {
                 progressLocalDeviceFailure(context->second);
                 if (context->second->recordPollSuccess(
@@ -554,7 +599,8 @@ void UbWorkers::pollingLoop(size_t poller_index) {
             }
             progressed = progressed || !completions.empty();
             for (const auto& completion : completions) {
-                if (completion.token != 0) handleCompletion(completion);
+                if (completion.token != 0)
+                    handleCompletion(completion, cqe_seen_ns);
             }
         }
         const uint64_t now = steadyNowNs();
@@ -562,6 +608,28 @@ void UbWorkers::pollingLoop(size_t poller_index) {
             now - last_timeout_scan >= 1'000'000ULL) {
             scanTimeouts();
             last_timeout_scan = now;
+        }
+        if (poll_stats_enabled) {
+            if (last_stats_ns == 0) {
+                last_stats_ns = now;
+            } else if (now - last_stats_ns >= 1'000'000'000ULL) {
+                MC_LOG_SAMPLED(INFO)
+                    << "ub_poller_stats poller=" << poller_index
+                    << " jfcs=" << all_jfcs_.size()
+                    << " poll_calls=" << poll_calls
+                    << " empty_polls=" << empty_polls
+                    << " completions=" << polled_completions
+                    << " poll_us=" << poll_ns_total / 1000.0
+                    << " max_batch=" << max_batch
+                    << " idle_sleeps=" << idle_sleeps;
+                poll_calls = 0;
+                empty_polls = 0;
+                polled_completions = 0;
+                poll_ns_total = 0;
+                max_batch = 0;
+                idle_sleeps = 0;
+                last_stats_ns = now;
+            }
         }
         if (progressed) {
             last_progress_ns = now;
@@ -576,6 +644,7 @@ void UbWorkers::pollingLoop(size_t poller_index) {
             continue;
         }
         std::this_thread::sleep_for(std::chrono::microseconds(20));
+        ++idle_sleeps;
     }
 }
 
@@ -638,8 +707,17 @@ void UbWorkers::deferPending(const PendingSlice& pending) {
 }
 
 Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
-    return segment_manager_->withCachedSegment(
+    // Metadata sub-phase checkpoints for traced tasks: segment descriptor
+    // resolved from cache -> buffer found -> metadata decoded -> remote
+    // devices ordered.
+    const bool traced = pending.task && pending.task->traceEnabled();
+    uint64_t segment_cache_ns = 0;
+    uint64_t find_buffer_ns = 0;
+    uint64_t decode_metadata_ns = 0;
+    uint64_t remote_order_ns = 0;
+    auto status = segment_manager_->withCachedSegment(
         pending.target_id, route.pin, [&](SegmentDesc* segment) -> Status {
+            if (traced) segment_cache_ns = steadyNowNs();
             if (!segment || segment->type != SegmentType::Memory) {
                 return Status::InvalidMetadataType(
                     "UB target is not a memory segment" LOC_MARK);
@@ -647,6 +725,7 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
             auto* buffer =
                 segment->findBuffer(pending.slice->spec().remote_address,
                                     pending.slice->spec().length);
+            if (traced) find_buffer_ns = steadyNowNs();
             if (!buffer) {
                 return Status::NeedsRefreshCache(
                     "UB target range is not registered" LOC_MARK);
@@ -658,17 +737,24 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
             }
             UbBufferMetadata metadata;
             auto status = decodeBufferMetadata(attr->second, metadata);
+            if (traced) decode_metadata_ns = steadyNowNs();
             if (!status.ok()) return status;
             route.remote_buffer = buffer;
             route.metadata = std::move(metadata);
             route.remote_devices =
                 orderedRemoteDevices(*segment, *buffer, route.metadata);
+            if (traced) remote_order_ns = steadyNowNs();
             if (route.remote_devices.empty()) {
                 return Status::DeviceNotFound(
                     "UB target has no active advertised device" LOC_MARK);
             }
             return Status::OK();
         });
+    if (traced && status.ok()) {
+        pending.slice->noteRouteStages(segment_cache_ns, find_buffer_ns,
+                                       decode_metadata_ns, remote_order_ns);
+    }
+    return status;
 }
 
 std::string UbWorkers::localLocationOf(const PendingSlice& pending) const {
@@ -1117,34 +1203,36 @@ void UbWorkers::processPending(const PendingSlice& pending,
     status = jetty ? adapter_->post(jetty, {work}, posted_count)
                    : Status::InternalError("UB endpoint has no Jetty" LOC_MARK);
     if (traced) pending.slice->notePostReturned(steadyNowNs());
-    if (sliceChipDiagnosticsEnabled()) {
+    if (pending.task->diagnosticsSampled() && sliceChipDiagnosticsEnabled()) {
         const auto task_snapshot = pending.task->snapshot();
-        if (sampleSliceChipTask(task_snapshot.created_ns)) {
-            LOG(INFO) << "urma_slice_chip_bindings engine=tent"
-                      << " task=" << pending.task.get()
-                      << " task_created_ns=" << task_snapshot.created_ns
-                      << " direction="
-                      << (work.operation == Operation::READ ? "read" : "write")
-                      << " worker=" << worker_index
-                      << " local_device=" << path.local_topology_id
-                      << " remote_nic=" << endpoint->key().peer_nic_path
-                      << " jetty_id=" << (jetty ? jetty->id() : 0)
-                      << " token=" << completion_token
-                      << " slice=" << pending.slice->id()
-                      << " offset=" << pending.slice->spec().request_offset
-                      << " bytes=" << work.length
-                      << " local_location=" << route.local_location
-                      << " remote_location=" << route.remote_buffer->location
-                      << " affinity_requested=" << params_.numa_affinity
-                      << " has_drv_ext=" << work.chip_affinity
-                      << " src_chip_id="
-                      << (work.chip_affinity
-                              ? std::to_string(work.src_chip_id) : "unbound")
-                      << " dst_chip_id="
-                      << (work.chip_affinity
-                              ? std::to_string(work.dst_chip_id) : "unbound")
-                      << " posted=" << posted_count
-                      << " status=" << status.ToString();
+        {
+            mooncake::logging::ScopedTraceId log_context(
+                pending.task->logTraceId());
+            MC_LOG(INFO)
+                << "urma_slice_chip_bindings engine=tent"
+                << " task=" << pending.task.get()
+                << " task_created_ns=" << task_snapshot.created_ns
+                << " direction="
+                << (work.operation == Operation::READ ? "read" : "write")
+                << " worker=" << worker_index
+                << " local_device=" << path.local_topology_id
+                << " remote_nic=" << endpoint->key().peer_nic_path
+                << " jetty_id=" << (jetty ? jetty->id() : 0)
+                << " token=" << completion_token
+                << " slice=" << pending.slice->id()
+                << " offset=" << pending.slice->spec().request_offset
+                << " bytes=" << work.length
+                << " local_location=" << route.local_location
+                << " remote_location=" << route.remote_buffer->location
+                << " affinity_requested=" << params_.numa_affinity
+                << " has_drv_ext=" << work.chip_affinity << " src_chip_id="
+                << (work.chip_affinity ? std::to_string(work.src_chip_id)
+                                       : "unbound")
+                << " dst_chip_id="
+                << (work.chip_affinity ? std::to_string(work.dst_chip_id)
+                                       : "unbound")
+                << " posted=" << posted_count
+                << " status=" << status.ToString();
         }
     }
     if (posted_count == 1) {
@@ -1214,17 +1302,37 @@ void UbWorkers::progressLocalDeviceFailure(const UbContextPtr& context) {
         << status.ToString();
 }
 
-void UbWorkers::handleCompletion(const Completion& completion) {
+void UbWorkers::handleCompletion(const Completion& completion,
+                                 uint64_t cqe_seen_ns) {
     std::shared_ptr<Inflight> inflight;
+    bool traced = false;
     {
         std::lock_guard<std::mutex> lock(inflight_mutex_);
+        // The clock read is only needed while tracing can be enabled; it
+        // splits the inflight-mutex wait from its hold for traced slices.
+        // The gate mirrors the trace-enable path, so
+        // MC_HIFREQ_LOG_SAMPLE_RATE=0 leaves this per-completion read off.
+        const uint64_t inflight_locked_ns =
+            ubTaskTraceClocksEnabled() ? steadyNowNs() : 0;
         auto it = inflight_.find(completion.token);
         if (it == inflight_.end()) return;
         inflight = std::move(it->second);
         inflight_.erase(it);
+        if (inflight_locked_ns != 0 && inflight->pending.task &&
+            inflight->pending.task->traceEnabled()) {
+            traced = true;
+            auto* slice = inflight->pending.slice.get();
+            slice->noteCqeSeen(cqe_seen_ns != 0 ? cqe_seen_ns
+                                                : steadyNowNs());
+            slice->noteInflightLocked(inflight_locked_ns);
+            slice->noteInflightErased(steadyNowNs());
+        }
     }
     inflight_cv_.notify_all();
     releaseInflight(inflight);
+    if (traced) {
+        inflight->pending.slice->noteResourcesReleased(steadyNowNs());
+    }
     if (inflight->timed_out.load(std::memory_order_acquire)) {
         // A natural or flush completion proves that this particular WR can no
         // longer touch memory. Whichever side wins the timeout/drain race may
@@ -1232,6 +1340,7 @@ void UbWorkers::handleCompletion(const Completion& completion) {
         // an idempotent no-op.
         const uint64_t now = steadyNowNs();
         recordTimeoutOnce(inflight, now);
+        if (traced) inflight->pending.slice->noteRailRecorded(steadyNowNs());
         resolveInflight(inflight, TIMEOUT, 0, true);
         return;
     }
@@ -1244,12 +1353,16 @@ void UbWorkers::handleCompletion(const Completion& completion) {
             rail_monitor_->recordSuccess(inflight->path,
                                          inflight->pending.slice->spec().length,
                                          latency, now);
+            if (traced)
+                inflight->pending.slice->noteRailRecorded(steadyNowNs());
             resolveInflight(inflight, COMPLETED,
                             inflight->pending.slice->spec().length, false);
             break;
         case CompletionCategory::TIMEOUT:
             rail_monitor_->recordTimeout(inflight->path, now);
             if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
+            if (traced)
+                inflight->pending.slice->noteRailRecorded(steadyNowNs());
             resolveInflight(inflight, TIMEOUT, 0, true);
             break;
         case CompletionCategory::LOCAL_DEVICE_ERROR:
@@ -1257,18 +1370,24 @@ void UbWorkers::handleCompletion(const Completion& completion) {
                 handleLocalDeviceFailure(inflight->endpoint->context());
             }
             rail_monitor_->recordError(inflight->path, now);
+            if (traced)
+                inflight->pending.slice->noteRailRecorded(steadyNowNs());
             if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
             resolveInflight(inflight, FAILED, 0, true);
             break;
         case CompletionCategory::REMOTE_PATH_ERROR:
         case CompletionCategory::ENDPOINT_ERROR:
             rail_monitor_->recordError(inflight->path, now);
+            if (traced)
+                inflight->pending.slice->noteRailRecorded(steadyNowNs());
             if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);
             resolveInflight(inflight, FAILED, 0, true);
             break;
         case CompletionCategory::MEMORY_ERROR:
         case CompletionCategory::UNKNOWN_ERROR:
             rail_monitor_->recordError(inflight->path, now);
+            if (traced)
+                inflight->pending.slice->noteRailRecorded(steadyNowNs());
             resolveInflight(inflight, FAILED, 0, false);
             break;
     }
@@ -1300,7 +1419,9 @@ void UbWorkers::scanTimeouts() {
         // Even a partial/failed fence may have returned valid WR completions;
         // they must never be lost.
         for (const auto& completion : drained) {
-            if (completion.token != 0) handleCompletion(completion);
+            if (completion.token != 0) {
+                handleCompletion(completion, steadyNowNs());
+            }
         }
         if (!status.ok()) {
             rememberEndpointDrain(inflight->endpoint);

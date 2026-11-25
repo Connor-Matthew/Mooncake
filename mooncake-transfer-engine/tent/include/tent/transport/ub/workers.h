@@ -196,7 +196,11 @@ class UbWorkers final {
                                     std::shared_ptr<UbEndpoint>& endpoint,
                                     UbPostPath& path,
                                     QuotaReservation& reservation);
-    void handleCompletion(const Completion& completion);
+    // `cqe_seen_ns` is when the poller observed the completion (0 means
+    // "not available"; handleCompletion then stamps its own timestamp for
+    // traced slices).
+    void handleCompletion(const Completion& completion,
+                          uint64_t cqe_seen_ns);
     void handleLocalDeviceFailure(const UbContextPtr& context);
     void progressLocalDeviceFailure(const UbContextPtr& context);
     void scanTimeouts();

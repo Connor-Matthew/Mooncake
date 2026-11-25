@@ -500,8 +500,8 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
             // peermem DMA path on the receiver (seg_cfg.is_gpu_seg = 1). The
             // GPU VA is posted to the NIC as-is; no host staging buffer.
             region_type = UbMemoryRegionType::kGpu;
-            VLOG(1) << "[ub_gdr] registering GPU region addr=" << addr
-                    << " length=" << length;
+            MC_VLOG(1) << "[ub_gdr] registering GPU region addr=" << addr
+                       << " length=" << length;
             // fall through to the common registration body below.
         } else if (mode == UbGpuMode::kStaging) {
             return registerLogicalDeviceRegion(addr, length, name,
@@ -658,7 +658,11 @@ Status UbTransport::submitTransferTask(
         return *end == '\0' ? static_cast<uint64_t>(value) : uint64_t{0};
     }();
     uint64_t trace_bytes = 0;
-    if (trace_min_bytes > 0) {
+    const bool sample_trace =
+        trace_min_bytes > 0 &&
+        logging::ShouldSampleHiFreqLog(logging::CurrentTraceId()) &&
+        logging::ShouldLog(google::INFO);
+    if (sample_trace) {
         for (const auto* task : task_list) {
             if (task && task->request) trace_bytes += task->request->length;
         }
@@ -688,6 +692,13 @@ Status UbTransport::submitTransferTask(
         nr_slices = 0;
         assert(task.request);
         auto& request = *task.request;
+        if (sample_trace && request.length >= trace_min_bytes) {
+            task.ub_trace = std::make_shared<UbTaskTrace>();
+            task.ub_trace->created_ns = ubTraceNowNs();
+            task.ub_trace->trace_id = logging::CurrentTraceId();
+            task.ub_trace->bytes = request.length;
+            task.ub_trace->is_read = request.opcode == TransferRequest::READ;
+        }
         void* effective_source = request.source;
         std::shared_ptr<StagingState> staging_state;
         StagingLease staging_lease;
@@ -701,10 +712,12 @@ Status UbTransport::submitTransferTask(
                 // Direct DMA: NIC reads/writes GPU HBM via peermem. The GPU VA
                 // (request.source) was registered with is_gpu_seg=1, so post it
                 // as-is -- no staging copy, effective_source unchanged.
-                VLOG(1) << "[ub_gdr] direct transfer gpu_va=" << request.source
-                        << " length=" << request.length << " opcode="
-                        << (request.opcode == TransferRequest::WRITE ? "WRITE"
-                                                                      : "READ");
+                MC_VLOG(1) << "[ub_gdr] direct transfer gpu_va="
+                           << request.source << " length=" << request.length
+                           << " opcode="
+                           << (request.opcode == TransferRequest::WRITE
+                                   ? "WRITE"
+                                   : "READ");
             } else if (mode == UbGpuMode::kStaging) {
                 if (!isLogicalDeviceRange(request.source, request.length)) {
                     return Status::AddressNotRegistered(
@@ -777,6 +790,13 @@ Status UbTransport::submitTransferTask(
                 merge_final_slice ? request.length - offset : kBlockSize;
             slice->opcode = request.opcode;
             slice->trace_id = mooncake::logging::CurrentTraceId();
+            // Slice cache entries may retain diagnostics from an older task.
+            slice->ub_trace.reset();
+            if (task.ub_trace) {
+                slice->ub_trace = std::make_shared<UbSliceTrace>();
+                slice->ub_trace->bytes = slice->length;
+                task.ub_trace->slices.push_back(slice->ub_trace);
+            }
             // LOG(INFO) << "target_offset : " << request.target_offset << ",
             // offset : " << offset;
             slice->ub.dest_addr = request.target_offset + offset;
@@ -883,7 +903,7 @@ Status UbTransport::submitTransferTask(
                     numa_log_counter.fetch_add(1, std::memory_order_relaxed) %
                             kNumaAffinitySampleInterval ==
                         0) {
-                    VLOG(2)
+                    MC_VLOG(2)
                         << "[numa_affinity] local_sample trace_id="
                         << slice->trace_id << " target_id=" << slice->target_id
                         << " opcode="

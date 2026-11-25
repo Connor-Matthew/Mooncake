@@ -192,6 +192,27 @@ struct UbSliceSnapshot {
     uint64_t path_selected_ns{0};
     uint64_t segments_ready_ns{0};
     uint64_t route_metadata_ns{0};
+    // Submit-side checkpoints (traced tasks only): submitBatch() entry, queue
+    // mutex acquired, and enqueue finished.
+    uint64_t submit_started_ns{0};
+    uint64_t queue_locked_ns{0};
+    uint64_t enqueue_finished_ns{0};
+    // Route metadata sub-phase checkpoints (traced tasks only): segment
+    // descriptor resolved from cache, remote buffer found, transport metadata
+    // decoded, remote devices ordered.
+    uint64_t segment_cache_ns{0};
+    uint64_t find_buffer_ns{0};
+    uint64_t decode_metadata_ns{0};
+    uint64_t remote_order_ns{0};
+    // Completion path checkpoints (traced tasks only): CQE observed by the
+    // poller, inflight mutex acquired, inflight entry erased, transport
+    // resources released, and rail monitor updated. The final attempt's
+    // terminal_ns closes the chain.
+    uint64_t cqe_seen_ns{0};
+    uint64_t inflight_locked_ns{0};
+    uint64_t inflight_erased_ns{0};
+    uint64_t resources_released_ns{0};
+    uint64_t rail_recorded_ns{0};
 };
 
 struct UbTask;
@@ -456,6 +477,41 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
         path_selected_ns_.store(path_selected_ns, std::memory_order_relaxed);
         segments_ready_ns_.store(segments_ready_ns, std::memory_order_relaxed);
     }
+    // Submit-side checkpoints; see UbSliceSnapshot.
+    void noteSubmitStages(uint64_t submit_started_ns, uint64_t queue_locked_ns,
+                          uint64_t enqueue_finished_ns) {
+        submit_started_ns_.store(submit_started_ns,
+                                  std::memory_order_relaxed);
+        queue_locked_ns_.store(queue_locked_ns, std::memory_order_relaxed);
+        enqueue_finished_ns_.store(enqueue_finished_ns,
+                                   std::memory_order_relaxed);
+    }
+    // Route metadata sub-phase checkpoints; see UbSliceSnapshot.
+    void noteRouteStages(uint64_t segment_cache_ns, uint64_t find_buffer_ns,
+                         uint64_t decode_metadata_ns,
+                         uint64_t remote_order_ns) {
+        segment_cache_ns_.store(segment_cache_ns, std::memory_order_relaxed);
+        find_buffer_ns_.store(find_buffer_ns, std::memory_order_relaxed);
+        decode_metadata_ns_.store(decode_metadata_ns,
+                                  std::memory_order_relaxed);
+        remote_order_ns_.store(remote_order_ns, std::memory_order_relaxed);
+    }
+    // Completion path checkpoints; see UbSliceSnapshot.
+    void noteCqeSeen(uint64_t now_ns) {
+        cqe_seen_ns_.store(now_ns, std::memory_order_relaxed);
+    }
+    void noteInflightLocked(uint64_t now_ns) {
+        inflight_locked_ns_.store(now_ns, std::memory_order_relaxed);
+    }
+    void noteInflightErased(uint64_t now_ns) {
+        inflight_erased_ns_.store(now_ns, std::memory_order_relaxed);
+    }
+    void noteResourcesReleased(uint64_t now_ns) {
+        resources_released_ns_.store(now_ns, std::memory_order_relaxed);
+    }
+    void noteRailRecorded(uint64_t now_ns) {
+        rail_recorded_ns_.store(now_ns, std::memory_order_relaxed);
+    }
 
     [[nodiscard]] UbSliceSnapshot snapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -479,7 +535,19 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
             route_ready_ns_.load(std::memory_order_relaxed),
             path_selected_ns_.load(std::memory_order_relaxed),
             segments_ready_ns_.load(std::memory_order_relaxed),
-            route_metadata_ns_.load(std::memory_order_relaxed)};
+            route_metadata_ns_.load(std::memory_order_relaxed),
+            submit_started_ns_.load(std::memory_order_relaxed),
+            queue_locked_ns_.load(std::memory_order_relaxed),
+            enqueue_finished_ns_.load(std::memory_order_relaxed),
+            segment_cache_ns_.load(std::memory_order_relaxed),
+            find_buffer_ns_.load(std::memory_order_relaxed),
+            decode_metadata_ns_.load(std::memory_order_relaxed),
+            remote_order_ns_.load(std::memory_order_relaxed),
+            cqe_seen_ns_.load(std::memory_order_relaxed),
+            inflight_locked_ns_.load(std::memory_order_relaxed),
+            inflight_erased_ns_.load(std::memory_order_relaxed),
+            resources_released_ns_.load(std::memory_order_relaxed),
+            rail_recorded_ns_.load(std::memory_order_relaxed)};
     }
 
    private:
@@ -533,6 +601,18 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
     std::atomic<uint64_t> path_selected_ns_{0};
     std::atomic<uint64_t> segments_ready_ns_{0};
     std::atomic<uint64_t> route_metadata_ns_{0};
+    std::atomic<uint64_t> submit_started_ns_{0};
+    std::atomic<uint64_t> queue_locked_ns_{0};
+    std::atomic<uint64_t> enqueue_finished_ns_{0};
+    std::atomic<uint64_t> segment_cache_ns_{0};
+    std::atomic<uint64_t> find_buffer_ns_{0};
+    std::atomic<uint64_t> decode_metadata_ns_{0};
+    std::atomic<uint64_t> remote_order_ns_{0};
+    std::atomic<uint64_t> cqe_seen_ns_{0};
+    std::atomic<uint64_t> inflight_locked_ns_{0};
+    std::atomic<uint64_t> inflight_erased_ns_{0};
+    std::atomic<uint64_t> resources_released_ns_{0};
+    std::atomic<uint64_t> rail_recorded_ns_{0};
 };
 
 struct UbTaskSnapshot {
@@ -568,6 +648,12 @@ struct UbTask : public std::enable_shared_from_this<UbTask> {
     // Must be called before the task is submitted to the workers.
     void enableTrace() { trace_enabled_ = true; }
     [[nodiscard]] bool traceEnabled() const { return trace_enabled_; }
+    void setLogContext(uint64_t trace_id, bool sampled) {
+        log_trace_id_ = trace_id;
+        diagnostics_sampled_ = sampled;
+    }
+    uint64_t logTraceId() const { return log_trace_id_; }
+    bool diagnosticsSampled() const { return diagnostics_sampled_; }
 
     // Keeps the first reported memory locations of this traced task.
     void noteTraceLocations(const std::string& local,
@@ -742,6 +828,8 @@ struct UbTask : public std::enable_shared_from_this<UbTask> {
     uint64_t terminal_ns_{0};
     TerminalCallback terminal_callback_;
     bool trace_enabled_{false};
+    uint64_t log_trace_id_{0};
+    bool diagnostics_sampled_{false};
     std::string trace_local_location_;
     std::string trace_remote_location_;
 };

@@ -72,6 +72,7 @@ uint64_t WorkerIdleSpinNs() {
 
 std::unique_ptr<mooncake::logging::ScopedTraceId> RestoreTraceIfMissing(
     uint64_t trace_id) {
+    if (mooncake::logging::HiFreqLogSampleRate() <= 0) return nullptr;
     if (trace_id == 0 || mooncake::logging::CurrentTraceId() != 0) {
         return nullptr;
     }
@@ -368,16 +369,15 @@ int UbWorkerPool::submitPostSend(
                 numa_log_counter.fetch_add(1, std::memory_order_relaxed) %
                         kNumaAffinitySampleInterval ==
                     0) {
-                VLOG(2) << "[numa_affinity] remote_sample trace_id="
-                        << slice->trace_id << " target_id="
-                        << slice->target_id
-                        << " opcode="
-                        << (slice->opcode == Transport::TransferRequest::READ
-                                ? "READ"
-                                : "WRITE")
-                        << " remote_data_numa=" << data_numa
-                        << " dst_chip=" << (int)slice->ub.dst_chip_id
-                        << " remote_name=" << peer_buf.name;
+                MC_VLOG(2) << "[numa_affinity] remote_sample trace_id="
+                           << slice->trace_id
+                           << " target_id=" << slice->target_id << " opcode="
+                           << (slice->opcode == Transport::TransferRequest::READ
+                                   ? "READ"
+                                   : "WRITE")
+                           << " remote_data_numa=" << data_numa
+                           << " dst_chip=" << (int)slice->ub.dst_chip_id
+                           << " remote_name=" << peer_buf.name;
             }
         }
         auto peer_nic_path =
@@ -724,10 +724,9 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                     numa_log_counter.fetch_add(1, std::memory_order_relaxed) %
                             kNumaAffinitySampleInterval ==
                         0) {
-                    VLOG(2)
+                    MC_VLOG(2)
                         << "[numa_affinity] remote_redispatch_sample trace_id="
-                        << slice->trace_id << " target_id="
-                        << slice->target_id
+                        << slice->trace_id << " target_id=" << slice->target_id
                         << " opcode="
                         << (slice->opcode == Transport::TransferRequest::READ
                                 ? "READ"

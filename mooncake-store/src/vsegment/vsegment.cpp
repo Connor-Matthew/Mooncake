@@ -5,9 +5,11 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 
 #if defined(__aarch64__) && defined(__GNUC__)
 #include <arm_acle.h>
@@ -17,6 +19,7 @@
 #endif
 
 #include "crc32c.h"
+#include "random.h"
 
 namespace mooncake::vsegment {
 namespace {
@@ -523,7 +526,10 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
         size_t range_index;
         uint64_t offset;
     };
-    std::vector<Candidate> candidates;
+    // 先收集全部可用候选（不再顺序取前 member_count 个）：顺序选择会让
+    // vsegment 的成员集中在配额声明顺序靠前的几个 psegment 上，负载和
+    // 故障域都倾斜；改为随机抽取 member_count 个不同成员分散到各节点。
+    std::vector<Candidate> eligible;
     std::set<std::string> visited_segments;
     size_t excluded_count = 0;
     auto& profile_ranges = free_ranges_.at(profile.name);
@@ -539,25 +545,39 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
             return r.length >= profile.member_extent_size;
         });
         if (range != ranges.end()) {
-            candidates.push_back({quota.segment_id,
-                                  static_cast<size_t>(range - ranges.begin()),
-                                  range->offset});
+            eligible.push_back({quota.segment_id,
+                                static_cast<size_t>(range - ranges.begin()),
+                                range->offset});
         }
-        if (candidates.size() == profile.member_count) break;
     }
-    if (candidates.size() != profile.member_count) {
+    if (eligible.size() < profile.member_count) {
         result.error = ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
         std::ostringstream message;
         message << "partition " << config->second.partition_id << " requires "
                 << profile.member_count << " psegments with "
                 << profile.member_extent_size << " free bytes each, but only "
-                << candidates.size() << " are available";
+                << eligible.size() << " are available";
         if (excluded_count > 0)
             message << " (" << excluded_count
                     << " excluded by runtime invalid-endpoint reports)";
         result.detail = message.str();
         return result;
     }
+
+    // 随机选取 member_count 个不同成员（部分 Fisher-Yates 洗牌下标，等概率
+    // 无偏）；随后把选中的下标排回 quota 声明顺序，保持视图成员顺序确定
+    //（checksum、视图比较与既有测试都依赖稳定的成员顺序）。
+    std::vector<size_t> indices(eligible.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    for (size_t i = 0; i < profile.member_count; ++i) {
+        const size_t pick = i + randomIndex(indices.size() - i);
+        std::swap(indices[i], indices[pick]);
+    }
+    std::sort(indices.begin(), indices.begin() + profile.member_count);
+    std::vector<Candidate> candidates;
+    candidates.reserve(profile.member_count);
+    for (size_t i = 0; i < profile.member_count; ++i)
+        candidates.push_back(eligible[indices[i]]);
 
     VSegmentView view;
     view.vsegment_id = vsegment_id;

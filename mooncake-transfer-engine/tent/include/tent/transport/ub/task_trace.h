@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <glog/logging.h>
+#include "mooncake_logging.h"
 
 #include "tent/runtime/topology.h"
 #include "tent/transport/ub/slice.h"
@@ -38,6 +39,19 @@ inline uint64_t ubTaskTraceMinBytes() {
         return *end == '\0' ? static_cast<uint64_t>(parsed) : uint64_t{0};
     }();
     return value;
+}
+
+// Process-wide gate for the trace checkpoint clock reads on hot paths.
+// It mirrors the conditions that construct the task trace reporter (and
+// thus enable any task tracing), so while it is false no task can be
+// traced and the checkpoints are pure overhead. In particular
+// MC_HIFREQ_LOG_SAMPLE_RATE=0 disables every added clock read and log.
+inline bool ubTaskTraceClocksEnabled() {
+    static const bool enabled =
+        ubTaskTraceMinBytes() > 0 &&
+        mooncake::logging::HiFreqLogSampleRate() > 0 &&
+        mooncake::logging::ShouldLog(google::INFO);
+    return enabled;
 }
 
 // Slice-level latency distribution, in nanoseconds.
@@ -69,12 +83,29 @@ inline UbTraceLatency summarizeUbTraceLatency(std::vector<uint64_t> samples) {
 //   queue_us   enqueued -> taken by a posting worker (includes quota deferrals)
 //   prepare_us taken -> ready to post (route, endpoint, quota, segment lookup)
 //     prep_route_us    taken -> route and local location resolved
+//       prep_route_metadata_us  taken -> remote metadata resolved; split into
+//           prep_seg_cache_us   segment descriptor resolved from cache
+//           prep_find_buf_us   remote buffer lookup
+//           prep_decode_us     transport metadata decode
+//           prep_remote_order_us remote device ordering
+//       prep_local_location_us  -> local NUMA location resolved
 //     prep_select_us   -> endpoint, rail and quota selected
 //     prep_segments_us -> local segment found and remote segment imported
 //     prep_commit_us   -> attempt committed, ready to post
 //   post_us    duration of the URMA post call
-//   device_us  post returned -> completion handled (device time plus poller
-//              wake-up delay)
+//   device_us  post returned -> completion observed by the poller (device
+//              time plus poller wake-up delay)
+//   cqh_*_us   completion handling stages observed by the poller:
+//     cqh_wait_us    CQE seen -> inflight mutex acquired (lock wait)
+//     cqh_inflight_us -> entry erased under the lock (lock hold)
+//     cqh_release_us -> endpoint outstanding/quota released and waiters
+//                      notified
+//     cqh_rail_us    -> rail monitor updated (global rail lock)
+//     cqh_resolve_us -> slice resolved, task finalized, callback run
+//   Submit-side phases (sub_*_us) split the enqueue path:
+//     sub_build_us       task created -> submitBatch entered
+//     sub_lock_wait_us   submitBatch entered -> queue mutex acquired
+//     sub_enqueue_us     queue mutex acquired -> enqueue finished
 // Retried slices report their final attempt.
 inline std::string formatUbTaskTrace(
     const UbTask& task, BatchID batch_id,
@@ -90,6 +121,10 @@ inline std::string formatUbTaskTrace(
     std::vector<uint64_t> queue, prepare, post, device;
     std::vector<uint64_t> prep_route, prep_select, prep_segments, prep_commit;
     std::vector<uint64_t> route_metadata, local_location;
+    std::vector<uint64_t> seg_cache, find_buffer, decode, remote_order;
+    std::vector<uint64_t> submit_build, submit_lock_wait, submit_enqueue;
+    std::vector<uint64_t> cqh_wait, cqh_inflight, cqh_release, cqh_rail,
+        cqh_resolve;
     uint64_t first_queued = 0, first_post = 0, last_post = 0;
     uint64_t first_complete = 0, last_complete = 0;
     uint64_t retries = 0, defers = 0;
@@ -103,12 +138,30 @@ inline std::string formatUbTaskTrace(
         if (item.state != UbSliceState::kCompleted) continue;
         queue.push_back(delta(item.queued_ns, item.dequeued_ns));
         prepare.push_back(delta(item.dequeued_ns, item.posted_ns));
+        if (item.submit_started_ns != 0) {
+            submit_build.push_back(
+                delta(item.created_ns, item.submit_started_ns));
+            submit_lock_wait.push_back(
+                delta(item.submit_started_ns, item.queue_locked_ns));
+            submit_enqueue.push_back(
+                delta(item.queue_locked_ns, item.enqueue_finished_ns));
+        }
         if (item.segments_ready_ns != 0) {
             if (item.route_metadata_ns != 0) {
                 route_metadata.push_back(
                     delta(item.dequeued_ns, item.route_metadata_ns));
                 local_location.push_back(
                     delta(item.route_metadata_ns, item.route_ready_ns));
+                if (item.segment_cache_ns != 0) {
+                    seg_cache.push_back(
+                        delta(item.dequeued_ns, item.segment_cache_ns));
+                    find_buffer.push_back(
+                        delta(item.segment_cache_ns, item.find_buffer_ns));
+                    decode.push_back(
+                        delta(item.find_buffer_ns, item.decode_metadata_ns));
+                    remote_order.push_back(
+                        delta(item.decode_metadata_ns, item.remote_order_ns));
+                }
             }
             prep_route.push_back(delta(item.dequeued_ns, item.route_ready_ns));
             prep_select.push_back(
@@ -120,6 +173,21 @@ inline std::string formatUbTaskTrace(
         }
         post.push_back(delta(item.posted_ns, item.post_returned_ns));
         device.push_back(delta(item.post_returned_ns, item.terminal_ns));
+        if (item.cqe_seen_ns != 0) {
+            // Device time ends where the poller observed the CQE; the rest is
+            // completion handling, measured stage by stage.
+            device.back() = delta(item.post_returned_ns, item.cqe_seen_ns);
+            cqh_wait.push_back(delta(item.cqe_seen_ns,
+                                     item.inflight_locked_ns));
+            cqh_inflight.push_back(delta(item.inflight_locked_ns,
+                                         item.inflight_erased_ns));
+            cqh_release.push_back(delta(item.inflight_erased_ns,
+                                        item.resources_released_ns));
+            cqh_rail.push_back(delta(item.resources_released_ns,
+                                     item.rail_recorded_ns));
+            cqh_resolve.push_back(delta(item.rail_recorded_ns,
+                                        item.terminal_ns));
+        }
         first_queued = first_queued == 0
                            ? item.queued_ns
                            : std::min(first_queued, item.queued_ns);
@@ -154,6 +222,7 @@ inline std::string formatUbTaskTrace(
             << us(latency.max_ns);
     };
     out << "ub_task_trace batch=0x" << std::hex << batch_id << std::dec
+        << " engine=tent trace_id=" << task.logTraceId()
         << " op=" << (task.request().opcode == Request::READ ? "read" : "write")
         << " bytes=" << snapshot.total_bytes
         << " slices=" << snapshot.total_slices << " slice_size=" << slice_size
@@ -171,14 +240,26 @@ inline std::string formatUbTaskTrace(
         << " last_complete_us=" << since_start(last_complete);
     write_latency("queue_us", queue);
     write_latency("prepare_us", prepare);
+    write_latency("sub_build_us", submit_build);
+    write_latency("sub_lock_wait_us", submit_lock_wait);
+    write_latency("sub_enqueue_us", submit_enqueue);
     write_latency("prep_route_us", prep_route);
     write_latency("prep_route_metadata_us", route_metadata);
+    write_latency("prep_seg_cache_us", seg_cache);
+    write_latency("prep_find_buf_us", find_buffer);
+    write_latency("prep_decode_us", decode);
+    write_latency("prep_remote_order_us", remote_order);
     write_latency("prep_local_location_us", local_location);
     write_latency("prep_select_us", prep_select);
     write_latency("prep_segments_us", prep_segments);
     write_latency("prep_commit_us", prep_commit);
     write_latency("post_us", post);
     write_latency("device_us", device);
+    write_latency("cqh_wait_us", cqh_wait);
+    write_latency("cqh_inflight_us", cqh_inflight);
+    write_latency("cqh_release_us", cqh_release);
+    write_latency("cqh_rail_us", cqh_rail);
+    write_latency("cqh_resolve_us", cqh_resolve);
     out << " retries=" << retries << " defers=" << defers << " rails=";
     bool first_rail = true;
     for (const auto& [rail, count] : rails) {
@@ -244,7 +325,8 @@ class UbTaskTraceReporter final {
             pending_.pop_front();
             const uint64_t dropped = std::exchange(dropped_, 0);
             lock.unlock();
-            LOG(INFO) << formatUbTaskTrace(*task, batch_id, nic_name);
+            mooncake::logging::ScopedTraceId log_context(task->logTraceId());
+            MC_LOG(INFO) << formatUbTaskTrace(*task, batch_id, nic_name);
             if (dropped != 0) {
                 LOG(WARNING) << "ub_task_trace dropped " << dropped
                              << " task(s): reporter queue is full";

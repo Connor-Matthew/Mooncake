@@ -2303,6 +2303,45 @@ TEST_F(TransportTest, CqMarkSuccessPublishesBatchFinishedTaskCount) {
     EXPECT_EQ(batch.active_completion_callbacks.load(), 0u);
 }
 
+TEST_F(TransportTest, UbTraceCompletesOnlyAfterSubmissionIsSealed) {
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 1;
+    Transport::TransferTask task;
+    task.batch_id = batch.id;
+    task.slice_count = 1;
+    task.ub_trace = std::make_shared<Transport::UbTaskTrace>();
+    task.ub_trace->created_ns = Transport::ubTraceNowNs();
+    Transport::Slice::unsealTaskSubmission(&task);
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 4;
+    slice.ub_trace = std::make_shared<Transport::UbSliceTrace>();
+    task.ub_trace->slices.push_back(slice.ub_trace);
+    slice.markSuccess();
+    EXPECT_TRUE(slice.ub_trace->success.load());
+    EXPECT_GE(slice.ub_trace->terminal_ns.load(), task.ub_trace->created_ns);
+    EXPECT_EQ(task.ub_trace->terminal_ns.load(), 0u);
+    Transport::Slice::sealTaskSubmission(&task);
+    EXPECT_GE(task.ub_trace->terminal_ns.load(),
+              slice.ub_trace->terminal_ns.load());
+    EXPECT_EQ(batch.finished_task_count.load(), 1u);
+    task.ub_trace.reset();
+}
+
+TEST_F(TransportTest, SliceCacheReleasesUbTraceBeforeReuseByOtherTransports) {
+    Transport::ThreadLocalSliceCache cache;
+    auto* slice = cache.allocate();
+    auto trace = std::make_shared<Transport::UbSliceTrace>();
+    slice->ub_trace = trace;
+    EXPECT_EQ(trace.use_count(), 2);
+    cache.deallocate(slice);
+    EXPECT_EQ(trace.use_count(), 1);
+    auto* reused = cache.allocate();
+    EXPECT_FALSE(reused->ub_trace);
+    cache.deallocate(reused);
+}
+
 TEST_F(TransportTest, SealPublishesWhenAllSlicesCompletedFirst) {
     Transport::BatchDesc batch{};
     batch.id = reinterpret_cast<Transport::BatchID>(&batch);

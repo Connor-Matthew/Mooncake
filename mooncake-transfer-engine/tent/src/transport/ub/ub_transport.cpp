@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -98,7 +99,7 @@ struct UbTransport::Impl {
                    std::shared_ptr<ControlService> control,
                    std::shared_ptr<Topology> topology,
                    std::shared_ptr<Config> config) {
-        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        std::lock_guard<std::shared_mutex> lock(lifecycle_mutex);
         if (installed.load(std::memory_order_acquire)) {
             return Status::InvalidArgument(
                 "UB transport has already been installed" LOC_MARK);
@@ -355,7 +356,9 @@ struct UbTransport::Impl {
         status = workers->start();
         if (!status.ok()) return failInstall(status);
 
-        if (ub::ubTaskTraceMinBytes() > 0) {
+        if (ub::ubTaskTraceMinBytes() > 0 &&
+            mooncake::logging::HiFreqLogSampleRate() > 0 &&
+            mooncake::logging::ShouldLog(google::INFO)) {
             trace_reporter =
                 std::make_shared<ub::UbTaskTraceReporter>(local_topology);
             LOG(INFO) << "UB task tracing enabled for requests of at least "
@@ -366,7 +369,7 @@ struct UbTransport::Impl {
     }
 
     Status uninstall() {
-        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        std::lock_guard<std::shared_mutex> lock(lifecycle_mutex);
         return shutdownUnlocked();
     }
 
@@ -607,7 +610,14 @@ struct UbTransport::Impl {
         return segment_generation.load(std::memory_order_relaxed);
     }
 
-    mutable std::mutex lifecycle_mutex;
+    // Exclusive (install/uninstall and buffer registration): install and
+    // uninstall are the only writers of the component graph, and the
+    // registration methods rely on this lock to serialize the adapter
+    // (un)registration that UbBufferManager performs outside its own lock.
+    // Shared (submit, cancel, stats): read-only access to the installed
+    // components so concurrent submit threads do not serialize on the
+    // lifecycle state; each component guards its own internals.
+    mutable std::shared_mutex lifecycle_mutex;
     std::shared_ptr<ub::UrmaAdapter> adapter;
     bool adapter_initialized{false};
     bool callback_installed{false};
@@ -669,7 +679,7 @@ Status UbTransport::uninstall() {
 
 Status UbTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     batch = nullptr;
-    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    std::shared_lock<std::shared_mutex> lock(impl_->lifecycle_mutex);
     if (!impl_->installed.load(std::memory_order_acquire)) {
         return Status::InvalidArgument(
             "UB transport is not installed" LOC_MARK);
@@ -710,7 +720,7 @@ Status UbTransport::submitTransferTasks(
     if (!ub_batch) {
         return Status::InvalidArgument("Invalid UB sub-batch" LOC_MARK);
     }
-    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    std::shared_lock<std::shared_mutex> lock(impl_->lifecycle_mutex);
     if (!impl_->installed.load(std::memory_order_acquire) || !impl_->workers) {
         return Status::InvalidArgument(
             "UB transport is not installed" LOC_MARK);
@@ -752,7 +762,12 @@ Status UbTransport::submitTransferTasks(
                     notify_progress(progress_batch_id);
                 }
             });
-        if (impl_->trace_reporter &&
+        const auto log_trace_id = mooncake::logging::CurrentTraceId();
+        const bool sampled =
+            mooncake::logging::ShouldSampleHiFreqLog(log_trace_id) &&
+            mooncake::logging::ShouldLog(google::INFO);
+        task->setLogContext(log_trace_id, sampled);
+        if (sampled && impl_->trace_reporter &&
             request.length >= ub::ubTaskTraceMinBytes()) {
             task->enableTrace();
         }
@@ -806,7 +821,7 @@ Status UbTransport::cancelTransferTask(SubBatchRef batch, int task_id) {
         static_cast<size_t>(task_id) >= ub_batch->task_list.size()) {
         return Status::InvalidArgument("Invalid UB task ID" LOC_MARK);
     }
-    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    std::shared_lock<std::shared_mutex> lock(impl_->lifecycle_mutex);
     if (!impl_->workers) {
         return Status::InvalidArgument("UB workers are not running" LOC_MARK);
     }
@@ -815,7 +830,7 @@ Status UbTransport::cancelTransferTask(SubBatchRef batch, int task_id) {
 
 Status UbTransport::addMemoryBuffer(BufferDesc& desc,
                                     const MemoryOptions& options) {
-    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    std::lock_guard<std::shared_mutex> lock(impl_->lifecycle_mutex);
     if (!impl_->buffers) {
         return Status::InvalidArgument(
             "UB transport is not installed" LOC_MARK);
@@ -829,7 +844,7 @@ Status UbTransport::addMemoryBuffer(BufferDesc& desc,
 
 Status UbTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
                                     const MemoryOptions& options) {
-    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    std::lock_guard<std::shared_mutex> lock(impl_->lifecycle_mutex);
     if (!impl_->buffers) {
         return Status::InvalidArgument(
             "UB transport is not installed" LOC_MARK);
@@ -842,7 +857,7 @@ Status UbTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
 }
 
 Status UbTransport::removeMemoryBuffer(BufferDesc& desc) {
-    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    std::lock_guard<std::shared_mutex> lock(impl_->lifecycle_mutex);
     if (!impl_->buffers) return Status::OK();
     auto status = impl_->buffers->removeBuffer(desc);
     if (status.ok()) {
@@ -852,7 +867,7 @@ Status UbTransport::removeMemoryBuffer(BufferDesc& desc) {
 }
 
 bool UbTransport::warmupMemory(void* addr, size_t length) {
-    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    std::lock_guard<std::shared_mutex> lock(impl_->lifecycle_mutex);
     if (!addr || length == 0 || !impl_->adapter || impl_->contexts.empty()) {
         return false;
     }
@@ -866,14 +881,14 @@ bool UbTransport::warmupMemory(void* addr, size_t length) {
 }
 
 double UbTransport::getEstimatedBandwidth() const {
-    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    std::shared_lock<std::shared_mutex> lock(impl_->lifecycle_mutex);
     if (!impl_->params.enable_bandwidth_estimation || !impl_->rails)
         return -1.0;
     return impl_->rails->aggregateBandwidth();
 }
 
 Status UbTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
-    std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+    std::shared_lock<std::shared_mutex> lock(impl_->lifecycle_mutex);
     if (!impl_->quota || !impl_->rails || !impl_->local_topology) {
         return Status::OK();
     }

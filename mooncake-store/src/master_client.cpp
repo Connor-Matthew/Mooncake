@@ -836,7 +836,9 @@ template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
     RoutedCallTiming* timing, const std::string& tenant_id,
     const std::string& key, uint32_t rpc_stat_key, Args... args) {
-    const auto t_routed_start = std::chrono::steady_clock::now();
+    const auto t_routed_start = timing
+                                    ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
     // 可选的 SpDiag 统计（首段 RPC = 发起 ylt 请求到拿到结果的时延，与
     // timing->rpc_first_us 同区间）：仅显式传入 PerfKey 的调用方记录
     // （Query 传 QUERY_RPC_CALL），默认 0 不记录——本模板被 7 个 routed
@@ -1251,9 +1253,12 @@ std::optional<std::string> MasterClient::ResolveSubmaster(
     const uint16_t slot = partition::KvHashMap::Compute(tenant_id_, key);
     auto submaster = partition_router_.ResolveSubmaster(slot);
     if (submaster) {
-        LOG(INFO) << "ResolveSubmaster hit: tenant=" << tenant_id_.value()
-                  << " key=" << key << " slot=" << slot
-                  << " submaster=" << *submaster;
+        if (mooncake::logging::ShouldSampleHiFreqLog(
+                mooncake::logging::CurrentTraceId()) &&
+            mooncake::logging::ShouldLog(google::INFO))
+            MC_LOG(INFO) << "ResolveSubmaster hit: tenant="
+                         << tenant_id_.value() << " key=" << key
+                         << " slot=" << slot << " submaster=" << *submaster;
     } else {
         LOG(WARNING) << "ResolveSubmaster miss: tenant=" << tenant_id_.value()
                      << " key=" << key << " slot=" << slot
@@ -1306,10 +1311,10 @@ ErrorCode MasterClient::SwitchToSubmaster(const std::string& tenant_id,
     }
 
     SwitchToSubmasterByAddress(*submaster);
-    // 每次单 key RPC 一条：随 QPS 刷屏，降为 VLOG(1)。
+    // 每次单 key RPC 一条：随 QPS 刷屏，降为 MC_VLOG(1)。
     // 命中延迟分布已由 CVM_ROUTE_SWITCH 打点覆盖，日志仅调试用。
-    VLOG(1) << "SwitchToSubmaster: tenant=" << tenant_id << " key=" << key
-            << " slot=" << slot << " -> submaster=" << *submaster;
+    MC_VLOG(1) << "SwitchToSubmaster: tenant=" << tenant_id << " key=" << key
+               << " slot=" << slot << " -> submaster=" << *submaster;
     pt_switch.End(0);
     return ErrorCode::OK;
 }
@@ -1369,7 +1374,7 @@ std::map<std::string, std::vector<size_t>> MasterClient::GroupKeysBySubmaster(
     }
 
     // 每批一条的分组描述日志会随 QPS 刷屏且拖慢热路径（含在 RouteGroup
-    // 打点窗口内），降为 VLOG(1)；描述串构建同样用 VLOG_IS_ON 门控，
+    // 打点窗口内），降为 MC_VLOG(1)；描述串构建同样用 VLOG_IS_ON 门控，
     // 关闭时零开销。
     if (VLOG_IS_ON(1)) {
         std::string group_desc;
@@ -1381,9 +1386,9 @@ std::map<std::string, std::vector<size_t>> MasterClient::GroupKeysBySubmaster(
                 (submaster.empty() ? std::string("<none>") : submaster);
             group_desc += ":" + std::to_string(indices.size());
         }
-        VLOG(1) << "GroupKeysBySubmaster: tenant=" << tenant_id
-                << " total_keys=" << keys.size() << " groups=" << groups.size()
-                << " [" << group_desc << "]";
+        MC_VLOG(1) << "GroupKeysBySubmaster: tenant=" << tenant_id
+                   << " total_keys=" << keys.size()
+                   << " groups=" << groups.size() << " [" << group_desc << "]";
     }
     pt_group.End(has_miss ? 2 : 0);
     return groups;
@@ -1626,7 +1631,11 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     // query 逐段归因（对齐 get_into_breakdown 风格）：switch（路由解析+建连）
     // 与 routed（RPC 含重试/退避）分段。与 invoke_rpc 内层的
     // master_rpc_client_breakdown（pool_lookup/rpc_call/result_get）互补。
-    const auto t0 = std::chrono::steady_clock::now();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+                                   mooncake::logging::CurrentTraceId()) &&
+                               mooncake::logging::ShouldLog(google::INFO);
+    const auto t0 = breakdown_log ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
     // SpDiag 统计：Query 三段下钻（与 query_rpc_breakdown trace 字段同区
     // 间）——RouteSwitch（路由解析/切换）、RpcCall（InvokeRoutedWithSlotRetry
     // 内首段 RPC，见其 rpc_stat_key 参数）、RpcTotal（路由+RPC 全程）。统
@@ -1642,24 +1651,29 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
         SpDiag::PerfPoint pt_switch(PerfKey::QUERY_ROUTE_SWITCH,
                                     SpDiag::PerfLevel::MODULE);
         pt_switch.Start();
-        const auto t_switch = std::chrono::steady_clock::now();
+        const auto t_switch = breakdown_log
+                                  ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
         switch_err = SwitchToSubmaster(tenant_id, object_key);
-        switch_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - t_switch)
-                        .count();
+        if (breakdown_log)
+            switch_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t_switch)
+                            .count();
         pt_switch.End(switch_err == ErrorCode::OK ? 0 : -1);
     }
     if (switch_err != ErrorCode::OK) {
         timer.LogResponse("error_code=", switch_err);
         pt_total.End(-1);
-        MC_LOG(INFO) << "query_rpc_breakdown key[" << object_key
-                     << "] switch_us[" << switch_us << "] rpc_first_us[0]"
-                     << "] total_us["
-                     << std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count()
-                     << "] retry_count[0] backoff_count[0] status[switch_fail_"
-                     << static_cast<int>(switch_err) << "]";
+        if (breakdown_log)
+            MC_LOG(INFO)
+                << "query_rpc_breakdown key[" << object_key << "] switch_us["
+                << switch_us << "] rpc_first_us[0]"
+                << "] total_us["
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count()
+                << "] retry_count[0] backoff_count[0] status[switch_fail_"
+                << static_cast<int>(switch_err) << "]";
         return tl::make_unexpected(switch_err);
     }
 
@@ -1667,32 +1681,36 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     auto result =
         InvokeRoutedWithSlotRetry<&WrappedMasterService::GetReplicaList,
                                   GetReplicaListResponse>(
-            &timing, tenant_id, object_key,
+            breakdown_log ? &timing : nullptr, tenant_id, object_key,
             /*rpc_stat_key=*/static_cast<uint32_t>(PerfKey::QUERY_RPC_CALL),
             object_key, tenant_id, trace_id, client_id_);
     timer.LogResponseExpected(result);
 
-    const char* status = "ok";
-    if (!result && timing.backoff_count > 0) {
-        status = "backoff_exhausted";
-    } else if (!result) {
-        status = "rpc_fail";
-    } else if (timing.retry_count > 0) {
-        status = "retry_ok";
-    } else if (timing.backoff_count > 0) {
-        status = "backoff_ok";
+    if (breakdown_log) {
+        const char* status = "ok";
+        if (!result && timing.backoff_count > 0) {
+            status = "backoff_exhausted";
+        } else if (!result) {
+            status = "rpc_fail";
+        } else if (timing.retry_count > 0) {
+            status = "retry_ok";
+        } else if (timing.backoff_count > 0) {
+            status = "backoff_ok";
+        }
+        MC_LOG(INFO) << "query_rpc_breakdown key[" << object_key
+                     << "] switch_us[" << switch_us << "] rpc_first_us["
+                     << timing.rpc_first_us << "] route_refresh_us["
+                     << timing.route_refresh_us << "] retry_switch_us["
+                     << timing.retry_switch_us << "] rpc_retry_us["
+                     << timing.rpc_retry_us << "] backoff_us["
+                     << timing.backoff_us << "] total_us["
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count()
+                     << "] retry_count[" << timing.retry_count
+                     << "] backoff_count[" << timing.backoff_count
+                     << "] status[" << status << "]";
     }
-    MC_LOG(INFO) << "query_rpc_breakdown key[" << object_key << "] switch_us["
-                 << switch_us << "] rpc_first_us[" << timing.rpc_first_us
-                 << "] route_refresh_us[" << timing.route_refresh_us
-                 << "] retry_switch_us[" << timing.retry_switch_us
-                 << "] rpc_retry_us[" << timing.rpc_retry_us << "] backoff_us["
-                 << timing.backoff_us << "] total_us["
-                 << std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - t0)
-                        .count()
-                 << "] retry_count[" << timing.retry_count << "] backoff_count["
-                 << timing.backoff_count << "] status[" << status << "]";
     pt_total.End(result ? 0 : -1);
     return result;
 }

@@ -2125,7 +2125,7 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
             return {};
         }
         if (!expected_checksum.has_value()) {
-            VLOG(1) << "object_checksum_absent key=" << object_key;
+            MC_VLOG(1) << "object_checksum_absent key=" << object_key;
             return {};
         }
 
@@ -2155,7 +2155,7 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
                                               const QueryResult& query_result,
                                               std::vector<Slice>& slices) {
         uint64_t path_bytes = 0;
-        if (StoreTransferTraceMinBytes() > 0) {
+        if (SampleStoreTransferTrace()) {
             for (const auto& slice : slices) path_bytes += slice.size;
         }
         ScopedTransferPathTrace path_trace("client_get", path_bytes);
@@ -2273,8 +2273,8 @@ ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
         }
         // Log cache hit statistics
         if (hot_cache_ && replica.is_memory_replica()) {
-            VLOG(1) << "Get completed: key=" << object_key
-                    << " cache_hit=" << (cache_used ? 1 : 0);
+            MC_VLOG(1) << "Get completed: key=" << object_key
+                       << " cache_hit=" << (cache_used ? 1 : 0);
         }
 
         pt_full.End(0);
@@ -2460,8 +2460,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         } else {
             for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
                 auto index = op.key_indexes[idx];
-                VLOG(1) << "Transfer completed successfully for key: "
-                        << object_keys[index];
+                MC_VLOG(1) << "Transfer completed successfully for key: "
+                           << object_keys[index];
 
                 // Release the cache block after transfer completes (memcpy is
                 // done)
@@ -2807,9 +2807,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 continue;
             }
 
-            VLOG(1) << "Submitted transfer for key " << key
-                    << " using strategy: "
-                    << static_cast<int>(future->strategy());
+            MC_VLOG(1) << "Submitted transfer for key " << key
+                       << " using strategy: "
+                       << static_cast<int>(future->strategy());
 
             pending_transfers.emplace_back(i, key, std::move(*future), replica,
                                            cache_used);
@@ -2845,8 +2845,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                                                group.replicas[j],
                                                group.cache_used[j]);
             }
-            VLOG(1) << "Submitted batch read of " << group.indexes.size()
-                    << " keys from " << endpoint;
+            MC_VLOG(1) << "Submitted batch read of " << group.indexes.size()
+                       << " keys from " << endpoint;
         }
 
         if (!dfs_read_requests.empty()) {
@@ -2920,11 +2920,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                                         static_cast<int64_t>(dfs_success_bytes),
                                         dfs_read_latency_us);
             }
-            VLOG(1) << "DFS batch read finished, action=batch_read, requested="
-                    << dfs_read_requests.size()
-                    << ", succeeded=" << dfs_success_keys
-                    << ", bytes=" << dfs_success_bytes
-                    << ", latency_us=" << dfs_read_latency_us;
+            MC_VLOG(1)
+                << "DFS batch read finished, action=batch_read, requested="
+                << dfs_read_requests.size()
+                << ", succeeded=" << dfs_success_keys
+                << ", bytes=" << dfs_success_bytes
+                << ", latency_us=" << dfs_read_latency_us;
         }
 
         // Wait for all transfers to complete
@@ -3143,7 +3144,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                            << " with error: " << static_cast<int>(result);
                 results[index] = tl::unexpected(result);
             } else {
-                VLOG(1) << "Transfer completed successfully for key: " << key;
+                MC_VLOG(1) << "Transfer completed successfully for key: "
+                           << key;
 
                 auto slices_it = slices.find(key);
                 if (slices_it == slices.end()) {
@@ -3386,11 +3388,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
 
         // Log overall cache hit statistics for the entire batch
         if (hot_cache_) {
-            VLOG(1) << "BatchGet completed: num_keys=" << object_keys.size()
-                    << " total_cache_hits=" << total_cache_hits;
+            MC_VLOG(1) << "BatchGet completed: num_keys=" << object_keys.size()
+                       << " total_cache_hits=" << total_cache_hits;
         } else {
-            VLOG(1) << "BatchGet completed for " << object_keys.size()
-                    << " keys";
+            MC_VLOG(1) << "BatchGet completed for " << object_keys.size()
+                       << " keys";
         }
         pt_full.End(std::any_of(results.begin(), results.end(),
                                 [](const auto& r) { return !r; })
@@ -3530,7 +3532,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         if (!start_result) {
             ErrorCode err = start_result.error();
             if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
-                VLOG(1) << "object_already_exists key=" << key;
+                MC_VLOG(1) << "object_already_exists key=" << key;
                 pt_full.End(0);
                 return {};
             }
@@ -3617,8 +3619,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             // replica failed first. Without this counter the write simply
             // disappears: no error is recorded against DFS and no I/O is
             // attempted. Counted per key, matching SubmitDfsWrites.
-            VLOG(1) << "Skipping DFS write, action=skip, key=" << key
-                    << ", reason=non_dfs_transfer_failed";
+            MC_VLOG(1) << "Skipping DFS write, action=skip, key=" << key
+                       << ", reason=non_dfs_transfer_failed";
             if (auto* dfs_metric = GetDfsMetricPtr()) {
                 dfs_metric->RecordSkippedWrites(1);
             }
@@ -3895,8 +3897,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             // allocated but a peer replica failed first, so no I/O is attempted
             // and no DFS error is recorded. Counted per key, matching
             // SubmitDfsWrites.
-            VLOG(1) << "Skipping DFS write, action=skip, key=" << key
-                    << ", reason=non_dfs_transfer_failed";
+            MC_VLOG(1) << "Skipping DFS write, action=skip, key=" << key
+                       << ", reason=non_dfs_transfer_failed";
             if (auto* dfs_metric = GetDfsMetricPtr()) {
                 dfs_metric->RecordSkippedWrites(1);
             }
@@ -3935,6 +3937,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             return tl::unexpected(finalize_decision.error);
         }
 
+        if (breakdown_log) finalize_end = std::chrono::steady_clock::now();
         // Success-side invalidation: a concurrent read between the pre-upsert
         // RemoveHotKey() and UpsertEnd could have read the old value and
         // submitted an async hot-cache fill with a still-valid token.
@@ -4406,8 +4409,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 }
                 // Operation continues to next stage - result remains
                 // INTERNAL_ERROR until fully successful
-                VLOG(1) << "Successfully started put for key " << op.key
-                        << " with " << op.replicas.size() << " replicas";
+                MC_VLOG(1) << "Successfully started put for key " << op.key
+                           << " with " << op.replicas.size() << " replicas";
             }
         }
 
@@ -4521,8 +4524,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                                         "requested replica policy");
                     continue;
                 }
-                VLOG(1) << "Successfully started upsert for key " << op.key
-                        << " with " << op.replicas.size() << " replicas";
+                MC_VLOG(1) << "Successfully started upsert for key " << op.key
+                           << " with " << op.replicas.size() << " replicas";
             }
         }
     }
@@ -4710,8 +4713,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 }
             }
 
-            VLOG(1) << "Submitted " << op.pending_transfers.size()
-                    << " transfers for key " << op.key;
+            MC_VLOG(1) << "Submitted " << op.pending_transfers.size()
+                       << " transfers for key " << op.key;
         }
 
         for (auto& [endpoint, group] : target_groups) {
@@ -4731,8 +4734,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                     ReplicaType::MEMORY, false, submit_result->share(),
                     std::vector<std::string>{endpoint});
             }
-            VLOG(1) << "Submitted batch write of " << group.ops.size()
-                    << " replicas to " << endpoint;
+            MC_VLOG(1) << "Submitted batch write of " << group.ops.size()
+                       << " replicas to " << endpoint;
         }
         const bool any_error =
             std::any_of(ops.begin(), ops.end(), [](const PutOperation& op) {
@@ -4780,14 +4783,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 }
             }
 
-            VLOG(1) << "Transfers finished for key " << op.key
-                    << ", success(mem="
-                    << op.transfer_summary.successful_memory_transfers
-                    << ", nof=" << op.transfer_summary.successful_nof_transfers
-                    << "), fail(mem="
-                    << op.transfer_summary.failed_memory_transfers
-                    << ", nof=" << op.transfer_summary.failed_nof_transfers
-                    << ")";
+            MC_VLOG(1) << "Transfers finished for key " << op.key
+                       << ", success(mem="
+                       << op.transfer_summary.successful_memory_transfers
+                       << ", nof="
+                       << op.transfer_summary.successful_nof_transfers
+                       << "), fail(mem="
+                       << op.transfer_summary.failed_memory_transfers
+                       << ", nof=" << op.transfer_summary.failed_nof_transfers
+                       << ")";
         }
         const bool any_error =
             std::any_of(ops.begin(), ops.end(), [](const PutOperation& op) {
@@ -4938,10 +4942,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                                      static_cast<int64_t>(success_bytes),
                                      write_latency_us);
         }
-        VLOG(1) << "DFS batch write finished, action=write, requested="
-                << requests.size() << ", succeeded=" << success_keys
-                << ", bytes=" << success_bytes
-                << ", latency_us=" << write_latency_us;
+        MC_VLOG(1) << "DFS batch write finished, action=write, requested="
+                   << requests.size() << ", succeeded=" << success_keys
+                   << ", bytes=" << success_bytes
+                   << ", latency_us=" << write_latency_us;
 
         for (auto& buffer : staging_buffers) {
             pinned_buffer_pool_->Release(std::move(buffer));
@@ -4969,8 +4973,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             // attempted.
             if (!NonDfsTransfersSucceeded(op.transfer_summary)) {
                 ++skipped_writes;
-                VLOG(1) << "Skipping DFS write, action=skip, key=" << op.key
-                        << ", reason=non_dfs_transfer_failed";
+                MC_VLOG(1) << "Skipping DFS write, action=skip, key=" << op.key
+                           << ", reason=non_dfs_transfer_failed";
                 continue;
             }
 
@@ -5305,8 +5309,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                         ops[op_idx].SetSuccess();
                         finalized_keys.emplace_back(
                             successful_object_metas[i].key);
-                        VLOG(1) << "Successfully completed upsert for key "
-                                << successful_object_metas[i].key;
+                        MC_VLOG(1) << "Successfully completed upsert for key "
+                                   << successful_object_metas[i].key;
                     }
                 }
             }
@@ -5406,8 +5410,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 }
             } else {
                 ++succeeded_count;
-                VLOG(1) << "Operation for key " << op.key
-                        << " completed successfully";
+                MC_VLOG(1) << "Operation for key " << op.key
+                           << " completed successfully";
             }
         }
         if (no_available_handle_count > 0) {
@@ -5450,8 +5454,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 continue;
             }
             op.slices = std::move(*staged_slices);
-            VLOG(1) << "Staged write buffers for non-local replica, key="
-                    << op.key;
+            MC_VLOG(1) << "Staged write buffers for non-local replica, key="
+                       << op.key;
         }
     }
 
@@ -6432,7 +6436,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                                                      retry_left - 1);
                     });
                 } catch (const std::runtime_error& e) {
-                    VLOG(1)
+                    MC_VLOG(1)
                         << "Skip graceful unmount retry enqueue: " << e.what();
                 }
             } else {
@@ -6666,7 +6670,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 LOG(ERROR) << "Failed to submit transfer operation";
                 return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
             }
-            VLOG(1) << "Using transfer strategy: " << future->strategy();
+            MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
             auto result = future->get();
             if (result != ErrorCode::OK) {
                 LOG(ERROR) << "Transfer failed, error code is " << result;
@@ -6861,7 +6865,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                     }
                 }
                 if (dual_delivery_count > 0 || unresolved_count > 0) {
-                    VLOG(1)
+                    MC_VLOG(1)
                         << "NotifyOffloadSuccessRouted: tasks=" << tasks.size()
                         << " dual_delivery=" << dual_delivery_count
                         << " unresolved=" << unresolved_count;
@@ -7444,9 +7448,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                                     if (!evict_results[i]) {
                                         if (evict_results[i].error() ==
                                             ErrorCode::OBJECT_NOT_FOUND) {
-                                            VLOG(1) << "Master no longer "
-                                                       "tracks evicted key: "
-                                                    << evicted_keys[i];
+                                            MC_VLOG(1) << "Master no longer "
+                                                          "tracks evicted key: "
+                                                       << evicted_keys[i];
                                             continue;
                                         }
                                         LOG(WARNING)
@@ -7515,7 +7519,7 @@ tl::expected<TransferFuture, ErrorCode> Client::SubmitSingleTransfer(
         return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
-    VLOG(1) << "Using transfer strategy: " << future->strategy();
+    MC_VLOG(1) << "Using transfer strategy: " << future->strategy();
 
     return std::move(*future);
 }
@@ -7526,7 +7530,7 @@ ErrorCode Client::TransferData(
     std::set<std::string>* failed_endpoints,
     const std::vector<VSegmentLayoutEntry>* layouts) {
     uint64_t path_bytes = 0;
-    if (StoreTransferTraceMinBytes() > 0) {
+    if (SampleStoreTransferTrace()) {
         for (const auto& slice : slices) path_bytes += slice.size;
     }
     ScopedTransferPathTrace path_trace("client_transfer_data", path_bytes);
@@ -7932,7 +7936,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
                         return ErrorCode::TRANSFER_FAIL;
                     }
 
-                    VLOG(1)
+                    MC_VLOG(1)
                         << "Using transfer strategy: " << future->strategy();
 
                     return future->get();
@@ -8011,7 +8015,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
                         return ErrorCode::TRANSFER_FAIL;
                     }
 
-                    VLOG(1)
+                    MC_VLOG(1)
                         << "Using transfer strategy: " << future->strategy();
                     return future->get();
                 }
@@ -8120,10 +8124,10 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
                             1, static_cast<int64_t>(desc.object_size),
                             read_latency_us);
                     }
-                    VLOG(1) << "DFS read finished, action=read, key=" << key
-                            << ", offset=" << desc.offset
-                            << ", size=" << desc.object_size
-                            << ", latency_us=" << read_latency_us;
+                    MC_VLOG(1) << "DFS read finished, action=read, key=" << key
+                               << ", offset=" << desc.offset
+                               << ", size=" << desc.object_size
+                               << ", latency_us=" << read_latency_us;
                     return ErrorCode::OK;
                 }
 
@@ -8152,7 +8156,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
                             << key << ", replica_id=" << replica_descriptor.id
                             << ", error=" << toString(evicted.error());
                     } else if (!*evicted) {
-                        VLOG(1)
+                        MC_VLOG(1)
                             << "KVCS replica was replaced before miss "
                                "reconciliation, key="
                             << key << ", replica_id=" << replica_descriptor.id;
@@ -8499,9 +8503,10 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
                         }
                         auto ping_result = master_client_.PingTo(addr);
                         if (!ping_result) {
-                            VLOG(1) << "HeartbeatAllSubmasters: ping submaster "
-                                       "failed addr="
-                                    << addr << " error=" << ping_result.error();
+                            MC_VLOG(1)
+                                << "HeartbeatAllSubmasters: ping submaster "
+                                   "failed addr="
+                                << addr << " error=" << ping_result.error();
                             continue;
                         }
                         if (ping_result.value().client_status ==

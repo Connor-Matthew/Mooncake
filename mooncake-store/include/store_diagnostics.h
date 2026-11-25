@@ -26,12 +26,65 @@ inline uint64_t StoreTransferTraceMinBytes() {
     return threshold;
 }
 
+inline bool SampleStoreTransferTrace() {
+    return StoreTransferTraceMinBytes() > 0 &&
+           logging::ShouldSampleHiFreqLog(logging::CurrentTraceId()) &&
+           logging::ShouldLog(google::INFO);
+}
+
+// Synchronous get_buffer call context. TransferFuture::wait records the
+// observed transfer boundaries on the calling thread, never on a CQ thread.
+class ScopedReadTransferTrace {
+   public:
+    using Clock = std::chrono::steady_clock;
+    ScopedReadTransferTrace(uint64_t bytes, Clock::time_point start)
+        : previous_(current_),
+          start_(start),
+          enabled_(SampleStoreTransferTrace() &&
+                   bytes >= StoreTransferTraceMinBytes()) {
+        current_ = enabled_ ? this : nullptr;
+    }
+    ~ScopedReadTransferTrace() { current_ = previous_; }
+    ScopedReadTransferTrace(const ScopedReadTransferTrace&) = delete;
+    ScopedReadTransferTrace& operator=(const ScopedReadTransferTrace&) = delete;
+    static void record(Clock::time_point start, Clock::time_point done) {
+        if (!current_) return;
+        ++current_->transfers_;
+        current_->submit_ = start;
+        current_->done_ = done;
+    }
+    bool valid(Clock::time_point end) const {
+        return enabled_ && transfers_ == 1 && start_ <= submit_ &&
+               submit_ <= done_ && done_ <= end;
+    }
+    double beforeUs(Clock::time_point end) const {
+        return valid(end) ? us(submit_ - start_) : -1.0;
+    }
+    double afterUs(Clock::time_point end) const {
+        return valid(end) ? us(end - done_) : -1.0;
+    }
+    double transferUs(Clock::time_point end) const {
+        return valid(end) ? us(done_ - submit_) : -1.0;
+    }
+    size_t transfers() const { return transfers_; }
+
+   private:
+    static double us(Clock::duration duration) {
+        return std::chrono::duration<double, std::micro>(duration).count();
+    }
+    inline static thread_local ScopedReadTransferTrace* current_ = nullptr;
+    ScopedReadTransferTrace* previous_;
+    Clock::time_point start_, submit_{}, done_{};
+    bool enabled_;
+    size_t transfers_ = 0;
+};
+
 class ScopedTransferPathTrace {
    public:
     ScopedTransferPathTrace(const char* scope, uint64_t bytes)
         : scope_(scope),
           bytes_(bytes),
-          enabled_(StoreTransferTraceMinBytes() > 0 &&
+          enabled_(SampleStoreTransferTrace() &&
                    bytes >= StoreTransferTraceMinBytes()) {
         if (enabled_) {
             trace_id_ = logging::CurrentTraceId();
@@ -101,7 +154,8 @@ inline bool ShouldSampleStoreTransferDiagnostics(uint64_t trace_id) {
         return normalized == "1" || normalized == "true" ||
                normalized == "yes" || normalized == "on";
     }();
-    return enabled && mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    return enabled && mooncake::logging::ShouldSampleHiFreqLog(trace_id) &&
+           mooncake::logging::ShouldLog(google::INFO);
 }
 
 }  // namespace mooncake

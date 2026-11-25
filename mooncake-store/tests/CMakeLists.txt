@@ -1,5 +1,12 @@
 set(MOONCAKE_STORE_TESTS_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
+add_executable(store_diagnostics_test store_diagnostics_test.cpp)
+target_include_directories(store_diagnostics_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_link_libraries(store_diagnostics_test PRIVATE mooncake_common gtest gtest_main pthread)
+add_test(NAME store_diagnostics_test COMMAND store_diagnostics_test)
+set_tests_properties(store_diagnostics_test PROPERTIES
+  ENVIRONMENT "MC_HIFREQ_LOG_SAMPLE_RATE=1;MC_TRANSFER_TRACE_MIN_BYTES=1")
+
 function(add_store_test name)
   add_executable(${name} ${ARGN})
   target_include_directories(${name} PRIVATE ${MOONCAKE_STORE_TESTS_SOURCE_DIR})
