@@ -102,6 +102,12 @@ class VSegmentService final {
                             const std::string& operation_id);
     ErrorCode ReleaseObject(const VSegmentDescriptor& replica,
                             const std::string& object_id);
+    // Renames a committed allocation without touching its physical range: the
+    // lease-holding old version keeps serving reads under the new id while
+    // the replacement commits under the original allocation_id.
+    ErrorCode RekeyObject(const VSegmentDescriptor& replica,
+                          const std::string& old_allocation_id,
+                          const std::string& new_allocation_id);
 
     ErrorCode LoadView(const std::string& partition_id,
                        const std::string& vsegment_id, VSegmentView* view,

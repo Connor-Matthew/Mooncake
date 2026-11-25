@@ -98,6 +98,14 @@ class LogicalRangeAllocator {
     // a terminal operation outcome, so the same operation id may be retried.
     ErrorCode CancelReservation(const std::string& operation_id);
     ErrorCode Release(const std::string& allocation_id, LogicalRange range);
+    // Renames a committed allocation so a replacement version of the same
+    // object can commit under the original allocation_id while the old
+    // version's range is still held for lease-holding readers. The completed
+    // operation records referencing the old id are renamed too, so a stale
+    // operation replay cannot resolve the retired id. Physical range and
+    // free space are unchanged.
+    ErrorCode RekeyAllocation(const std::string& old_allocation_id,
+                              const std::string& new_allocation_id);
     // O(1) lookup used to validate an expected range before Commit, replacing
     // a full Snapshot(). Priority matches the former snapshot scan exactly:
     // an outstanding reservation wins, otherwise a COMMITTED completion

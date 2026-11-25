@@ -222,6 +222,13 @@ class VSegmentManager {
                             const std::string& allocation_id,
                             LogicalRange range,
                             uint64_t expected_route_epoch = 0);
+    // Renames a committed allocation in place (see LogicalRangeAllocator::
+    // RekeyAllocation). Used when a lease-holding old version must keep its
+    // range while the replacement commits under the original allocation_id.
+    ErrorCode RekeyObject(const std::string& vsegment_id,
+                          const std::string& old_allocation_id,
+                          const std::string& new_allocation_id,
+                          uint64_t expected_route_epoch = 0);
     ErrorCode ForgetOperation(const std::string& operation_id);
     ErrorCode TransitionLifecycle(const std::string& vsegment_id,
                                   Lifecycle target);

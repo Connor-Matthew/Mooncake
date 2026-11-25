@@ -175,6 +175,30 @@ bool LogicalRangeAllocator::OverlapsFreeOrReserved(LogicalRange range) const {
     return false;
 }
 
+ErrorCode LogicalRangeAllocator::RekeyAllocation(
+    const std::string& old_allocation_id,
+    const std::string& new_allocation_id) {
+    if (old_allocation_id.empty() || new_allocation_id.empty() ||
+        old_allocation_id == new_allocation_id) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto allocation = committed_allocations_.find(old_allocation_id);
+    if (allocation == committed_allocations_.end())
+        return ErrorCode::OBJECT_NOT_FOUND;
+    if (committed_allocations_.count(new_allocation_id) != 0)
+        return ErrorCode::OBJECT_ALREADY_EXISTS;
+    LogicalRange range = allocation->second;
+    committed_allocations_.erase(allocation);
+    committed_allocations_.emplace(new_allocation_id, range);
+    for (auto& [operation_id, completed] : completed_operations_) {
+        if (completed.allocation_id == old_allocation_id) {
+            completed.allocation_id = new_allocation_id;
+        }
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode LogicalRangeAllocator::Release(const std::string& allocation_id,
                                          LogicalRange range) {
     std::lock_guard<std::mutex> lock(mutex_);
