@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -192,6 +193,14 @@ class UbWorkers final {
     void deferPending(const PendingSlice& pending);
     void processPending(const PendingSlice& pending, size_t worker_index);
     Status buildRoute(const PendingSlice& pending, Route& route);
+    // Parsed-route-metadata cache: entries are keyed by the identity of the
+    // pinned SegmentDesc snapshot plus the BufferDesc inside it and stay
+    // valid exactly as long as that snapshot object lives (see members
+    // below). `pin` is the snapshot reference held by withCachedSegment().
+    [[nodiscard]] std::shared_ptr<const UbBufferMetadata> cachedRouteMetadata(
+        const SegmentDescRef& pin, const BufferDesc& buffer) const;
+    void storeRouteMetadata(const SegmentDescRef& pin, const BufferDesc& buffer,
+                            std::shared_ptr<const UbBufferMetadata> metadata);
     Status chooseAndResolveEndpoint(const PendingSlice& pending, Route& route,
                                     std::shared_ptr<UbEndpoint>& endpoint,
                                     UbPostPath& path,
@@ -241,6 +250,38 @@ class UbWorkers final {
     // retrying cleanup, so a second poller must not observe a false empty
     // barrier and reactivate the context early.
     mutable std::mutex local_device_failure_mutex_;
+
+    // Decoded UB buffer metadata cache. The encoded metadata inside a
+    // published SegmentDesc snapshot is immutable, so the parsed form can be
+    // shared across slices until the snapshot itself is dropped. Keys are
+    // (snapshot object, buffer object) pairs and each entry keeps a weak
+    // handle to its snapshot: a lookup only hits while the weak handle still
+    // resolves to the pinned snapshot object, which makes the validation
+    // immune to address reuse after a snapshot is freed.
+    struct RouteMetadataKey {
+        const SegmentDesc* segment{nullptr};
+        const BufferDesc* buffer{nullptr};
+        bool operator==(const RouteMetadataKey&) const = default;
+    };
+    struct RouteMetadataKeyHash {
+        size_t operator()(const RouteMetadataKey& key) const noexcept {
+            const auto segment = std::hash<const SegmentDesc*>{}(key.segment);
+            const auto buffer = std::hash<const BufferDesc*>{}(key.buffer);
+            return segment ^ (buffer + 0x9e3779b97f4a7c15ULL +
+                             (segment << 6) + (segment >> 2));
+        }
+    };
+    struct RouteMetadataEntry {
+        std::weak_ptr<SegmentDesc> snapshot;
+        std::shared_ptr<const UbBufferMetadata> metadata;
+    };
+    mutable std::shared_mutex route_metadata_mutex_;
+    std::unordered_map<RouteMetadataKey, RouteMetadataEntry,
+                       RouteMetadataKeyHash>
+        route_metadata_cache_;
+    // Inserts since the last prune sweep; amortizes cleanup of entries whose
+    // snapshot was dropped (e.g. by a segment cache invalidation).
+    size_t route_metadata_inserts_{0};
 
     mutable std::mutex queue_mutex_;
     std::condition_variable queue_cv_;

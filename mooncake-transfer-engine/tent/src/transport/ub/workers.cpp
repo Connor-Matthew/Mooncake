@@ -55,6 +55,10 @@ constexpr uint64_t kRailProbeEndpointGeneration = 1;
 // only one candidate.
 constexpr size_t kMinResolvedCandidates = 2;
 
+// Route-metadata cache inserts between prune sweeps of expired snapshot
+// entries; see UbWorkers::storeRouteMetadata().
+constexpr size_t kRouteMetadataPruneInterval = 64;
+
 bool sliceChipDiagnosticsEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("MC_UB_SLICE_CHIP_DIAG");
@@ -82,8 +86,10 @@ inline void cpuRelax() {
 struct UbWorkers::Route {
     SegmentDescRef pin;
     BufferDesc* remote_buffer{nullptr};
-    // Decoded once per slice and reused by device ordering and the import.
-    UbBufferMetadata metadata;
+    // Parsed once per pinned segment snapshot and shared through the
+    // route-metadata cache in buildRoute(); slices never re-decode the
+    // encoded JSON themselves.
+    std::shared_ptr<const UbBufferMetadata> metadata;
     std::vector<Topology::NicID> remote_devices;
     std::string local_location{kWildcardLocation};
 };
@@ -735,14 +741,26 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
                 return Status::NeedsRefreshCache(
                     "UB target buffer has no transport metadata" LOC_MARK);
             }
-            UbBufferMetadata metadata;
-            auto status = decodeBufferMetadata(attr->second, metadata);
-            if (traced) decode_metadata_ns = steadyNowNs();
-            if (!status.ok()) return status;
+            // The encoded metadata is immutable inside the pinned snapshot,
+            // so reuse the parsed form until the snapshot itself is dropped.
+            // The first slice per (snapshot, buffer) pays the JSON decode;
+            // every later slice takes a shared-lock hash lookup instead.
+            std::shared_ptr<const UbBufferMetadata> metadata =
+                cachedRouteMetadata(route.pin, *buffer);
+            if (!metadata) {
+                auto parsed = std::make_shared<UbBufferMetadata>();
+                auto status = decodeBufferMetadata(attr->second, *parsed);
+                if (traced) decode_metadata_ns = steadyNowNs();
+                if (!status.ok()) return status;
+                metadata = std::move(parsed);
+                storeRouteMetadata(route.pin, *buffer, metadata);
+            } else if (traced) {
+                decode_metadata_ns = steadyNowNs();
+            }
             route.remote_buffer = buffer;
             route.metadata = std::move(metadata);
             route.remote_devices =
-                orderedRemoteDevices(*segment, *buffer, route.metadata);
+                orderedRemoteDevices(*segment, *buffer, *route.metadata);
             if (traced) remote_order_ns = steadyNowNs();
             if (route.remote_devices.empty()) {
                 return Status::DeviceNotFound(
@@ -755,6 +773,46 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
                                        decode_metadata_ns, remote_order_ns);
     }
     return status;
+}
+
+std::shared_ptr<const UbBufferMetadata> UbWorkers::cachedRouteMetadata(
+    const SegmentDescRef& pin, const BufferDesc& buffer) const {
+    std::shared_lock<std::shared_mutex> lock(route_metadata_mutex_);
+    auto it = route_metadata_cache_.find({pin.get(), &buffer});
+    if (it == route_metadata_cache_.end()) return nullptr;
+    // Weak-handle validation: serve the entry only while the snapshot it was
+    // decoded from is still the pinned object. A recycled segment address
+    // can never pass here because the weak handle resolves to the exact
+    // allocation, and that allocation is kept alive by the pin itself.
+    auto snapshot = it->second.snapshot.lock();
+    if (!snapshot || snapshot.get() != pin.get()) return nullptr;
+    return it->second.metadata;
+}
+
+void UbWorkers::storeRouteMetadata(
+    const SegmentDescRef& pin, const BufferDesc& buffer,
+    std::shared_ptr<const UbBufferMetadata> metadata) {
+    std::unique_lock<std::shared_mutex> lock(route_metadata_mutex_);
+    // Overwrite unconditionally: concurrent posters parsed the same
+    // immutable string, and this also refreshes an entry raced in after its
+    // snapshot died.
+    auto& entry = route_metadata_cache_[{pin.get(), &buffer}];
+    entry.snapshot = pin;
+    entry.metadata = std::move(metadata);
+    // Amortized prune of entries whose snapshot has expired. Entries are
+    // bounded (one per live buffer per snapshot), so a full sweep every
+    // kRouteMetadataPruneInterval inserts stays cheap.
+    if (++route_metadata_inserts_ >= kRouteMetadataPruneInterval) {
+        route_metadata_inserts_ = 0;
+        for (auto it = route_metadata_cache_.begin();
+             it != route_metadata_cache_.end();) {
+            if (it->second.snapshot.expired()) {
+                it = route_metadata_cache_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 }
 
 std::string UbWorkers::localLocationOf(const PendingSlice& pending) const {
@@ -978,7 +1036,7 @@ Status UbWorkers::chooseAndResolveEndpoint(
         auto context = context_by_topology_id_.at(rail.local_id);
         EndpointResolveRequest request{context, pending.target_id,
                                        route.pin.get(), rail.remote_id,
-                                       route.metadata.generation};
+                                       route.metadata->generation};
         std::shared_ptr<UbEndpoint> candidate_endpoint;
         auto status = endpoint_resolver_(request, candidate_endpoint);
         if (!status.ok() || !candidate_endpoint ||
@@ -1113,7 +1171,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
     ImportedSegmentRef remote;
     status = buffers_->importRemote(pending.target_id, path.local_topology_id,
                                     path.remote_device_id, *route.remote_buffer,
-                                    route.metadata, pending.opcode,
+                                    *route.metadata, pending.opcode,
                                     pending.slice->spec().remote_address,
                                     pending.slice->spec().length, remote);
     if (!status.ok()) {
@@ -1184,8 +1242,8 @@ void UbWorkers::processPending(const PendingSlice& pending,
     work.local_segment = local.segment;
     work.remote_segment = remote.segment;
     const auto remote_chip = chipForRange(
-        route.metadata.chip_regions,
-        work.remote_address - route.metadata.base, work.length);
+        route.metadata->chip_regions,
+        work.remote_address - route.metadata->base, work.length);
     // Keep classic bondp semantics: electrical links select the peer chip at
     // both ends; optical links select local/peer respectively, also for READ.
     const auto binding = selectChipBinding(params_.electrical_network,
@@ -1473,11 +1531,27 @@ void UbWorkers::releaseInflight(const std::shared_ptr<Inflight>& inflight) {
                          expected, true, std::memory_order_acq_rel)) {
         return;
     }
+    // Trace split of the release phase: the stamps below subdivide
+    // cqh_release into the endpoint-accounting and quota stages; the notify
+    // tail is closed by the caller's noteResourcesReleased. Gated exactly
+    // like the other trace checkpoints, so MC_HIFREQ_LOG_SAMPLE_RATE=0
+    // keeps this path free of clock reads.
+    const bool traced = ubTaskTraceClocksEnabled() &&
+                        inflight->pending.task &&
+                        inflight->pending.task->traceEnabled();
     if (inflight->endpoint) {
         inflight->endpoint->releaseOutstanding(
             inflight->pending.slice->spec().length);
+        if (traced) {
+            inflight->pending.slice->noteEndpointReleased(steadyNowNs());
+        }
     }
-    if (inflight->quota.valid()) (void)quota_->release(inflight->quota);
+    if (inflight->quota.valid()) {
+        (void)quota_->release(inflight->quota);
+        if (traced) {
+            inflight->pending.slice->noteQuotaReleased(steadyNowNs());
+        }
+    }
     queue_cv_.notify_all();
 }
 
