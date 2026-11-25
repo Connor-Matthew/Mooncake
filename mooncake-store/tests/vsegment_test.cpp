@@ -590,6 +590,91 @@ TEST(VSegmentConfigTest, ValidatesPublishedConfigAgainstSegmentGeometry) {
               ErrorCode::INVALID_PARAMS);
 }
 
+// 成员槽计数：N 个 vsegment 各需 member_count 个互不相同的成员段、每
+// 成员切一个 member_extent_size；同一段跨 vsegment 可复用（段级槽数上限
+// min(N, Σ quota.length / member_extent_size)）。旧的「每段 >= N *
+// member_extent_size」仅在段数恰等于 member_count 时等价，冗余段场景
+// 过严（分配器允许不同 vsegment 选用不同成员段）。
+TEST(VSegmentConfigTest, PublishedConfigCountsMemberSlots) {
+    auto profile = Profile();  // M=2, member_extent_size=256
+    profile.initial_vsegment_count = 2;
+    PartitionVSegmentConfig config;
+    config.partition_id = "partition-1";
+    config.profile_name = "default";
+    config.config_generation = 1;
+    config.initial_vsegment_count = 2;
+
+    // 5 段 × 256B：每段 1 槽，总 5 槽 >= N*M=4 → 通过（旧校验：每段
+    // 256 < 512 → 拒绝）。两个 vsegment 可选用不同成员段。
+    std::vector<PartitionPSegmentQuota> quotas;
+    std::vector<PSegmentGeometry> segments;
+    for (int i = 0; i < 5; ++i) {
+        const auto id = "segment-" + std::to_string(i);
+        quotas.push_back({id, 0, 256});
+        segments.push_back({id, 256, 0, 8, "DRAM", true, true, ""});
+    }
+    config.quotas = quotas;
+    EXPECT_EQ(ValidatePublishedConfig({profile}, {config}, segments, {}),
+              ErrorCode::OK);
+
+    // 3 段 × 256B：3 槽 < 4 → 拒绝，detail 报实际槽数缺口。
+    config.quotas = {quotas[0], quotas[1], quotas[2]};
+    std::string detail;
+    EXPECT_EQ(ValidatePublishedConfig({profile}, {config},
+                                      {segments[0], segments[1], segments[2]},
+                                      {}, &detail),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_NE(detail.find("member slots"), std::string::npos);
+
+    // 单段 1024B：floor 槽数 4，但段级槽数封顶 N=2 → 2 槽 < 4 → 拒绝
+    //（单 vsegment 需 2 个不同成员段，无法全落在一个段上）。
+    config.quotas = {{"segment-x", 0, 1024}};
+    EXPECT_EQ(ValidatePublishedConfig(
+                  {profile}, {config},
+                  {{"segment-x", 1024, 0, 8, "DRAM", true, true, ""}}, {},
+                  &detail),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_NE(detail.find("member slots"), std::string::npos);
+}
+
+TEST(VSegmentConfigTest, QuotaSnapshotCountsMemberSlots) {
+    auto profile = Profile();  // M=2, member_extent_size=256
+    profile.initial_vsegment_count = 2;
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {profile};
+
+    // 5 段 × 256B：每段 1 槽，总 5 槽 >= N*M=4 → 通过（旧校验拒绝）。
+    std::vector<PSegmentExtent> extents;
+    std::vector<PSegmentGeometry> segments;
+    for (int i = 0; i < 5; ++i) {
+        const auto id = "segment-" + std::to_string(i);
+        extents.push_back({id, 0, 256});
+        segments.push_back({id, 256, 0, 8, "DRAM", true, true, ""});
+    }
+    snapshot.quotas = {{"partition-1", "default", "DRAM", extents}};
+    EXPECT_EQ(ValidateQuotaSnapshot(snapshot, segments),
+              ErrorCode::OK);
+
+    // 3 槽 < 4 → 拒绝。
+    snapshot.quotas.front().extents = {extents[0], extents[1], extents[2]};
+    std::string detail;
+    EXPECT_EQ(ValidateQuotaSnapshot(
+                  snapshot, {segments[0], segments[1], segments[2]}, &detail),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_NE(detail.find("member slots"), std::string::npos);
+
+    // 单段 1024B：floor 槽数 4，段级封顶 N=2 → 2 槽 < 4 → 拒绝。
+    snapshot.quotas.front().extents = {{"segment-x", 0, 1024}};
+    EXPECT_EQ(ValidateQuotaSnapshot(
+                  snapshot, {{"segment-x", 1024, 0, 8, "DRAM", true, true, ""}},
+                  &detail),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_NE(detail.find("member slots"), std::string::npos);
+}
+
 TEST(PartitionQuotaPlannerTest, SplitsEveryMediumAcrossAllPartitions) {
     PartitionQuotaPlanRequest request;
     request.config_generation = 7;

@@ -226,13 +226,14 @@ ErrorCode ValidatePublishedConfig(
             return Invalid("unknown profile: " + partition.profile_name,
                            detail);
         const auto& layout = profile->second;
-        if (layout.member_extent_size >
-            std::numeric_limits<uint64_t>::max() /
-                partition.initial_vsegment_count)
-            return Invalid("initial allocation size overflows", detail);
-        const uint64_t initial_bytes =
-            layout.member_extent_size * partition.initial_vsegment_count;
-        std::set<std::string> eligible_segments;
+        // 成员槽计数（语义同 ValidateQuotaSnapshot，对齐 Allocate 的实际
+        // 分配能力）：initial_vsegment_count 个 vsegment 各需 member_count
+        // 个互不相同的成员段、每成员切一个 member_extent_size；同一段跨
+        // vsegment 可复用，段级槽数上限为
+        // min(N, Σ floor(quota.length / member_extent_size))。旧的
+        // 「每段 >= N * extent」仅在段数恰等于 member_count 时等价，
+        // 冗余段场景过严（分配器允许不同 vsegment 选用不同成员段）。
+        std::unordered_map<std::string, uint64_t> member_slots;
         for (const auto& quota : partition.quotas) {
             auto geometry = segment_by_id.find(quota.segment_id);
             if (geometry == segment_by_id.end())
@@ -250,13 +251,23 @@ ErrorCode ValidatePublishedConfig(
                 layout.required_medium != segment.medium)
                 return Invalid("psegment medium does not match profile",
                                detail);
-            if (quota.length >= initial_bytes)
-                eligible_segments.insert(quota.segment_id);
+            member_slots[quota.segment_id] +=
+                quota.length / layout.member_extent_size;
             all_quotas[quota.segment_id].push_back(
                 {partition.partition_id, quota.base_offset, quota.length});
         }
-        if (eligible_segments.size() < layout.member_count)
-            return Invalid("Partition cannot satisfy initial vsegment count",
+        uint64_t total_slots = 0;
+        for (const auto& [segment_id, slots] : member_slots)
+            total_slots += std::min<uint64_t>(slots,
+                                              partition.initial_vsegment_count);
+        const uint64_t required_slots =
+            static_cast<uint64_t>(partition.initial_vsegment_count) *
+            layout.member_count;
+        if (total_slots < required_slots)
+            return Invalid("Partition member slots " +
+                               std::to_string(total_slots) + " < required " +
+                               std::to_string(required_slots) +
+                               " for initial vsegments",
                            detail);
     }
     for (auto& [segment, quotas] : all_quotas) {
@@ -398,15 +409,15 @@ ErrorCode ValidateQuotaSnapshot(
         if (quota.medium != profile->second.required_medium)
             return Invalid("quota medium does not match profile", detail);
 
-        std::set<std::string> members;
-        uint32_t eligible = 0;
-        if (profile->second.member_extent_size >
-            std::numeric_limits<uint64_t>::max() /
-                profile->second.initial_vsegment_count)
-            return Invalid("initial profile allocation overflows", detail);
-        const uint64_t initial_bytes =
-            profile->second.member_extent_size *
-            profile->second.initial_vsegment_count;
+        // 成员槽计数（与 PartitionQuotaAllocator::Allocate 的实际分配能力
+        // 对齐）：initial_vsegment_count 个 vsegment 各需 member_count 个
+        // 互不相同的成员段、每成员切一个 member_extent_size；同一段可被
+        // 不同 vsegment 复用（Allocate 的 visited_segments 保证单个
+        // vsegment 内每段至多 1 成员），故段级槽数上限为
+        // min(N, Σ floor(extent.length / member_extent_size))。旧的
+        // 「每段 >= N * extent」仅在段数恰等于 member_count 时等价，
+        // 冗余段场景过严（分配器允许不同 vsegment 选用不同成员段）。
+        std::unordered_map<std::string, uint64_t> member_slots;
         for (const auto& extent : quota.extents) {
             auto segment = geometry.find(extent.segment_id);
             if (segment == geometry.end())
@@ -425,14 +436,23 @@ ErrorCode ValidateQuotaSnapshot(
             if (extent.base_offset % alignment != 0 ||
                 extent.length % alignment != 0)
                 return Invalid("quota extent is not aligned", detail);
-            if (members.insert(extent.segment_id).second &&
-                extent.length >= initial_bytes)
-                ++eligible;
+            member_slots[extent.segment_id] +=
+                extent.length / profile->second.member_extent_size;
             ranges[extent.segment_id].push_back(
                 {extent.base_offset, extent.length});
         }
-        if (eligible < profile->second.member_count)
-            return Invalid("quota cannot create one configured vsegment",
+        uint64_t total_slots = 0;
+        for (const auto& [segment_id, slots] : member_slots)
+            total_slots += std::min<uint64_t>(
+                slots, profile->second.initial_vsegment_count);
+        const uint64_t required_slots =
+            static_cast<uint64_t>(profile->second.initial_vsegment_count) *
+            profile->second.member_count;
+        if (total_slots < required_slots)
+            return Invalid("quota member slots " +
+                               std::to_string(total_slots) + " < required " +
+                               std::to_string(required_slots) +
+                               " for initial vsegments",
                            detail);
     }
     for (auto& [segment, owned] : ranges) {
