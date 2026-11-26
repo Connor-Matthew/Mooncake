@@ -99,7 +99,11 @@ inline UbTraceLatency summarizeUbTraceLatency(std::vector<uint64_t> samples) {
 //     cqh_wait_us    CQE seen -> inflight mutex acquired (lock wait)
 //     cqh_inflight_us -> entry erased under the lock (lock hold)
 //     cqh_release_us -> endpoint outstanding/quota released and waiters
-//                      notified
+//                      notified; sub-split (rel_*_us):
+//       rel_endpoint_us -> endpoint releaseOutstanding() returned
+//       rel_quota_us    -> quota reservation released
+//       rel_notify_us   -> release tail: queue waiters notified (closed by
+//                         the resources-released checkpoint)
 //     cqh_rail_us    -> rail monitor updated (global rail lock)
 //     cqh_resolve_us -> slice resolved, task finalized, callback run
 //   Submit-side phases (sub_*_us) split the enqueue path:
@@ -125,6 +129,7 @@ inline std::string formatUbTaskTrace(
     std::vector<uint64_t> submit_build, submit_lock_wait, submit_enqueue;
     std::vector<uint64_t> cqh_wait, cqh_inflight, cqh_release, cqh_rail,
         cqh_resolve;
+    std::vector<uint64_t> rel_endpoint, rel_quota, rel_notify;
     uint64_t first_queued = 0, first_post = 0, last_post = 0;
     uint64_t first_complete = 0, last_complete = 0;
     uint64_t retries = 0, defers = 0;
@@ -182,7 +187,24 @@ inline std::string formatUbTaskTrace(
             cqh_inflight.push_back(delta(item.inflight_locked_ns,
                                          item.inflight_erased_ns));
             cqh_release.push_back(delta(item.inflight_erased_ns,
-                                        item.resources_released_ns));
+                                       item.resources_released_ns));
+            // Release sub-split: endpoint accounting, quota release, and the
+            // notify tail. A missing checkpoint (e.g. no endpoint or quota on
+            // an error path) folds its stage into the next window boundary
+            // so every reported delta stays well-defined.
+            uint64_t release_stage_ns = item.inflight_erased_ns;
+            if (item.endpoint_released_ns != 0) {
+                rel_endpoint.push_back(
+                    delta(release_stage_ns, item.endpoint_released_ns));
+                release_stage_ns = item.endpoint_released_ns;
+            }
+            if (item.quota_released_ns != 0) {
+                rel_quota.push_back(
+                    delta(release_stage_ns, item.quota_released_ns));
+                release_stage_ns = item.quota_released_ns;
+            }
+            rel_notify.push_back(
+                delta(release_stage_ns, item.resources_released_ns));
             cqh_rail.push_back(delta(item.resources_released_ns,
                                      item.rail_recorded_ns));
             cqh_resolve.push_back(delta(item.rail_recorded_ns,
@@ -258,6 +280,9 @@ inline std::string formatUbTaskTrace(
     write_latency("cqh_wait_us", cqh_wait);
     write_latency("cqh_inflight_us", cqh_inflight);
     write_latency("cqh_release_us", cqh_release);
+    write_latency("rel_endpoint_us", rel_endpoint);
+    write_latency("rel_quota_us", rel_quota);
+    write_latency("rel_notify_us", rel_notify);
     write_latency("cqh_rail_us", cqh_rail);
     write_latency("cqh_resolve_us", cqh_resolve);
     out << " retries=" << retries << " defers=" << defers << " rails=";

@@ -456,6 +456,19 @@ ErrorCode VSegmentService::ReleaseObject(const VSegmentDescriptor& replica,
     return result == ErrorCode::OBJECT_NOT_FOUND ? ErrorCode::OK : result;
 }
 
+ErrorCode VSegmentService::RekeyObject(const VSegmentDescriptor& replica,
+                                       const std::string& old_allocation_id,
+                                       const std::string& new_allocation_id) {
+    if (old_allocation_id.empty() || new_allocation_id.empty() ||
+        replica.partition_id.empty() || replica.vsegment_id.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto manager = FindPartition(replica.partition_id);
+    if (!manager) return ErrorCode::STALE_ROUTE;
+    return manager->RekeyObject(replica.vsegment_id, old_allocation_id,
+                                 new_allocation_id, manager->RouteEpoch());
+}
+
 ErrorCode VSegmentService::LoadView(const std::string& partition_id,
                                     const std::string& vsegment_id,
                                     VSegmentView* view, std::string* detail) {

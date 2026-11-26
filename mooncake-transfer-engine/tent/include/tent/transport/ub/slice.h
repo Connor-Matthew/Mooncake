@@ -205,12 +205,15 @@ struct UbSliceSnapshot {
     uint64_t decode_metadata_ns{0};
     uint64_t remote_order_ns{0};
     // Completion path checkpoints (traced tasks only): CQE observed by the
-    // poller, inflight mutex acquired, inflight entry erased, transport
-    // resources released, and rail monitor updated. The final attempt's
-    // terminal_ns closes the chain.
+    // poller, inflight mutex acquired, inflight entry erased, endpoint
+    // outstanding released, quota reservation released, transport resources
+    // released, and rail monitor updated. The final attempt's terminal_ns
+    // closes the chain.
     uint64_t cqe_seen_ns{0};
     uint64_t inflight_locked_ns{0};
     uint64_t inflight_erased_ns{0};
+    uint64_t endpoint_released_ns{0};
+    uint64_t quota_released_ns{0};
     uint64_t resources_released_ns{0};
     uint64_t rail_recorded_ns{0};
 };
@@ -506,6 +509,12 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
     void noteInflightErased(uint64_t now_ns) {
         inflight_erased_ns_.store(now_ns, std::memory_order_relaxed);
     }
+    void noteEndpointReleased(uint64_t now_ns) {
+        endpoint_released_ns_.store(now_ns, std::memory_order_relaxed);
+    }
+    void noteQuotaReleased(uint64_t now_ns) {
+        quota_released_ns_.store(now_ns, std::memory_order_relaxed);
+    }
     void noteResourcesReleased(uint64_t now_ns) {
         resources_released_ns_.store(now_ns, std::memory_order_relaxed);
     }
@@ -546,6 +555,8 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
             cqe_seen_ns_.load(std::memory_order_relaxed),
             inflight_locked_ns_.load(std::memory_order_relaxed),
             inflight_erased_ns_.load(std::memory_order_relaxed),
+            endpoint_released_ns_.load(std::memory_order_relaxed),
+            quota_released_ns_.load(std::memory_order_relaxed),
             resources_released_ns_.load(std::memory_order_relaxed),
             rail_recorded_ns_.load(std::memory_order_relaxed)};
     }
@@ -611,6 +622,8 @@ class UbSlice : public std::enable_shared_from_this<UbSlice> {
     std::atomic<uint64_t> cqe_seen_ns_{0};
     std::atomic<uint64_t> inflight_locked_ns_{0};
     std::atomic<uint64_t> inflight_erased_ns_{0};
+    std::atomic<uint64_t> endpoint_released_ns_{0};
+    std::atomic<uint64_t> quota_released_ns_{0};
     std::atomic<uint64_t> resources_released_ns_{0};
     std::atomic<uint64_t> rail_recorded_ns_{0};
 };

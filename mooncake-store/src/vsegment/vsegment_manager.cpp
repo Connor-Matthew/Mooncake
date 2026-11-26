@@ -808,6 +808,37 @@ ErrorCode VSegmentManager::ReleaseObject(const std::string& vsegment_id,
     return WaitForDurable(fence);
 }
 
+ErrorCode VSegmentManager::RekeyObject(const std::string& vsegment_id,
+                                       const std::string& old_allocation_id,
+                                       const std::string& new_allocation_id,
+                                       uint64_t expected_route_epoch) {
+    std::shared_ptr<VSegmentDeferredCommitHandle> fence;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!owned_ ||
+            (route_epoch_ != 0 && expected_route_epoch != route_epoch_))
+            return ErrorCode::STALE_ROUTE;
+        auto managed = vsegments_.find(vsegment_id);
+        if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
+        const auto before = managed->second.logical_allocator->Snapshot();
+        const auto result = managed->second.logical_allocator->RekeyAllocation(
+            old_allocation_id, new_allocation_id);
+        if (result != ErrorCode::OK) return result;
+        // Same persist contract as ReleaseObject: the aligned mode relies on
+        // recovery reconcile (which rebuilds from the metadata references),
+        // the legacy mode checkpoints the full allocator state.
+        const auto persisted = VSegmentOplogAlignedMode()
+                                   ? ErrorCode::OK
+                                   : PersistDeferredLocked("logical_rekey",
+                                                       nullptr, &fence);
+        if (persisted != ErrorCode::OK) {
+            managed->second.logical_allocator->Restore(before);
+            return persisted;
+        }
+    }
+    return WaitForDurable(fence);
+}
+
 ErrorCode VSegmentManager::ForgetOperation(const std::string& operation_id) {
     std::shared_ptr<VSegmentDeferredCommitHandle> fence;
     {

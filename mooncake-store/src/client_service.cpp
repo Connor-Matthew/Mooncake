@@ -5951,15 +5951,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
 
             size_t success_count = 0;
             size_t failure_count = 0;
+            size_t endpoint_failure_count = 0;
             size_t local_segment_count = 0;
-            for (const auto& segment_name : segments) {
+            const std::set<std::string> endpoints(segments.begin(),
+                                                  segments.end());
+            for (const auto& segment_name : endpoints) {
                 // Open the segment to resolve its SegmentID (caches the
                 // descriptor).
                 auto target_id = transfer_engine_->openSegment(segment_name);
                 if (target_id == (SegmentHandle)-1) {
                     LOG(WARNING) << "warmup: cannot open segment '"
                                  << segment_name << "'";
-                    ++failure_count;
+                    ++endpoint_failure_count;
                     continue;
                 }
                 // Skip the local segment: there is no remote connection to
@@ -5975,31 +5978,50 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 std::vector<SegmentBufferInfo> buffers;
                 const int buffer_status =
                     transfer_engine_->getSegmentBuffers(target_id, buffers);
-                if (buffer_status != 0 || buffers.empty() ||
-                    buffers.front().length < kWarmupBufSize) {
+                if (buffer_status != 0 || buffers.empty()) {
                     LOG(WARNING)
                         << "warmup: no usable memory buffer for '"
                         << segment_name << "', rc=" << buffer_status
                         << ", buffers=" << buffers.size();
-                    ++failure_count;
+                    ++endpoint_failure_count;
                     continue;
                 }
 
-                if (submit_read_and_wait(target_id, buffers.front().addr,
-                                         segment_name)) {
-                    ++success_count;
-                } else {
-                    ++failure_count;
+                // One registered local NUMA buffer probes every remote NUMA
+                // buffer. getSegmentBuffers covers both classic TE and TENT;
+                // repeated psegment names must not repeat the whole endpoint.
+                for (const auto& buffer : buffers) {
+                    if (buffer.length < kWarmupBufSize) {
+                        LOG(WARNING) << "warmup: empty remote buffer for '"
+                                     << segment_name << "', addr="
+                                     << buffer.addr;
+                        ++failure_count;
+                        continue;
+                    }
+                    const bool ok = submit_read_and_wait(
+                        target_id, buffer.addr, segment_name);
+                    if (ok) {
+                        ++success_count;
+                    } else {
+                        ++failure_count;
+                    }
+                    LOG(INFO) << "warmup: endpoint='" << segment_name
+                              << "' remote_addr=" << buffer.addr
+                              << " location=" << buffer.location
+                              << " read_ok=" << ok;
                 }
             }
 
-            const size_t remote_segment_count = success_count + failure_count;
+            const size_t remote_buffer_count = success_count + failure_count;
             LOG(INFO) << "warmup: completed, " << success_count << "/"
-                      << remote_segment_count
-                      << " remote segments processed (registered="
-                      << segments.size() << ", local_skipped="
+                      << remote_buffer_count
+                      << " remote buffers processed (registered="
+                      << segments.size() << ", unique_endpoints="
+                      << endpoints.size()
+                      << ", endpoint_failures=" << endpoint_failure_count
+                      << ", local_skipped="
                       << local_segment_count << ")";
-            if (failure_count != 0) {
+            if (failure_count != 0 || endpoint_failure_count != 0) {
                 return tl::unexpected(ErrorCode::TRANSFER_FAIL);
             }
             return {};

@@ -2975,6 +2975,15 @@ class MasterService {
     const std::chrono::seconds put_start_release_timeout_sec_;
     class DiscardedReplicas {
        public:
+        // A committed VSegment object whose slot release is deferred with the
+        // replicas: a reader granted the old descriptors under a live lease
+        // keeps reading the old data until this entry expires. The id is the
+        // re-keyed allocation id (see UpsertStart's lease-preserving path).
+        struct DeferredVSegmentObject {
+            VSegmentDescriptor descriptor;
+            std::string allocation_id;
+        };
+
         DiscardedReplicas() = delete;
 
         DiscardedReplicas(std::vector<Replica>&& replicas,
@@ -2989,10 +2998,27 @@ class MasterService {
                 1, mem_size_);
         }
 
-        ~DiscardedReplicas() {
-            MasterMetricManager::instance().inc_put_start_release_cnt(
-                1, mem_size_);
+        // Lease-preserving replacement: keep the listed VSegment objects
+        // committed until this entry expires, then release their slots with
+        // the memory buffers. No-op for entries without VSegment replicas.
+        void DeferVSegmentRelease(
+            const std::shared_ptr<vsegment::VSegmentService>& vsegment_service,
+            std::vector<DeferredVSegmentObject> deferred_vsegments) {
+            deferred_vsegment_service_ = vsegment_service;
+            deferred_vsegments_ = std::move(deferred_vsegments);
         }
+
+        // Releases every deferred VSegment object and takes them off this
+        // entry, so the entry (and its memory buffers) can be destroyed right
+        // after. Returns the objects whose release failed; they must be kept
+        // somewhere for retry or their slots leak.
+        std::vector<DeferredVSegmentObject> ReleaseDeferredVSegments();
+
+        bool HasDeferredVSegments() const {
+            return !deferred_vsegments_.empty();
+        }
+
+        ~DiscardedReplicas();
 
         uint64_t memSize() const { return mem_size_; }
 
@@ -3004,9 +3030,23 @@ class MasterService {
         std::vector<Replica> replicas_;
         std::chrono::system_clock::time_point ttl_;
         uint64_t mem_size_;
+        std::shared_ptr<vsegment::VSegmentService> deferred_vsegment_service_;
+        std::vector<DeferredVSegmentObject> deferred_vsegments_;
+    };
+    // A deferred VSegment release whose ReleaseObject failed (STALE_ROUTE,
+    // persist failure, ...). The slot is still committed, so the entry is
+    // retried by the periodic ReleaseExpiredDiscardedReplicas pass (against
+    // the master's current vsegment_service_) until the release lands; a
+    // master restart recovers it via recovery reconcile, which rebuilds
+    // allocations from the published metadata only.
+    struct DeferredVSegmentRetry {
+        DiscardedReplicas::DeferredVSegmentObject object;
+        std::chrono::system_clock::time_point retry_at;
     };
     std::mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
+        GUARDED_BY(discarded_replicas_mutex_);
+    std::list<DeferredVSegmentRetry> deferred_vsegment_retries_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
 

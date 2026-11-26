@@ -11080,10 +11080,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 const bool has_read_lease = !metadata.IsLeaseExpired(now);
                 if (has_read_lease &&
                     metadata.HasReplica([](const Replica& replica) {
-                        return !replica.is_memory_replica();
+                        return !replica.is_memory_replica() &&
+                               !replica.is_vsegment_replica();
                     })) {
                     // File-backed reads can resolve storage by key, so they
                     // cannot retain an old version across replacement.
+                    // VSegment reads hold slot descriptors like memory reads,
+                    // so the old segments are retained below and released
+                    // when the discard entry expires.
                     return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
                 }
 
@@ -11194,13 +11198,73 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // What the old object charges stays on the key until the
                 // replacement's write settles.
                 accessor.BeforeReplace();
-                auto old_replicas =
-                    PopReplicasWithCacheTotalAccounting(metadata);
+                // Detach the old replicas without releasing their VSegment
+                // state: readers granted the old descriptors before this
+                // write lock keep reading the old slots until the discard
+                // TTL, so their release is deferred into the DiscardedReplicas
+                // entry together with the memory buffers. Without VSegment
+                // replicas this matches PopReplicasWithCacheTotalAccounting.
+                std::vector<DiscardedReplicas::DeferredVSegmentObject>
+                    deferred_vsegments;
+                if (vsegment_service_) {
+                    const auto allocation_id =
+                        metadata.tenant_id.MakeScopedKey(metadata.user_key);
+                    metadata.VisitReplicas(
+                        &Replica::fn_is_vsegment_replica,
+                        [&](const Replica& replica) {
+                            const auto& descriptor =
+                                replica.get_vsegment_descriptor();
+                            // Re-key the old committed allocation to a unique
+                            // deferred id so the replacement can commit under
+                            // the original allocation_id even when its new
+                            // slot lands in the same VSegment.
+                            const std::string deferred_allocation_id =
+                                allocation_id + "#deferred#" +
+                                UuidToString(generate_uuid());
+                            const auto rekeyed =
+                                vsegment_service_->RekeyObject(
+                                    descriptor, allocation_id,
+                                    deferred_allocation_id);
+                            if (rekeyed == ErrorCode::OK ||
+                                rekeyed == ErrorCode::OBJECT_NOT_FOUND) {
+                                // NOT_FOUND: the old allocation is already
+                                // gone; a deferred release under the new id
+                                // is a harmless no-op.
+                                deferred_vsegments.push_back(
+                                    {descriptor, deferred_allocation_id});
+                                return;
+                            }
+                            LOG(ERROR)
+                                << "key=" << key
+                                << ", error=vsegment_deferred_rekey_failed"
+                                << ", detail=" << toString(rekeyed);
+                            // Re-key refused (persist failure, route drift):
+                            // fall back to releasing the old allocation now.
+                            // Readers may lose the old version, but the
+                            // replacement can still commit. If even that
+                            // fails, keep the old id in the deferred list so
+                            // the slot is retried instead of leaked.
+                            if (vsegment_service_->ReleaseObject(
+                                    descriptor, allocation_id) ==
+                                ErrorCode::OK) {
+                                return;
+                            }
+                            deferred_vsegments.push_back(
+                                {descriptor, allocation_id});
+                        });
+                }
+                auto old_replicas = metadata.PopReplicas();
+                SyncCacheTotalAccounting(metadata);
                 if (!old_replicas.empty()) {
                     FreeDfsReplicas(key, old_replicas);
                     std::lock_guard lock(discarded_replicas_mutex_);
                     discarded_replicas_.emplace_back(std::move(old_replicas),
                                                      release_at);
+                    if (!deferred_vsegments.empty()) {
+                        discarded_replicas_.back().DeferVSegmentRelease(
+                            vsegment_service_,
+                            std::move(deferred_vsegments));
+                    }
                 }
                 // The replacement is published under this same lock, so no
                 // reader or writer finds the key between the two objects.
@@ -15159,18 +15223,95 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 }
 
+// Releases every deferred VSegment object carried by a discarded-replicas
+// entry and takes them off the entry, so the caller can destroy the entry
+// (freeing its memory buffers) right after. Returns the objects whose
+// ReleaseObject failed: the caller must park them in
+// deferred_vsegment_retries_ or their slots leak.
+std::vector<MasterService::DiscardedReplicas::DeferredVSegmentObject>
+MasterService::DiscardedReplicas::ReleaseDeferredVSegments() {
+    std::vector<DeferredVSegmentObject> failed;
+    if (!deferred_vsegment_service_ || deferred_vsegments_.empty()) {
+        deferred_vsegments_.clear();
+        deferred_vsegment_service_.reset();
+        return failed;
+    }
+    auto service = std::move(deferred_vsegment_service_);
+    auto deferred = std::move(deferred_vsegments_);
+    for (auto& entry : deferred) {
+        const auto error = service->ReleaseObject(entry.descriptor,
+                                                   entry.allocation_id);
+        if (error == ErrorCode::OK) continue;
+        LOG(ERROR) << "Failed to release deferred vsegment replica, "
+                      "allocation_id="
+                   << entry.allocation_id << ", error=" << toString(error);
+        failed.push_back(std::move(entry));
+    }
+    return failed;
+}
+
+// Normal expiry releases the deferred objects via ReleaseDeferredVSegments()
+// before destruction, so this list is empty on the regular path. A non-empty
+// list means off-nominal teardown: best-effort release the slots and log
+// what could not be reclaimed (a master restart reconciles the rest).
+MasterService::DiscardedReplicas::~DiscardedReplicas() {
+    if (deferred_vsegment_service_ && !deferred_vsegments_.empty()) {
+        for (const auto& deferred : deferred_vsegments_) {
+            const auto error = deferred_vsegment_service_->ReleaseObject(
+                deferred.descriptor, deferred.allocation_id);
+            if (error != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to release deferred vsegment replica, "
+                              "allocation_id="
+                           << deferred.allocation_id
+                           << ", error=" << toString(error);
+            }
+        }
+    }
+    MasterMetricManager::instance().inc_put_start_release_cnt(1, mem_size_);
+}
+
 uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
     const std::chrono::system_clock::time_point& now) {
     uint64_t released_cnt = 0;
     std::lock_guard lock(discarded_replicas_mutex_);
-    discarded_replicas_.remove_if(
-        [&now, &released_cnt](const DiscardedReplicas& item) {
-            const bool expired = item.isExpired(now);
-            if (expired && item.memSize() > 0) {
-                released_cnt++;
-            }
-            return expired;
-        });
+    // Retry deferred VSegment releases that failed earlier: a failed
+    // ReleaseObject leaves the old slot committed, so it is retried against
+    // the current vsegment_service_ until it lands.
+    for (auto it = deferred_vsegment_retries_.begin();
+         it != deferred_vsegment_retries_.end();) {
+        if (it->retry_at > now || !vsegment_service_) {
+            ++it;
+            continue;
+        }
+        const auto error = vsegment_service_->ReleaseObject(
+            it->object.descriptor, it->object.allocation_id);
+        if (error == ErrorCode::OK) {
+            it = deferred_vsegment_retries_.erase(it);
+            continue;
+        }
+        LOG(WARNING) << "Retried deferred vsegment release failed again, "
+                        "allocation_id="
+                     << it->object.allocation_id
+                     << ", error=" << toString(error);
+        it->retry_at = now + put_start_release_timeout_sec_;
+        ++it;
+    }
+    for (auto it = discarded_replicas_.begin();
+         it != discarded_replicas_.end();) {
+        if (!it->isExpired(now)) {
+            ++it;
+            continue;
+        }
+        for (auto& failed : it->ReleaseDeferredVSegments()) {
+            deferred_vsegment_retries_.push_back(
+                {std::move(failed),
+                 now + put_start_release_timeout_sec_});
+        }
+        if (it->memSize() > 0) {
+            released_cnt++;
+        }
+        it = discarded_replicas_.erase(it);
+    }
     return released_cnt;
 }
 
