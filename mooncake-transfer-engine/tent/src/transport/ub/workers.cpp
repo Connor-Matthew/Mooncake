@@ -677,7 +677,12 @@ void UbWorkers::enqueueRetry(const PendingSlice& pending) {
         pending.slice->requestCancellation();
         return;
     }
-    queue_cv_.notify_one();
+    // notify_all, not notify_one: queue_cv_ is shared with deferPending()
+    // waiters whose predicate ignores the queues, so a single wakeup could
+    // land on one of them and leave the slice unclaimed until a backoff
+    // expires. Retries are rare, so the broadcast costs nothing in steady
+    // state, and releaseInflight() no longer broadcasts on every completion.
+    queue_cv_.notify_all();
 }
 
 void UbWorkers::deferPending(const PendingSlice& pending) {
@@ -691,7 +696,8 @@ void UbWorkers::deferPending(const PendingSlice& pending) {
     }
     // Capacity pressure is not a transfer failure. A short bounded backoff
     // prevents a posting lane from exhausting CPU while completions release
-    // quota; releaseInflight() also wakes the queue condition variable.
+    // quota. Only shutdown or cancellation ends the backoff early (both
+    // notify queue_cv_); a quota release does not.
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
         (void)queue_cv_.wait_for(lock, std::chrono::microseconds(50), [&] {
@@ -705,7 +711,8 @@ void UbWorkers::deferPending(const PendingSlice& pending) {
                 .push_back(pending);
             queued_hint_.fetch_add(1, std::memory_order_release);
             lock.unlock();
-            queue_cv_.notify_one();
+            // Broadcast for the same reason as enqueueRetry().
+            queue_cv_.notify_all();
             return;
         }
     }
@@ -829,11 +836,14 @@ std::string UbWorkers::localLocationOf(const PendingSlice& pending) const {
 
 std::vector<UbWorkers::LocalDeviceCandidate> UbWorkers::orderedLocalDevices(
     const PendingSlice& pending, const std::string& location) const {
+    // Runs once per slice and a host has only a handful of UB devices, so a
+    // linear scan of `ordered` replaces the per-call hash set/map. A device
+    // keeps the rank of its first (best) appearance in the memory entry's
+    // priority lists; devices only found in contexts_ rank last.
     std::vector<LocalDeviceCandidate> ordered;
-    std::unordered_set<Topology::NicID> seen;
-    std::unordered_map<Topology::NicID, size_t> device_rank;
+    ordered.reserve(contexts_.size());
 
-    auto append = [&](Topology::NicID id) {
+    auto append = [&](Topology::NicID id, size_t rank) {
         auto found = context_by_topology_id_.find(id);
         if (found == context_by_topology_id_.end() || !found->second ||
             !found->second->active()) {
@@ -842,39 +852,36 @@ std::vector<UbWorkers::LocalDeviceCandidate> UbWorkers::orderedLocalDevices(
         const bool allowed = pending.device_mask == ~0ULL ||
                              (id >= 0 && id < 64 &&
                               (pending.device_mask & (uint64_t{1} << id)) != 0);
-        if (allowed && seen.insert(id).second) {
-            const auto rank = device_rank.find(id);
-            ordered.push_back({id, rank == device_rank.end()
-                                       ? Topology::DevicePriorityRanks
-                                       : rank->second});
+        if (!allowed) return;
+        for (const auto& existing : ordered) {
+            if (existing.id == id) return;
         }
+        ordered.push_back({id, rank});
     };
     if (local_topology_) {
         if (const auto* memory = local_topology_->getMemEntry(location)) {
             for (size_t rank = 0; rank < Topology::DevicePriorityRanks;
                  ++rank) {
-                for (auto id : memory->device_list[rank]) {
-                    auto [it, inserted] = device_rank.emplace(id, rank);
-                    if (!inserted) it->second = std::min(it->second, rank);
-                    append(id);
-                }
+                for (auto id : memory->device_list[rank]) append(id, rank);
             }
         }
     }
     for (const auto& context : contexts_) {
         if (context) {
-            device_rank.try_emplace(context->topologyId(),
-                                    Topology::DevicePriorityRanks);
-            append(context->topologyId());
+            append(context->topologyId(), Topology::DevicePriorityRanks);
         }
     }
-    std::stable_sort(
-        ordered.begin(), ordered.end(), [&](const auto& lhs, const auto& rhs) {
-            if (lhs.topology_rank != rhs.topology_rank)
-                return lhs.topology_rank < rhs.topology_rank;
-            return context_by_topology_id_.at(lhs.id)->inflightBytes() <
-                   context_by_topology_id_.at(rhs.id)->inflightBytes();
-        });
+    // std::stable_sort may allocate a temporary buffer even for one element.
+    if (ordered.size() > 1) {
+        std::stable_sort(
+            ordered.begin(), ordered.end(),
+            [&](const auto& lhs, const auto& rhs) {
+                if (lhs.topology_rank != rhs.topology_rank)
+                    return lhs.topology_rank < rhs.topology_rank;
+                return context_by_topology_id_.at(lhs.id)->inflightBytes() <
+                       context_by_topology_id_.at(rhs.id)->inflightBytes();
+            });
+    }
     return ordered;
 }
 
@@ -1008,11 +1015,13 @@ Status UbWorkers::chooseAndResolveEndpoint(
             std::move(rail_stats),
             quota_->availability(probe_path, pending.slice->spec().length)});
     }
-    std::stable_sort(rails.begin(), rails.end(),
-                     [&](const RailCandidate& lhs, const RailCandidate& rhs) {
-                         return betterUbPathScore(railScore(lhs),
-                                                  railScore(rhs));
-                     });
+    if (rails.size() > 1) {
+        std::stable_sort(
+            rails.begin(), rails.end(),
+            [&](const RailCandidate& lhs, const RailCandidate& rhs) {
+                return betterUbPathScore(railScore(lhs), railScore(rhs));
+            });
+    }
 
     // Phase 2: resolve lazily in the order produced by
     // ubResolutionAttemptOrder(), which takes the best rail of each local
@@ -1081,10 +1090,12 @@ Status UbWorkers::chooseAndResolveEndpoint(
         return first_error;
     }
 
-    std::stable_sort(candidates.begin(), candidates.end(),
-                     [](const Candidate& lhs, const Candidate& rhs) {
-                         return betterUbPathScore(lhs.score, rhs.score);
-                     });
+    if (candidates.size() > 1) {
+        std::stable_sort(candidates.begin(), candidates.end(),
+                         [](const Candidate& lhs, const Candidate& rhs) {
+                             return betterUbPathScore(lhs.score, rhs.score);
+                         });
+    }
     std::vector<UbPostPath> ordered_paths;
     ordered_paths.reserve(candidates.size());
     for (const auto& candidate : candidates) {
@@ -1552,7 +1563,12 @@ void UbWorkers::releaseInflight(const std::shared_ptr<Inflight>& inflight) {
             inflight->pending.slice->noteQuotaReleased(steadyNowNs());
         }
     }
-    queue_cv_.notify_all();
+    // No queue_cv_ notification here. Its waiters are popPending() (waits
+    // for a non-empty queue or shutdown) and deferPending() (waits for
+    // shutdown or cancellation); releasing endpoint/quota accounting changes
+    // neither predicate, so a notify could only wake every idle posting
+    // worker to re-sleep. That futex wake sat on the completion critical
+    // path. Deferred slices still retry after their bounded backoff.
 }
 
 void UbWorkers::recordTimeoutOnce(const std::shared_ptr<Inflight>& inflight,

@@ -535,6 +535,21 @@ class RealJfc final : public Jfc {
     Status retainSegments(uint32_t jetty_id,
                           const std::vector<WorkRequest>& requests) {
         std::lock_guard<std::mutex> lock(inflight_mutex_);
+        if (requests.size() == 1) {
+            // Single-WR post (the common case): emplace() is the duplicate
+            // check, so no scratch set is allocated.
+            const WorkRequest& request = requests.front();
+            if (!inflight_segments_
+                     .emplace(
+                         request.token,
+                         InflightSegments{request.local_segment,
+                                          request.remote_segment, jetty_id})
+                     .second) {
+                return Status::InvalidArgument(
+                    "work request token is already in flight on this JFC");
+            }
+            return Status::OK();
+        }
         std::unordered_set<uint64_t> new_tokens;
         new_tokens.reserve(requests.size());
         for (const WorkRequest& request : requests) {
@@ -1718,9 +1733,14 @@ class RealUrmaAdapter final : public UrmaAdapter {
     Status post(const JettyPtr& jetty, const std::vector<WorkRequest>& requests,
                 size_t& posted_count) override {
         posted_count = 0;
-        std::shared_ptr<RuntimeLease> runtime;
-        CHECK_STATUS(getRuntime(runtime));
-        auto real_jetty = std::dynamic_pointer_cast<RealJetty>(jetty);
+        // Hot path: no getRuntime(). A RealJetty owns its RealContext, which
+        // retains the runtime lease, and shutdown() refuses while any lease
+        // copy is alive, so a valid Jetty already proves the runtime is up.
+        // Skipping it keeps the post off the adapter mutex that every poll
+        // used to take as well. The caller's `jetty` and `requests` own the
+        // objects for the whole call, so raw-pointer casts are safe and avoid
+        // shared_ptr reference-count traffic.
+        auto* real_jetty = dynamic_cast<RealJetty*>(jetty.get());
         if (!real_jetty || !real_jetty->valid()) return invalidHandle("Jetty");
         if (requests.empty()) return Status::OK();
 
@@ -1729,7 +1749,14 @@ class RealUrmaAdapter final : public UrmaAdapter {
             urma_sge_t local_sge{};
             urma_sge_t remote_sge{};
         };
-        std::vector<NativeWorkRequest> native_requests(requests.size());
+        // The common post carries one WR; keep it on the stack.
+        NativeWorkRequest inline_request{};
+        std::unique_ptr<NativeWorkRequest[]> heap_requests;
+        NativeWorkRequest* native_requests = &inline_request;
+        if (requests.size() > 1) {
+            heap_requests.reset(new NativeWorkRequest[requests.size()]());
+            native_requests = heap_requests.get();
+        }
 
         std::lock_guard<std::mutex> jetty_lock(real_jetty->mutex());
         if (!real_jetty->postable() || real_jetty->remote() == nullptr) {
@@ -1746,10 +1773,10 @@ class RealUrmaAdapter final : public UrmaAdapter {
                 return Status::InvalidArgument("invalid work request length");
             }
 
-            auto local = std::dynamic_pointer_cast<RealLocalSegment>(
-                request.local_segment);
-            auto remote = std::dynamic_pointer_cast<RealRemoteSegment>(
-                request.remote_segment);
+            const auto* local = dynamic_cast<const RealLocalSegment*>(
+                request.local_segment.get());
+            const auto* remote = dynamic_cast<const RealRemoteSegment*>(
+                request.remote_segment.get());
             if (!local || !local->valid()) return invalidHandle("LocalSegment");
             if (!remote || !remote->valid()) {
                 return invalidHandle("RemoteSegment");
@@ -1814,13 +1841,13 @@ class RealUrmaAdapter final : public UrmaAdapter {
 
         urma_jfs_wr_t* bad_wr = nullptr;
         const int rc = urma_post_jetty_send_wr(
-            real_jetty->native(), &native_requests.front().extended.base, &bad_wr);
+            real_jetty->native(), &native_requests[0].extended.base, &bad_wr);
         if (rc == URMA_SUCCESS) {
             posted_count = requests.size();
             return Status::OK();
         }
         if (bad_wr != nullptr) {
-            for (size_t i = 0; i < native_requests.size(); ++i) {
+            for (size_t i = 0; i < requests.size(); ++i) {
                 if (bad_wr == &native_requests[i].extended.base) {
                     posted_count = i;
                     break;
@@ -1836,9 +1863,11 @@ class RealUrmaAdapter final : public UrmaAdapter {
     Status poll(const JfcPtr& jfc, size_t max_completions,
                 std::vector<Completion>& completions) override {
         completions.clear();
-        std::shared_ptr<RuntimeLease> runtime;
-        CHECK_STATUS(getRuntime(runtime));
-        auto real_jfc = std::dynamic_pointer_cast<RealJfc>(jfc);
+        // Hot path: no getRuntime(), for the same reason as post(): a valid
+        // RealJfc owns its RealContext and therefore the runtime lease.
+        // Pollers spin on this call, so taking the adapter mutex here made
+        // every post contend with them.
+        auto* real_jfc = dynamic_cast<RealJfc*>(jfc.get());
         if (!real_jfc || !real_jfc->valid()) return invalidHandle("Jfc");
         if (max_completions == 0 ||
             max_completions > static_cast<size_t>(INT_MAX)) {
